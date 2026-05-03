@@ -1023,9 +1023,10 @@ def index():
 
 
 if __name__ == "__main__":
-    updater = threading.Thread(target=_background_updater, daemon=True)
-    updater.start()
     import os
 
-port = int(os.environ.get("PORT", 5000))
-app.run(host="0.0.0.0", port=port)
+    updater = threading.Thread(target=_background_updater, daemon=True)
+    updater.start()
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
