@@ -286,58 +286,400 @@ def load_quakes():
     return data
 
 
+
 # ══════════════════════════════════════════════════════
-# IONEX TEC 取得・解析
+# TEC 取得・解析
 # ══════════════════════════════════════════════════════
-def _ionex_url(dt):
+# 取得戦略（優先順）:
+#   1. IONEXファイル（IGS各ミラー）         - GNSS実測値・最高精度
+#   2. NOAA Space Weather GOES-TEC JSON API  - フォールバック（全球値のみ）
+# ══════════════════════════════════════════════════════
+
+def _ionex_candidates(dt):
     """
-    JPL の IONEX ファイル URL を生成する。
-    フォーマット: jpld{DOY}0.{YY}i.gz
-    例: 2025年1月15日 -> DOY=015, YY=25
+    日付に対応するIONEXファイルの(URL, ファイル名)リストを返す。
+    IGS長名フォーマット（2022年以降）と旧短名フォーマット両方を含む。
+    認証不要の公開ミラーのみ。
     """
-    doy = dt.timetuple().tm_yday
-    yy  = dt.strftime("%y")
+    doy  = dt.timetuple().tm_yday
+    yy   = dt.strftime("%y")
     yyyy = dt.strftime("%Y")
-    fname = f"jpld{doy:03d}0.{yy}i.gz"
-    return (
-        f"https://cddis.nasa.gov/archive/gnss/products/ionex/{yyyy}/{doy:03d}/{fname}",
-        fname,
-    )
+
+    long_date = f"{yyyy}{doy:03d}0000"
+
+    candidates = []
+
+    # ── IGS長名フォーマット（2022年以降の標準）──
+    long_providers = [
+        ("JPL0OPSFIN", "02H"),
+        ("COD0OPSFIN", "01H"),
+        ("ESA0OPSFIN", "02H"),
+        ("IGS0OPSFIN", "02H"),
+    ]
+    long_mirrors = [
+        "https://igs.ign.fr/pub/igs/products/ionex/{yyyy}/{doy:03d}/{fname}",
+        "https://igs.bkg.bund.de/root_ftp/IGS/products/ionosphere/{yyyy}/{doy:03d}/{fname}",
+    ]
+    for provider, interval in long_providers:
+        fname = f"{provider}_{long_date}_01D_{interval}_GIM.INX.gz"
+        for mirror in long_mirrors:
+            url = mirror.format(yyyy=yyyy, doy=doy, fname=fname)
+            candidates.append((url, fname))
+
+    # ── 旧短名フォーマット（後方互換・一部ミラーで現役）──
+    short_providers = ["jplg", "codg", "esag", "igsg", "upcg", "whug"]
+    short_mirrors = [
+        "https://igs.ign.fr/pub/igs/products/ionex/{yyyy}/{doy:03d}/{fname}",
+        "https://igs.bkg.bund.de/root_ftp/IGS/products/ionosphere/{yyyy}/{doy:03d}/{fname}",
+        "https://ftp.aiub.unibe.ch/CODE/{yyyy}/{fname}",
+        "https://cddis.nasa.gov/archive/gnss/products/ionex/{yyyy}/{doy:03d}/{fname}",
+    ]
+    for provider in short_providers:
+        fname = f"{provider}{doy:03d}0.{yy}i.gz"
+        for mirror in short_mirrors:
+            url = mirror.format(yyyy=yyyy, doy=doy, fname=fname)
+            candidates.append((url, fname))
+
+    return candidates
+
 
 def _download_ionex(dt):
     """
-    指定日のIONEXをダウンロードしてキャッシュ、テキストを返す。
-    NASAのCDDISはログイン不要(anonymous FTP over HTTPS)。
-    失敗時はNoneを返す。
+    IONEXファイルをキャッシュから読むか複数ミラーから取得。
+    成功したテキストを返す。全失敗時はNone。
     """
     os.makedirs(IONEX_CACHE_DIR, exist_ok=True)
-    url, fname = _ionex_url(dt)
-    cache_path = os.path.join(IONEX_CACHE_DIR, fname.replace(".gz", ""))
+    date_str   = dt.strftime("%Y%m%d")
+    cache_path = os.path.join(IONEX_CACHE_DIR, f"tec_{date_str}.ionex")
+
+    if os.path.exists(cache_path):
+        with open(cache_path, "r", encoding="ascii", errors="ignore") as f:
+            content = f.read()
+        if len(content) > 1000:
+            return content
+
+    for url, fname in _ionex_candidates(dt):
+        try:
+            r = requests.get(url, timeout=25,
+                             headers={"User-Agent": "IGSClient/1.0 (research)"})
+            if r.status_code != 200:
+                continue
+            raw = r.content
+            # gzip判定（マジックバイト）
+            if raw[:2] == b"\x1f\x8b":
+                with gzip.open(io.BytesIO(raw), "rt",
+                               encoding="ascii", errors="ignore") as gz:
+                    text = gz.read()
+            elif raw[:2] == b"\x1f\x9d":   # compress (.Z)
+                text = raw.decode("ascii", errors="ignore")
+            else:
+                text = raw.decode("ascii", errors="ignore")
+
+            if "IONEX" not in text[:500]:
+                continue
+
+            with open(cache_path, "w", encoding="ascii") as f:
+                f.write(text)
+            print(f"[IONEX] 取得成功: {fname} <- {url}")
+            return text
+        except Exception:
+            continue
+
+    print(f"[IONEX] {date_str} 全ミラー失敗")
+    return None
+
+
+def _parse_ionex(text):
+    """
+    IONEXテキスト（旧・新フォーマット共通）を解析。
+    戻り値: list of {"epoch": datetime, "tec": ndarray, "lat_arr": ndarray, "lon_arr": ndarray}
+    """
+    maps    = []
+    lines   = text.splitlines()
+    i       = 0
+    lat_arr = None
+    lon_arr = None
+
+    while i < len(lines):
+        line = lines[i]
+
+        if "LAT1 / LAT2 / DLAT" in line:
+            parts = line.split()
+            lat1, lat2, dlat = float(parts[0]), float(parts[1]), float(parts[2])
+            if lat_arr is None:
+                n = round(abs(lat2 - lat1) / abs(dlat)) + 1
+                lat_arr = np.linspace(lat1, lat2, n)
+
+        if "LON1 / LON2 / DLON" in line:
+            parts = line.split()
+            lon1, lon2, dlon = float(parts[0]), float(parts[1]), float(parts[2])
+            if lon_arr is None:
+                n = round(abs(lon2 - lon1) / abs(dlon)) + 1
+                lon_arr = np.linspace(lon1, lon2, n)
+
+        if "START OF TEC MAP" in line:
+            i += 1
+            # エポック
+            parts = lines[i].split()
+            try:
+                yr,mo,dy,hr,mi = int(parts[0]),int(parts[1]),int(parts[2]),\
+                                  int(parts[3]),int(parts[4])
+                epoch = datetime(yr, mo, dy, hr, mi, 0, tzinfo=timezone.utc)
+            except Exception:
+                i += 1
+                continue
+
+            if lat_arr is None or lon_arr is None:
+                i += 1
+                continue
+
+            n_lat   = len(lat_arr)
+            n_lon   = len(lon_arr)
+            tec_map = np.full((n_lat, n_lon), np.nan)
+            row_idx = 0
+            i += 1
+
+            while i < len(lines) and "END OF TEC MAP" not in lines[i]:
+                if "LAT/LON1/LON2/DLON/H" in lines[i]:
+                    i += 1
+                    col_idx = 0
+                    while i < len(lines) \
+                          and "LAT/LON1/LON2/DLON/H" not in lines[i] \
+                          and "END OF TEC MAP" not in lines[i]:
+                        for v in lines[i].split():
+                            if col_idx < n_lon:
+                                try:
+                                    tec_map[row_idx, col_idx] = float(v) * 0.1
+                                except ValueError:
+                                    pass
+                                col_idx += 1
+                        i += 1
+                    row_idx = min(row_idx + 1, n_lat - 1)
+                else:
+                    i += 1
+
+            maps.append({"epoch": epoch, "tec": tec_map,
+                         "lat_arr": lat_arr.copy(), "lon_arr": lon_arr.copy()})
+            continue
+        i += 1
+
+    return maps
+
+
+def _fetch_noaa_tec_fallback():
+    """
+    フォールバック: NOAA SWPC の公開 JSON から
+    宇宙天気指数（Kp・Dst）を取得し、
+    日本周辺のTEC代替グリッドを簡易モデルで構築する。
+
+    Kp: 地磁気擾乱指数（0-9）  高い -> 電離層撹乱が強い
+    Dst: 磁気嵐指数（nT）       負に大きい -> 磁気嵐
+
+    簡易モデル: TEC_anomaly(lat, lon) = Kp_factor * lat_sensitivity(lat)
+    これはあくまで「全球的な撹乱強度」の空間分配であり、
+    局所的な精度はIONEXより低い。
+    """
+    try:
+        # Kp指数（直近3時間値）
+        r_kp = requests.get(
+            "https://services.swpc.noaa.gov/json/planetary_k_index_1m.json",
+            timeout=10)
+        kp_data = r_kp.json()
+        # 最新値
+        kp_val = float(kp_data[-1]["kp_index"]) if kp_data else 2.0
+    except Exception:
+        kp_val = 2.0
+
+    try:
+        # Dst指数（磁気嵐）
+        r_dst = requests.get(
+            "https://services.swpc.noaa.gov/json/geospace/dst_1_hour.json",
+            timeout=10)
+        dst_data = r_dst.json()
+        dst_val = float(dst_data[-1]["dst"]) if dst_data else 0.0
+    except Exception:
+        dst_val = 0.0
+
+    # 日本周辺グリッド（2.5x5度、IONEXと同解像度）
+    lat_arr = np.arange(22.5, 47.6, 2.5)
+    lon_arr = np.arange(120.0, 146.1, 5.0)
+    n_lat, n_lon = len(lat_arr), len(lon_arr)
+
+    # 簡易電離層モデル:
+    # - Kpが高いほど中高緯度でTEC撹乱が増大
+    # - 磁気嵐(Dst < -30nT)で追加ブースト
+    # - 日本は中緯度(30-45度)なので中程度の感度
+    tec_grid = np.zeros((n_lat, n_lon))
+    storm_boost = max(0, -dst_val / 50.0)  # Dst=-50nT -> +1.0
+
+    for i, lat in enumerate(lat_arr):
+        # 中高緯度感度: 緯度30-50度でピーク
+        lat_factor = np.exp(-((lat - 40.0) ** 2) / (2 * 15.0 ** 2))
+        for j, lon in enumerate(lon_arr):
+            tec_grid[i, j] = (kp_val / 4.0) * lat_factor + storm_boost * lat_factor
+
+    # Zスコア代替（平均0, 標準偏差1 に正規化）
+    mean = np.mean(tec_grid)
+    std  = np.std(tec_grid) + 1e-6
+    zscore = (tec_grid - mean) / std
+
+    status = (f"NOAA SWPC 代替モード "
+              f"(Kp={kp_val:.1f}, Dst={dst_val:.0f}nT)")
+    print(f"[TEC] {status}")
+    return {
+        "zscore":  zscore,
+        "lat_arr": lat_arr,
+        "lon_arr": lon_arr,
+        "tec_now": tec_grid,
+        "epoch":   datetime.now(timezone.utc),
+        "status":  status,
+        "source":  "noaa_fallback",
+    }
+
+
+def compute_tec_zscore():
+    """
+    TEC Zスコアを計算して返す。
+    IONEXが取得できればそれを使い、失敗時はNOAA SWPCで代替。
+    """
+    now      = datetime.now(timezone.utc)
+    today_dt = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+
+    # ── IONEXを試みる ──
+    today_text = _download_ionex(today_dt)
+    if today_text:
+        today_maps = _parse_ionex(today_text)
+        if today_maps:
+            current_map  = min(today_maps,
+                               key=lambda m: abs((m["epoch"]-now).total_seconds()))
+            tec_now      = current_map["tec"]
+            lat_arr      = current_map["lat_arr"]
+            lon_arr      = current_map["lon_arr"]
+            current_hour = current_map["epoch"].hour
+
+            history_stack = []
+            for d in range(1, TEC_HISTORY_DAYS + 1):
+                past_text = _download_ionex(today_dt - timedelta(days=d))
+                if not past_text:
+                    continue
+                for pm in _parse_ionex(past_text):
+                    if abs(pm["epoch"].hour - current_hour) <= 1:
+                        history_stack.append(pm["tec"])
+
+            if len(history_stack) >= 3:
+                history_arr = np.stack(history_stack, axis=0)
+                mean_tec    = np.nanmean(history_arr, axis=0)
+                std_tec     = np.maximum(np.nanstd(history_arr, axis=0), 0.5)
+                zscore      = (tec_now - mean_tec) / std_tec
+                status      = f"IONEXモード (Zスコア, 過去{len(history_stack)}エポック)"
+                source      = "ionex"
+            else:
+                mean_g = np.nanmean(tec_now)
+                std_g  = max(np.nanstd(tec_now), 0.5)
+                zscore = (tec_now - mean_g) / std_g
+                status = "IONEXモード (絶対値正規化, 過去データ不足)"
+                source = "ionex"
+
+            # 日本周辺に絞り込む
+            lat_mask = (lat_arr >= 22) & (lat_arr <= 48)
+            lon_mask = (lon_arr >= 120) & (lon_arr <= 148)
+            lat_jp   = lat_arr[lat_mask]
+            lon_jp   = lon_arr[lon_mask]
+            li       = np.where(lat_mask)[0]
+            lj       = np.where(lon_mask)[0]
+
+            print(f"[TEC] {status}")
+            return {
+                "zscore":  zscore[np.ix_(li, lj)],
+                "lat_arr": lat_jp,
+                "lon_arr": lon_jp,
+                "tec_now": tec_now[np.ix_(li, lj)],
+                "epoch":   current_map["epoch"],
+                "status":  status,
+                "source":  source,
+            }
+
+    # ── IONEXが全滅 -> NOAA SWPCフォールバック ──
+    print("[TEC] IONEXすべて失敗 -> NOAA SWPCで代替")
+    return _fetch_noaa_tec_fallback()
+
+
+    """
+    IONEXファイルの候補URLリストを返す（認証不要ミラー優先順）。
+    プロバイダ優先順: IGS/IGN(FR) -> CODE(AIUB) -> BKG(DE)
+    ファイル命名規則:
+      JPL  : jpld{DOY}0.{YY}i.gz
+      CODE : codg{DOY}0.{YY}i.gz
+      ESA  : esag{DOY}0.{YY}i.gz
+    """
+    doy  = dt.timetuple().tm_yday
+    yy   = dt.strftime("%y")
+    yyyy = dt.strftime("%Y")
+
+    candidates = []
+
+    # ── IGS/IGN Paris ミラー（認証不要 HTTPS）──
+    for prefix in ["jplg", "codg", "esag", "igsg"]:
+        fname = f"{prefix}{doy:03d}0.{yy}i.gz"
+        candidates.append((
+            f"https://igs.ign.fr/pub/igs/products/ionosphere/{yyyy}/{doy:03d}/{fname}",
+            fname,
+        ))
+
+    # ── CODE / AIUB ミラー（認証不要 FTP-over-HTTPS）──
+    for prefix in ["codg", "jplg"]:
+        fname = f"{prefix}{doy:03d}0.{yy}i.gz"
+        candidates.append((
+            f"https://ftp.aiub.unibe.ch/CODE/{yyyy}/{fname}",
+            fname,
+        ))
+
+    return candidates
+
+
+def _download_ionex(dt):
+    """
+    指定日のIONEXファイルをキャッシュから読むか、ミラーから取得して返す。
+    複数プロバイダ・複数ミラーをフォールバックしながら試みる。
+    """
+    os.makedirs(IONEX_CACHE_DIR, exist_ok=True)
+    date_str   = dt.strftime("%Y%m%d")
+    cache_path = os.path.join(IONEX_CACHE_DIR, f"tec_{date_str}.ionex")
 
     if os.path.exists(cache_path):
         with open(cache_path, "r", encoding="ascii", errors="ignore") as f:
             return f.read()
 
-    # 代替ミラー（CDDISが失敗した場合はIGSミラーを試みる）
-    mirrors = [
-        url,
-        url.replace("cddis.nasa.gov/archive", "igs.ign.fr/pub"),
-    ]
-    for mirror_url in mirrors:
+    for url, fname in _ionex_mirrors(dt):
         try:
-            r = requests.get(mirror_url, timeout=30)
+            print(f"[IONEX] 試行: {url}")
+            r = requests.get(url, timeout=30,
+                             headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code != 200:
+                print(f"[IONEX] HTTP {r.status_code}: {url}")
                 continue
-            with gzip.open(io.BytesIO(r.content), "rt",
-                           encoding="ascii", errors="ignore") as gz:
-                text = gz.read()
+            # .gz か生テキストかを判定
+            content = r.content
+            if content[:2] == b"\x1f\x8b":   # gzip magic bytes
+                with gzip.open(io.BytesIO(content), "rt",
+                               encoding="ascii", errors="ignore") as gz:
+                    text = gz.read()
+            else:
+                text = content.decode("ascii", errors="ignore")
+
+            if "IONEX" not in text[:200]:
+                print(f"[IONEX] IONEX形式ではない: {url}")
+                continue
+
             with open(cache_path, "w", encoding="ascii") as f:
                 f.write(text)
-            print(f"[IONEX] ダウンロード完了: {fname}")
+            print(f"[IONEX] 取得成功: {fname}")
             return text
         except Exception as e:
-            print(f"[IONEX] ミラー失敗 {mirror_url}: {e}")
+            print(f"[IONEX] 失敗 {url}: {e}")
             continue
+
+    print(f"[IONEX] {date_str} の全ミラー失敗")
     return None
 
 def _parse_ionex(text):
@@ -606,13 +948,21 @@ def analyze_etas(quakes):
 # マップ生成ヘルパー
 # ══════════════════════════════════════════════════════
 def _percentile_thresholds(values_arr):
+    """
+    レベル閾値（パーセンタイルベース）
+      Level 5: 上位 0.2% （M6相当以上）
+      Level 4: 上位 2.0% （M5.5相当以上）
+      Level 3: 上位 5.0% （M5前後相当）
+      Level 2: 上位 15%  （現状維持）
+      Level 1: 上位 50%  （現状維持）
+    """
     log_v = np.log(np.clip(values_arr, 0, None) + 1)
     return (
-        np.percentile(log_v, 98),
-        np.percentile(log_v, 95),
-        np.percentile(log_v, 85),
-        np.percentile(log_v, 70),
-        np.percentile(log_v, 40),
+        np.percentile(log_v, 99.8),   # Level 5
+        np.percentile(log_v, 98.0),   # Level 4
+        np.percentile(log_v, 95.0),   # Level 3
+        np.percentile(log_v, 85.0),   # Level 2
+        np.percentile(log_v, 50.0),   # Level 1
     )
 
 ETAS_COLOR = {5: "#1a0033", 4: "#8000ff", 3: "red", 2: "orange", 1: "#66ccff"}
@@ -657,11 +1007,11 @@ def create_etas_map(grid_scores, quakes, updated_str):
                 background:white;padding:12px;border-radius:8px;
                 border:2px solid #8800cc;font-size:13px;line-height:2.0;">
       <b>&#9312; ETAS 地震発生確率</b><br>
-      <span style="color:#1a0033;">&#9632;</span> Level 5（上位2%）<br>
-      <span style="color:#8000ff;">&#9632;</span> Level 4（上位5%）<br>
-      <span style="color:red;">&#9632;</span> Level 3（上位15%）<br>
-      <span style="color:orange;">&#9632;</span> Level 2（上位30%）<br>
-      <span style="color:#66ccff;">&#9632;</span> Level 1（上位60%）<br>
+      <span style="color:#1a0033;">&#9632;</span> Level 5（上位0.2%）<br>
+      <span style="color:#8000ff;">&#9632;</span> Level 4（上位2.0%）<br>
+      <span style="color:red;">&#9632;</span> Level 3（上位5.0%）<br>
+      <span style="color:orange;">&#9632;</span> Level 2（上位15%）<br>
+      <span style="color:#66ccff;">&#9632;</span> Level 1（上位50%）<br>
       <hr style="margin:4px 0;">
       <small>空間: べき乗則(q={EP.Q}) / 時間: Omori-Utsu(p={EP.P})<br>
       深さ補正あり / 背景活動率={EP.MU}<br>
@@ -844,9 +1194,9 @@ def create_combined_map(grid_scores, tec_result, quakes, updated_str):
                 background:white;padding:12px;border-radius:8px;
                 border:2px solid #660099;font-size:13px;line-height:2.0;">
       <b>&#9314; 統合リスクマップ</b><br>
-      <span style="color:#0d001a;">&#9632;</span> Level 5（上位2%）<br>
-      <span style="color:#660099;">&#9632;</span> Level 4（上位5%）<br>
-      <span style="color:#cc0033;">&#9632;</span> Level 3（上位15%）<br>
+      <span style="color:#0d001a;">&#9632;</span> Level 5（上位0.2%）<br>
+      <span style="color:#660099;">&#9632;</span> Level 4（上位0.5%）<br>
+      <span style="color:#cc0033;">&#9632;</span> Level 3（上位1%）<br>
       <span style="color:#ff6600;">&#9632;</span> Level 2（上位30%）<br>
       <span style="color:#ffff99;">&#9632;</span> Level 1（上位60%）<br>
       <hr style="margin:4px 0;">
@@ -870,8 +1220,17 @@ TAB_TEMPLATE = """<!DOCTYPE html>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: "Helvetica Neue", Arial, sans-serif; background: #1a1a2e; }
     #tab-bar {
-      display: flex; background: #16213e; padding: 8px 12px 0;
+      display: flex; align-items: center; background: #16213e; padding: 8px 12px 0;
       border-bottom: 3px solid #0f3460;
+    }
+    .version-badge {
+      margin-left: auto; padding: 6px 12px; font-size: 12px; font-weight: bold;
+      color: #ffffff; background: linear-gradient(135deg, #1f3b73, #274690); border-radius: 999px;
+      border: 1px solid #4d79ff; box-shadow:
+    0 0 8px rgba(77,121,255,0.35),
+    inset 0 0 6px rgba(255,255,255,0.08);
+    align-self: center; margin-bottom: 4px;
+      letter-spacing: 0.8px;
     }
     .tab-btn {
       padding: 10px 24px; cursor: pointer; border: none;
@@ -903,6 +1262,7 @@ TAB_TEMPLATE = """<!DOCTYPE html>
     <button class="tab-btn" onclick="switchTab(2)">
       <span class="num">&#9314;</span>統合リスク
     </button>
+    <span class="version-badge">&#946;3.0.1</span>
   </div>
   <div id="map-container">
     <div class="tab-panel active" id="panel-0">
@@ -1023,10 +1383,6 @@ def index():
 
 
 if __name__ == "__main__":
-    import os
-
     updater = threading.Thread(target=_background_updater, daemon=True)
     updater.start()
-
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=False, host="0.0.0.0", port=5000)
