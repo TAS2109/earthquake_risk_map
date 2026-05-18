@@ -951,7 +951,7 @@ def _percentile_thresholds(values_arr):
     """
     レベル閾値（パーセンタイルベース）
       Level 5: 上位 0.2% （M6相当以上）
-      Level 4: 上位 2.0% （M5.5相当以上）
+      Level 4: 上位 1.5% （M5.5相当以上）
       Level 3: 上位 5.0% （M5前後相当）
       Level 2: 上位 15%  （現状維持）
       Level 1: 上位 50%  （現状維持）
@@ -959,7 +959,7 @@ def _percentile_thresholds(values_arr):
     log_v = np.log(np.clip(values_arr, 0, None) + 1)
     return (
         np.percentile(log_v, 99.8),   # Level 5
-        np.percentile(log_v, 98.0),   # Level 4
+        np.percentile(log_v, 98.5),   # Level 4
         np.percentile(log_v, 95.0),   # Level 3
         np.percentile(log_v, 85.0),   # Level 2
         np.percentile(log_v, 50.0),   # Level 1
@@ -1008,7 +1008,7 @@ def create_etas_map(grid_scores, quakes, updated_str):
                 border:2px solid #8800cc;font-size:13px;line-height:2.0;">
       <b>&#9312; ETAS 地震発生確率</b><br>
       <span style="color:#1a0033;">&#9632;</span> Level 5（上位0.2%）<br>
-      <span style="color:#8000ff;">&#9632;</span> Level 4（上位2.0%）<br>
+      <span style="color:#8000ff;">&#9632;</span> Level 4（上位1.5%）<br>
       <span style="color:red;">&#9632;</span> Level 3（上位5.0%）<br>
       <span style="color:orange;">&#9632;</span> Level 2（上位15%）<br>
       <span style="color:#66ccff;">&#9632;</span> Level 1（上位50%）<br>
