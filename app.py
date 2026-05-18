@@ -4,13 +4,16 @@
 
 3種類のマップをタブ切り替えで表示:
   [1] ETAS マップ    : 直近地震履歴からの余震確率（Ogata 1998）
-  [2] TEC 撹乱マップ : IGS IONEXによる電離層TEC Zスコア（参考指標）
+  [2] TEC 撹乱マップ : 電離層TEC Zスコア（参考指標）
   [3] 統合リスクマップ: (1) + w*(2) の加重合算
 
-TEC データ:
-  - ソース  : JPL（Jet Propulsion Laboratory）IONEX ファイル
-  - 解像度  : 2.5度×5.0度（全球グリッド）
-  - 更新頻度: 2時間ごと
+TEC データ取得戦略（優先順）:
+  1. GEONET（国土地理院）RINEX  - 日本全国約1300点の電子基準点GNSS生データから
+                                   直接TEC計算。最も日本に特化した高密度データ。
+                                   ソース: ftp://terras.gsi.go.jp/data/GPS_products/
+  2. IGS IONEX ファイル          - JPL/CODE/ESA等のグローバルマップ（2.5°×5.0°）
+  3. NOAA SWPC フォールバック    - Kp/Dst指数からの簡易推定
+
   - 撹乱指標: 過去7日間の同時刻帯の平均・標準偏差に対するZスコア
               Z = (TEC_now - mean_7d) / std_7d
 """
@@ -291,11 +294,346 @@ def load_quakes():
 # TEC 取得・解析
 # ══════════════════════════════════════════════════════
 # 取得戦略（優先順）:
-#   1. IONEXファイル（IGS各ミラー）         - GNSS実測値・最高精度
-#   2. NOAA Space Weather GOES-TEC JSON API  - フォールバック（全球値のみ）
+#   1. GEONET RINEX（terras.gsi.go.jp）     - 日本特化・高密度（約1300点）
+#   2. IONEXファイル（IGS各ミラー）         - グローバルマップ（2.5°×5.0°）
+#   3. NOAA Space Weather GOES-TEC JSON API  - フォールバック（全球値のみ）
 # ══════════════════════════════════════════════════════
 
-def _ionex_candidates(dt):
+# GEONET代表観測局（日本各地をカバーする常設局）
+# terras.gsi.go.jp の /data/GPS_products/ 以下に4文字局名でアクセス可能
+GEONET_STATIONS = [
+    # 4文字局名, 緯度, 経度
+    ("0132", 43.06, 141.35),  # 札幌
+    ("0272", 40.82, 141.32),  # 青森
+    ("0481", 39.70, 141.14),  # 盛岡
+    ("0561", 38.27, 140.87),  # 仙台
+    ("0721", 37.42, 140.36),  # 郡山
+    ("0891", 36.38, 140.47),  # 水戸
+    ("0931", 36.41, 139.74),  # 宇都宮
+    ("1021", 36.55, 139.11),  # 前橋
+    ("1101", 35.69, 139.75),  # 東京
+    ("1211", 35.18, 136.90),  # 名古屋
+    ("1301", 35.01, 135.73),  # 京都
+    ("1361", 34.69, 135.50),  # 大阪
+    ("1501", 34.39, 132.46),  # 広島
+    ("1601", 33.59, 130.42),  # 福岡
+    ("1701", 31.60, 130.56),  # 鹿児島
+    ("1801", 26.33, 127.81),  # 那覇
+    ("0601", 37.91, 139.06),  # 新潟
+    ("0811", 36.70, 137.21),  # 富山
+    ("1141", 34.35, 134.05),  # 高松
+    ("1461", 33.55, 133.53),  # 高知
+]
+GEONET_CACHE_DIR = "data/geonet_rinex"
+
+
+# ──────────────────────────────────────────────────────
+# GEONET RINEX → TEC 計算
+# ──────────────────────────────────────────────────────
+
+def _geonet_rinex_url(station: str, dt: datetime) -> list:
+    """
+    GEONET電子基準点のRINEXファイルURLリストを返す。
+    terras.gsi.go.jp の公開FTPをHTTPSで取得する。
+    ファイル命名: {STATION}{DOY}0.{YY}o.gz  (RINEX 2.11)
+    ディレクトリ: /data/GPS_products/{YYYY}/{DOY:03d}/
+    """
+    doy  = dt.timetuple().tm_yday
+    yy   = dt.strftime("%y")
+    yyyy = dt.strftime("%Y")
+    base = "https://terras.gsi.go.jp/data/GPS_products"
+    fname_obs = f"{station}{doy:03d}0.{yy}o.gz"
+    fname_nav = f"brdc{doy:03d}0.{yy}n.gz"   # 放送暦（共通）
+    url_obs = f"{base}/{yyyy}/{doy:03d}/{fname_obs}"
+    url_nav = f"{base}/{yyyy}/{doy:03d}/{fname_nav}"
+    return url_obs, url_nav, fname_obs, fname_nav
+
+
+def _download_geonet_file(url: str, cache_path: str) -> bytes | None:
+    """単一ファイルをキャッシュ付きでダウンロード。生バイト列を返す。"""
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 200:
+        with open(cache_path, "rb") as f:
+            return f.read()
+    try:
+        r = requests.get(url, timeout=20,
+                         headers={"User-Agent": "GEONETClient/1.0 (research)"})
+        if r.status_code != 200:
+            return None
+        data = r.content
+        with open(cache_path, "wb") as f:
+            f.write(data)
+        return data
+    except Exception as e:
+        print(f"[GEONET] DL失敗 {url}: {e}")
+        return None
+
+
+def _decompress_gz(data: bytes) -> str | None:
+    """gzip圧縮バイト列を文字列に展開。"""
+    try:
+        if data[:2] == b"\x1f\x8b":
+            with gzip.open(io.BytesIO(data), "rt",
+                           encoding="ascii", errors="ignore") as gz:
+                return gz.read()
+        return data.decode("ascii", errors="ignore")
+    except Exception:
+        return None
+
+
+def _parse_rinex2_obs_tec(obs_text: str) -> list:
+    """
+    RINEX 2.11 観測ファイルから擬似距離P1/P2を読み取り、
+    局ごとのスラント TEC 時系列を返す。
+
+    TEC[TECU] = (P2 - P1) / (40.3 * (1/f1^2 - 1/f2^2))
+    f1 = 1575.42 MHz, f2 = 1227.60 MHz (GPS L1/L2)
+    戻り値: list of {"epoch": datetime(UTC), "stec": float[TECU]}
+    """
+    F1 = 1575.42e6   # GPS L1 [Hz]
+    F2 = 1227.60e6   # GPS L2 [Hz]
+    K  = 40.3        # [m・TECU / electron・m^-2]
+    # TEC factor: STEC = (P2-P1) * f1^2*f2^2 / (K*(f1^2-f2^2)) [TECU]
+    SCALE = F1**2 * F2**2 / (K * (F1**2 - F2**2)) / 1e16
+
+    lines = obs_text.splitlines()
+    i = 0
+    obs_types = []
+    p1_idx = p2_idx = -1
+
+    # ヘッダ解析
+    while i < len(lines):
+        line = lines[i]
+        if "# / TYPES OF OBSERV" in line:
+            parts = line.split()
+            try:
+                n = int(parts[0])
+                types = parts[1:1+n]
+                # 次行に続く場合
+                j = i + 1
+                while len(types) < n and j < len(lines):
+                    if "# / TYPES OF OBSERV" in lines[j]:
+                        types += lines[j].split()[:-3]
+                    j += 1
+                obs_types = types
+                if "P1" in obs_types: p1_idx = obs_types.index("P1")
+                if "P2" in obs_types: p2_idx = obs_types.index("P2")
+                if "C1" in obs_types and p1_idx < 0: p1_idx = obs_types.index("C1")
+            except Exception:
+                pass
+        if "END OF HEADER" in line:
+            i += 1
+            break
+        i += 1
+
+    if p1_idx < 0 or p2_idx < 0:
+        return []
+
+    results = []
+    while i < len(lines):
+        line = lines[i]
+        if len(line) < 26:
+            i += 1
+            continue
+        # エポックヘッダ: yy mm dd hh mm ss.sss  n_sat  ...
+        try:
+            yy2 = int(line[1:3]);   mo = int(line[4:6]);   dy = int(line[7:9])
+            hr  = int(line[10:12]); mi = int(line[13:15]); sc = float(line[15:26])
+            year = 2000 + yy2 if yy2 < 80 else 1900 + yy2
+            epoch = datetime(year, mo, dy, hr, mi, int(sc), tzinfo=timezone.utc)
+            n_sv  = int(line[29:32])
+        except Exception:
+            i += 1
+            continue
+
+        # 衛星リスト（1行29字+12衛星まで）
+        sv_line = line[32:68]
+        extra_lines = math.ceil(n_sv / 12) - 1
+        i += 1
+        for _ in range(extra_lines):
+            if i < len(lines):
+                sv_line += lines[i][32:68]
+                i += 1
+
+        stec_list = []
+        n_obs = len(obs_types)
+        for sv_i in range(n_sv):
+            # 各衛星: ceil(n_obs/5) 行
+            obs_vals = []
+            for row in range(math.ceil(n_obs / 5)):
+                if i < len(lines):
+                    obs_line = lines[i].ljust(80)
+                    i += 1
+                    for col in range(5):
+                        start = col * 16
+                        val_str = obs_line[start:start+14].strip()
+                        try:
+                            obs_vals.append(float(val_str))
+                        except Exception:
+                            obs_vals.append(float("nan"))
+                else:
+                    obs_vals.extend([float("nan")] * 5)
+
+            try:
+                p1 = obs_vals[p1_idx]
+                p2 = obs_vals[p2_idx]
+                if not (math.isnan(p1) or math.isnan(p2) or p1 == 0 or p2 == 0):
+                    stec = abs(p2 - p1) * abs(SCALE)
+                    # 合理範囲チェック (1-300 TECU)
+                    if 1.0 < stec < 300.0:
+                        stec_list.append(stec)
+            except IndexError:
+                pass
+
+        if stec_list:
+            results.append({
+                "epoch": epoch,
+                "stec":  float(np.median(stec_list)),  # 複数衛星の中央値
+            })
+
+    return results
+
+
+def _fetch_geonet_tec(dt: datetime) -> dict | None:
+    """
+    GEONETの複数代表局からRINEXを取得し、
+    日本周辺グリッドのTECマップとZスコアを返す。
+
+    処理フロー:
+      1. 各局のRINEX観測ファイル（O型）をterras.gsi.go.jpから取得
+      2. P1/P2擬似距離差からスラントTECを計算
+      3. 現在エポックに最も近い値を各局から抽出
+      4. 空間補間（逆距離加重）でグリッドマップを生成
+      5. 過去7日間の同時刻値でZスコアを算出
+    """
+    os.makedirs(GEONET_CACHE_DIR, exist_ok=True)
+    now = datetime.now(timezone.utc)
+
+    def _fetch_station_tec(station_info):
+        station, slat, slon = station_info
+        url_obs, url_nav, fname_obs, fname_nav = _geonet_rinex_url(station, dt)
+        cache_obs = os.path.join(GEONET_CACHE_DIR,
+                                 f"{station}_{dt.strftime('%Y%m%d')}.obs.gz")
+        raw = _download_geonet_file(url_obs, cache_obs)
+        if raw is None:
+            return None
+        text = _decompress_gz(raw)
+        if not text or "RINEX" not in text[:200]:
+            return None
+        series = _parse_rinex2_obs_tec(text)
+        if not series:
+            return None
+        # 現在時刻に最も近いエポックの値
+        best = min(series, key=lambda x: abs((x["epoch"] - now).total_seconds()))
+        if abs((best["epoch"] - now).total_seconds()) > 7200:
+            return None  # 2時間以上ずれていたら棄却
+        return {"station": station, "lat": slat, "lon": slon,
+                "stec": best["stec"], "epoch": best["epoch"]}
+
+    # 並列取得（最大8局同時）
+    station_data = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_fetch_station_tec, s): s for s in GEONET_STATIONS}
+        for f in as_completed(futures):
+            r = f.result()
+            if r:
+                station_data.append(r)
+
+    if len(station_data) < 3:
+        print(f"[GEONET] 有効局数不足: {len(station_data)}局")
+        return None
+
+    print(f"[GEONET] {len(station_data)}局からTEC取得成功")
+
+    # ── グリッドへの逆距離加重補間 (IDW) ──
+    lat_arr = np.arange(24.0, 47.5, 1.0)   # 0.1度→1.0度（局数に合わせて粗め）
+    lon_arr = np.arange(122.0, 147.0, 1.0)
+    tec_grid = np.full((len(lat_arr), len(lon_arr)), np.nan)
+
+    lats  = np.array([d["lat"]  for d in station_data])
+    lons  = np.array([d["lon"]  for d in station_data])
+    stecs = np.array([d["stec"] for d in station_data])
+
+    for i, lat in enumerate(lat_arr):
+        for j, lon in enumerate(lon_arr):
+            dists = np.sqrt((lats - lat)**2 + (lons - lon)**2)
+            dists = np.maximum(dists, 0.01)
+            weights = 1.0 / dists**2
+            tec_grid[i, j] = np.sum(weights * stecs) / np.sum(weights)
+
+    # ── 過去7日間の同時刻帯でZスコア計算 ──
+    history_stack = []
+    current_hour  = now.hour
+    for d in range(1, TEC_HISTORY_DAYS + 1):
+        past_dt = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc) \
+                  - timedelta(days=d)
+
+        def _past_station(s_info):
+            station, slat, slon = s_info
+            url_obs, _, fname_obs, _ = _geonet_rinex_url(station, past_dt)
+            cache_p = os.path.join(GEONET_CACHE_DIR,
+                                   f"{station}_{past_dt.strftime('%Y%m%d')}.obs.gz")
+            raw = _download_geonet_file(url_obs, cache_p)
+            if raw is None: return None
+            text = _decompress_gz(raw)
+            if not text: return None
+            series = _parse_rinex2_obs_tec(text)
+            # 当日の同時刻帯（±1時間）のエポックを抽出
+            target = past_dt.replace(hour=current_hour)
+            close  = [x for x in series
+                      if abs((x["epoch"]-target).total_seconds()) <= 3600]
+            if not close: return None
+            med = float(np.median([c["stec"] for c in close]))
+            return {"lat": slat, "lon": slon, "stec": med}
+
+        past_data = []
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = {ex.submit(_past_station, s): s for s in GEONET_STATIONS}
+            for f in as_completed(futs):
+                r = f.result()
+                if r: past_data.append(r)
+
+        if len(past_data) < 3:
+            continue
+
+        # 同じグリッドに補間
+        pg = np.full((len(lat_arr), len(lon_arr)), np.nan)
+        pl = np.array([d["lat"]  for d in past_data])
+        po = np.array([d["lon"]  for d in past_data])
+        ps = np.array([d["stec"] for d in past_data])
+        for i, lat in enumerate(lat_arr):
+            for j, lon in enumerate(lon_arr):
+                dists   = np.maximum(np.sqrt((pl-lat)**2 + (po-lon)**2), 0.01)
+                weights = 1.0 / dists**2
+                pg[i, j] = np.sum(weights * ps) / np.sum(weights)
+        history_stack.append(pg)
+
+    if len(history_stack) >= 3:
+        history_arr = np.stack(history_stack, axis=0)
+        mean_tec    = np.nanmean(history_arr, axis=0)
+        std_tec     = np.maximum(np.nanstd(history_arr, axis=0), 0.5)
+        zscore      = (tec_grid - mean_tec) / std_tec
+        status      = (f"GEONETモード ({len(station_data)}局, "
+                       f"Zスコア 過去{len(history_stack)}日)")
+    else:
+        mean_g = np.nanmean(tec_grid)
+        std_g  = max(np.nanstd(tec_grid), 0.5)
+        zscore = (tec_grid - mean_g) / std_g
+        status = f"GEONETモード ({len(station_data)}局, 絶対値正規化)"
+
+    epoch = station_data[0]["epoch"]
+    print(f"[TEC] {status}")
+    return {
+        "zscore":  zscore,
+        "lat_arr": lat_arr,
+        "lon_arr": lon_arr,
+        "tec_now": tec_grid,
+        "epoch":   epoch,
+        "status":  status,
+        "source":  "geonet",
+    }
+
+
+
     """
     日付に対応するIONEXファイルの(URL, ファイル名)リストを返す。
     IGS長名フォーマット（2022年以降）と旧短名フォーマット両方を含む。
@@ -540,12 +878,19 @@ def _fetch_noaa_tec_fallback():
 def compute_tec_zscore():
     """
     TEC Zスコアを計算して返す。
-    IONEXが取得できればそれを使い、失敗時はNOAA SWPCで代替。
+    優先順: GEONET（日本特化）-> IGS IONEX（全球）-> NOAA SWPC（代替）
     """
     now      = datetime.now(timezone.utc)
     today_dt = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
 
-    # ── IONEXを試みる ──
+    # ── 1. GEONET RINEX から計算（最優先）──
+    geonet_result = _fetch_geonet_tec(today_dt)
+    if geonet_result:
+        return geonet_result
+
+    print("[TEC] GEONET失敗 -> IGS IONEXを試みる")
+
+    # ── 2. IGS IONEX フォールバック ──
     today_text = _download_ionex(today_dt)
     if today_text:
         today_maps = _parse_ionex(today_text)
@@ -571,13 +916,13 @@ def compute_tec_zscore():
                 mean_tec    = np.nanmean(history_arr, axis=0)
                 std_tec     = np.maximum(np.nanstd(history_arr, axis=0), 0.5)
                 zscore      = (tec_now - mean_tec) / std_tec
-                status      = f"IONEXモード (Zスコア, 過去{len(history_stack)}エポック)"
+                status      = f"IGS IONEXモード (Zスコア, 過去{len(history_stack)}エポック)"
                 source      = "ionex"
             else:
                 mean_g = np.nanmean(tec_now)
                 std_g  = max(np.nanstd(tec_now), 0.5)
                 zscore = (tec_now - mean_g) / std_g
-                status = "IONEXモード (絶対値正規化, 過去データ不足)"
+                status = "IGS IONEXモード (絶対値正規化, 過去データ不足)"
                 source = "ionex"
 
             # 日本周辺に絞り込む
@@ -599,7 +944,7 @@ def compute_tec_zscore():
                 "source":  source,
             }
 
-    # ── IONEXが全滅 -> NOAA SWPCフォールバック ──
+    # ── 3. NOAA SWPCフォールバック ──
     print("[TEC] IONEXすべて失敗 -> NOAA SWPCで代替")
     return _fetch_noaa_tec_fallback()
 
@@ -766,100 +1111,6 @@ def _parse_ionex(text):
     return maps
 
 
-def compute_tec_zscore():
-    """
-    TEC Zスコアグリッドを計算する。
-
-    手順:
-      1. 今日と過去TEC_HISTORY_DAYS日分のIONEXを取得
-      2. 現在時刻に最も近いエポックのTECを「現在値」とする
-      3. 同じ時間帯（±1時間）の過去7日分のTECで平均・標準偏差を計算
-      4. Z = (TEC_now - mean) / std を各グリッドで算出
-      5. 日本周辺（lat 24-46, lon 122-146）に絞り込んで返す
-
-    戻り値:
-      {
-        "zscore": np.ndarray (n_lat_jp, n_lon_jp),
-        "lat_arr": np.ndarray,
-        "lon_arr": np.ndarray,
-        "tec_now": np.ndarray,
-        "epoch":   datetime,
-        "status":  str
-      }
-      失敗時は None
-    """
-    now = datetime.now(timezone.utc)
-    today = now.date()
-
-    # 今日のIONEX取得
-    today_dt   = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
-    today_text = _download_ionex(today_dt)
-    if not today_text:
-        print("[TEC] 今日のIONEXダウンロード失敗")
-        return None
-
-    today_maps = _parse_ionex(today_text)
-    if not today_maps:
-        print("[TEC] 今日のIONEX解析失敗")
-        return None
-
-    # 現在時刻に最も近いエポックを選択
-    def epoch_diff(m):
-        return abs((m["epoch"] - now).total_seconds())
-
-    current_map = min(today_maps, key=epoch_diff)
-    tec_now     = current_map["tec"]
-    lat_arr     = current_map["lat_arr"]
-    lon_arr     = current_map["lon_arr"]
-    current_hour = current_map["epoch"].hour
-
-    # 過去TEC_HISTORY_DAYS日分の同時間帯データを収集
-    history_stack = []
-    for d in range(1, TEC_HISTORY_DAYS + 1):
-        past_dt   = today_dt - timedelta(days=d)
-        past_text = _download_ionex(past_dt)
-        if not past_text:
-            continue
-        past_maps = _parse_ionex(past_text)
-        for pm in past_maps:
-            if abs(pm["epoch"].hour - current_hour) <= 1:
-                history_stack.append(pm["tec"])
-
-    if len(history_stack) < 3:
-        print(f"[TEC] 過去データ不足（{len(history_stack)}件）、絶対値モードで代替")
-        # Zスコア計算不可 -> 絶対値を正規化して使用
-        zscore = (tec_now - np.nanmean(tec_now)) / (np.nanstd(tec_now) + 1e-6)
-        status = "絶対値モード（過去データ不足）"
-    else:
-        history_arr = np.stack(history_stack, axis=0)  # (days, lat, lon)
-        mean_tec    = np.nanmean(history_arr, axis=0)
-        std_tec     = np.nanstd(history_arr,  axis=0)
-        std_tec     = np.where(std_tec < 0.5, 0.5, std_tec)  # 最小std=0.5TECU
-        zscore      = (tec_now - mean_tec) / std_tec
-        status      = f"Zスコードモード（過去{len(history_stack)}エポック使用）"
-
-    # 日本周辺に絞り込む（lat 22-48, lon 120-148）
-    lat_mask = (lat_arr >= 22) & (lat_arr <= 48)
-    lon_mask = (lon_arr >= 120) & (lon_arr <= 148)
-
-    lat_jp = lat_arr[lat_mask]
-    lon_jp = lon_arr[lon_mask]
-
-    # 2Dマスク
-    lat_idx = np.where(lat_mask)[0]
-    lon_idx = np.where(lon_mask)[0]
-    zscore_jp  = zscore[np.ix_(lat_idx, lon_idx)]
-    tec_now_jp = tec_now[np.ix_(lat_idx, lon_idx)]
-
-    print(f"[TEC] 計算完了: {status}, epoch={current_map['epoch']}")
-    return {
-        "zscore":  zscore_jp,
-        "lat_arr": lat_jp,
-        "lon_arr": lon_jp,
-        "tec_now": tec_now_jp,
-        "epoch":   current_map["epoch"],
-        "status":  status,
-    }
 
 
 # ══════════════════════════════════════════════════════
@@ -1083,6 +1334,15 @@ def create_tec_map(tec_result, updated_str):
             ).add_to(m)
 
     epoch_str = epoch.strftime("%Y-%m-%d %H:%M UTC")
+    src_label = {
+        "geonet":        "GEONET 電子基準点 RINEX（国土地理院）",
+        "ionex":         "IGS IONEX（JPL/CODE/ESA GNSS網）",
+        "noaa_fallback": "NOAA SWPC（Kp/Dst指数代替モデル）",
+    }.get(tec_result.get("source", ""), "不明")
+    resolution = {
+        "geonet": "1.0°×1.0°（IDW補間）",
+        "ionex":  "2.5°×5.0°",
+    }.get(tec_result.get("source", ""), "-")
     legend = f"""
     <div style="position:fixed;bottom:30px;left:30px;z-index:1000;
                 background:white;padding:12px;border-radius:8px;
@@ -1094,9 +1354,9 @@ def create_tec_map(tec_result, updated_str):
       <span style="color:#ffcc00;">&#9632;</span> Level 2（|Z|&ge;1.0）<br>
       <span style="color:#ffffcc;">&#9632;</span> Level 1（|Z|&ge;0.5）<br>
       <hr style="margin:4px 0;">
-      <small>ソース: JPL IONEX (IGS GNSS網)<br>
+      <small>ソース: {src_label}<br>
       指標: {status}<br>
-      解像度: 2.5°&times;5.0° | Epoch: {epoch_str}<br>
+      解像度: {resolution} | Epoch: {epoch_str}<br>
       &#x26A0; 参考指標（地震との因果関係未確定）<br>
       {updated_str}</small>
     </div>"""
