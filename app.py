@@ -1468,6 +1468,35 @@ def create_combined_map(grid_scores, tec_result, quakes, updated_str):
     return m
 
 
+
+
+def create_placeholder_map(title, subtitle):
+    m = _base_map()
+
+    html = f"""
+    <div style="
+        position: fixed;
+        top: 20px;
+        left: 20px;
+        z-index: 9999;
+        background: white;
+        padding: 18px;
+        border-radius: 12px;
+        border: 2px solid #2563eb;
+        width: 340px;
+        font-family: sans-serif;
+    ">
+      <h3 style="margin-bottom:10px;color:#111827;">{title}</h3>
+      <p style="font-size:14px;color:#374151;line-height:1.7;">
+        {subtitle}
+      </p>
+    </div>
+    """
+
+    m.get_root().html.add_child(Element(html))
+    return m
+
+
 # ══════════════════════════════════════════════════════
 # タブ切り替えページを生成
 # ══════════════════════════════════════════════════════
@@ -1475,76 +1504,197 @@ TAB_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震リスクマップ</title>
+  <title>地震・気象統合情報システム</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: "Helvetica Neue", Arial, sans-serif; background: #1a1a2e; }
-    #tab-bar {
-      display: flex; align-items: center; background: #16213e; padding: 8px 12px 0;
-      border-bottom: 3px solid #0f3460;
+
+    body {
+      font-family: "Helvetica Neue", Arial, sans-serif;
+      background: #101827;
+      color: white;
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
     }
-    .version-badge {
-      margin-left: auto; padding: 6px 12px; font-size: 12px; font-weight: bold;
-      color: #ffffff; background: linear-gradient(135deg, #1f3b73, #274690); border-radius: 999px;
-      border: 1px solid #4d79ff; box-shadow:
-    0 0 8px rgba(77,121,255,0.35),
-    inset 0 0 6px rgba(255,255,255,0.08);
-    align-self: center; margin-bottom: 4px;
-      letter-spacing: 0.8px;
+
+    #sidebar {
+      width: 300px;
+      background: #111827;
+      border-right: 3px solid #1f2937;
+      overflow-y: auto;
+      padding: 18px 14px;
+      flex-shrink: 0;
     }
+
+    .sidebar-title {
+      font-size: 22px;
+      font-weight: bold;
+      margin-bottom: 18px;
+      color: #f3f4f6;
+    }
+
+    .group-title {
+      margin-top: 18px;
+      margin-bottom: 10px;
+      padding-left: 8px;
+      font-size: 15px;
+      font-weight: bold;
+      color: #93c5fd;
+      border-left: 4px solid #3b82f6;
+    }
+
     .tab-btn {
-      padding: 10px 24px; cursor: pointer; border: none;
-      border-radius: 8px 8px 0 0; font-size: 14px; font-weight: bold;
-      background: #0f3460; color: #aac; transition: all 0.2s;
-      margin-right: 4px;
+      width: 100%;
+      text-align: left;
+      border: none;
+      margin-bottom: 8px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: #1f2937;
+      color: #d1d5db;
+      cursor: pointer;
+      transition: 0.2s;
+      font-size: 14px;
+      font-weight: 600;
     }
-    .tab-btn:hover { background: #1a5276; color: white; }
-    .tab-btn.active { background: #e94560; color: white; }
-    .tab-btn span.num {
-      display: inline-block; width: 22px; height: 22px;
-      background: rgba(255,255,255,0.2); border-radius: 50%;
-      text-align: center; line-height: 22px; margin-right: 6px; font-size: 12px;
+
+    .tab-btn:hover {
+      background: #374151;
+      color: white;
     }
-    #map-container { width: 100%; height: calc(100vh - 51px); }
-    iframe { width: 100%; height: 100%; border: none; }
-    .tab-panel { display: none; width: 100%; height: 100%; }
-    .tab-panel.active { display: block; }
+
+    .tab-btn.active {
+      background: linear-gradient(135deg, #2563eb, #7c3aed);
+      color: white;
+    }
+
+    .sub-item {
+      margin-left: 12px;
+    }
+
+    #content {
+      flex: 1;
+      height: 100vh;
+    }
+
+    iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+
+    .tab-panel {
+      display: none;
+      width: 100%;
+      height: 100%;
+    }
+
+    .tab-panel.active {
+      display: block;
+    }
+
+    .version {
+      margin-top: 20px;
+      font-size: 12px;
+      color: #9ca3af;
+      text-align: center;
+    }
   </style>
 </head>
 <body>
-  <div id="tab-bar">
+
+  <div id="sidebar">
+    <div class="sidebar-title">地震・気象情報</div>
+
+    <div class="group-title">地震</div>
+
     <button class="tab-btn active" onclick="switchTab(0)">
-      <span class="num">&#9312;</span>ETAS（地震履歴）
+      有感地震履歴
     </button>
+
     <button class="tab-btn" onclick="switchTab(1)">
-      <span class="num">&#9313;</span>TEC（電離層）
+      無感地震履歴
     </button>
+
+    <div class="group-title">気象</div>
+
     <button class="tab-btn" onclick="switchTab(2)">
-      <span class="num">&#9314;</span>統合リスク
+      アメダス観測値
     </button>
-    <span class="version-badge">&#946;3.0.1</span>
+
+    <button class="tab-btn" onclick="switchTab(3)">
+      雨雲レーダー
+    </button>
+
+    <button class="tab-btn" onclick="switchTab(4)">
+      警報・注意報
+    </button>
+
+    <div class="group-title">地震リスクマップ</div>
+
+    <button class="tab-btn" onclick="switchTab(5)">
+      ETASマップ
+    </button>
+
+    <button class="tab-btn" onclick="switchTab(6)">
+      電離層（TEC）マップ
+    </button>
+
+    <button class="tab-btn" onclick="switchTab(7)">
+      統合マップ
+    </button>
+
+    <div class="version">β4.0.0</div>
   </div>
-  <div id="map-container">
-    <div class="tab-panel active" id="panel-0">
+
+  <div id="content">
+
+    <div class="tab-panel active">
+      <iframe srcdoc="{{ felt_quake_map|e }}"></iframe>
+    </div>
+
+    <div class="tab-panel">
+      <iframe srcdoc="{{ unfelt_quake_map|e }}"></iframe>
+    </div>
+
+    <div class="tab-panel">
+      <iframe srcdoc="{{ amedas_map|e }}"></iframe>
+    </div>
+
+    <div class="tab-panel">
+      <iframe srcdoc="{{ radar_map|e }}"></iframe>
+    </div>
+
+    <div class="tab-panel">
+      <iframe srcdoc="{{ warning_map|e }}"></iframe>
+    </div>
+
+    <div class="tab-panel">
       <iframe srcdoc="{{ etas_map|e }}"></iframe>
     </div>
-    <div class="tab-panel" id="panel-1">
+
+    <div class="tab-panel">
       <iframe srcdoc="{{ tec_map|e }}"></iframe>
     </div>
-    <div class="tab-panel" id="panel-2">
+
+    <div class="tab-panel">
       <iframe srcdoc="{{ combined_map|e }}"></iframe>
     </div>
+
   </div>
+
   <script>
     function switchTab(idx) {
-      document.querySelectorAll('.tab-btn').forEach((b,i) => {
+      document.querySelectorAll('.tab-btn').forEach((b, i) => {
         b.classList.toggle('active', i === idx);
       });
-      document.querySelectorAll('.tab-panel').forEach((p,i) => {
+
+      document.querySelectorAll('.tab-panel').forEach((p, i) => {
         p.classList.toggle('active', i === idx);
       });
     }
   </script>
+
 </body>
 </html>"""
 
@@ -1608,8 +1758,25 @@ def _background_updater():
             m3 = create_combined_map(grid_scores, tec_result, quakes, updated_str)
 
             maps = {
-                "etas":     m1._repr_html_(),
-                "tec":      m2._repr_html_(),
+                "felt_quake": m1._repr_html_(),
+                "unfelt_quake": create_placeholder_map(
+                    "無感地震履歴",
+                    "無感地震マップ機能は今後追加予定です。"
+                )._repr_html_(),
+                "amedas": create_placeholder_map(
+                    "アメダス観測値",
+                    "気温・降水量・風速・積雪・気圧の統合表示を実装予定です。"
+                )._repr_html_(),
+                "radar": create_placeholder_map(
+                    "雨雲レーダー",
+                    "JMA雨雲レーダー統合を実装予定です。"
+                )._repr_html_(),
+                "warning": create_placeholder_map(
+                    "警報・注意報",
+                    "気象警報・注意報表示を実装予定です。"
+                )._repr_html_(),
+                "etas": m1._repr_html_(),
+                "tec": m2._repr_html_(),
                 "combined": m3._repr_html_(),
             }
             with _cache_lock:
@@ -1636,8 +1803,13 @@ def index():
 
     return render_template_string(
         TAB_TEMPLATE,
-        etas_map     = maps["etas"],
-        tec_map      = maps["tec"],
+        felt_quake_map = maps["felt_quake"],
+        unfelt_quake_map = maps["unfelt_quake"],
+        amedas_map = maps["amedas"],
+        radar_map = maps["radar"],
+        warning_map = maps["warning"],
+        etas_map = maps["etas"],
+        tec_map = maps["tec"],
         combined_map = maps["combined"],
     )
 
