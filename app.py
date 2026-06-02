@@ -1222,7 +1222,24 @@ COMB_COLOR = {5: "#0d001a", 4: "#660099", 3: "#cc0033", 2: "#ff6600", 1: "#ffff9
 
 
 def _base_map():
-    return folium.Map(location=[36, 138], zoom_start=5, tiles="CartoDB positron")
+    m = folium.Map(
+        location=[36, 138],
+        zoom_start=5,
+        tiles="CartoDB dark_matter",
+        prefer_canvas=True
+    )
+
+    # 都道府県境のみ表示
+    folium.GeoJson(
+        "https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson",
+        style_function=lambda x: {
+            "fillOpacity": 0,
+            "color": "#666666",
+            "weight": 1.2,
+        }
+    ).add_to(m)
+
+    return m
 
 
 # ── ① ETASマップ ──────────────────────────────────────
