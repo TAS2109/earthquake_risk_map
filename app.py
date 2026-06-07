@@ -42,8 +42,6 @@ DATA_FILE          = "data/quakes.csv"
 IONEX_CACHE_DIR    = "data/ionex"
 GRID_SIZE          = 0.1          # ETAS格子間隔（度）
 FETCH_INTERVAL_SEC = 600          # バックグラウンド更新間隔（秒）
-JMA_MAX_ENTRIES    = 60
-JMA_WORKERS        = 12
 TEC_HISTORY_DAYS   = 7            # Zスコア計算に使う過去日数
 TEC_WEIGHT         = 0.4          # 統合マップでのTEC寄与率（0〜1）
 
@@ -51,6 +49,7 @@ TEC_WEIGHT         = 0.4          # 統合マップでのTEC寄与率（0〜1）
 _cache_lock   = threading.Lock()
 _cached_maps  = None   # {"etas": html, "tec": html, "combined": html}
 _last_update  = 0.0
+_ready_phase  = 0      # 0=未準備, 1=地震データのみ準備完了, 2=TEC含む全データ準備完了
 
 
 # ══════════════════════════════════════════════════════
@@ -76,25 +75,43 @@ EP = ETASParams()
 # 地震データ取得
 # ══════════════════════════════════════════════════════
 def fetch_quakes_p2p():
+    """P2P地震情報API: 無感地震履歴取得用（有感判定なし・座標のみ）"""
     url = "https://api.p2pquake.net/v2/history?codes=551&limit=100"
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, timeout=10,
+                           headers={"User-Agent": "EarthquakeApp/4.0"})
         data = res.json()
     except Exception as e:
         print(f"[P2P] 取得エラー: {e}")
         return []
     quakes = []
-    for q in data:
-        if "earthquake" not in q:
+    for item in data:
+        if "earthquake" not in item:
             continue
-        eq = q["earthquake"]
+        eq   = item["earthquake"]
+        hypo = eq.get("hypocenter", {})
         try:
+            lat = float(hypo["latitude"])
+            lon = float(hypo["longitude"])
+            if lat == -200 or lon == -200:
+                continue
+            mag   = float(hypo["magnitude"])
+            depth = abs(float(hypo.get("depth", 0)))
+            raw_time = eq.get("time", "")
+            try:
+                now_y  = datetime.now().year
+                dt_jst = datetime.strptime(f"{now_y}/{raw_time}", "%Y/%m/%d %H:%M")
+                dt_utc = dt_jst.replace(tzinfo=timezone(timedelta(hours=9))) \
+                               .astimezone(timezone.utc)
+                time_str = dt_utc.isoformat()
+            except Exception:
+                time_str = raw_time
             quakes.append({
-                "time":   eq["time"],
-                "lat":    float(eq["hypocenter"]["latitude"]),
-                "lon":    float(eq["hypocenter"]["longitude"]),
-                "mag":    float(eq["hypocenter"]["magnitude"]),
-                "depth":  float(eq["hypocenter"]["depth"]),
+                "time":   time_str,
+                "lat":    lat,
+                "lon":    lon,
+                "mag":    mag,
+                "depth":  depth,
                 "source": "p2p",
             })
         except Exception:
@@ -103,77 +120,77 @@ def fetch_quakes_p2p():
     return quakes
 
 
-JMA_FEED_URL = "https://www.data.jma.go.jp/developer/xml/feed/eqvol_l.xml"
+# ══════════════════════════════════════════════════════
+# 有感地震取得（気象庁 bosai JSON API）
+# ══════════════════════════════════════════════════════
+JMA_LIST_URL = "https://www.jma.go.jp/bosai/quake/data/list.json"
 
-def _fetch_one_jma(url):
-    try:
-        r = requests.get(url, timeout=8)
-        return _parse_jma_xml(r.content)
-    except Exception:
-        return None
+def _parse_jma_cod(cod_str):
+    """ISO6709形式 '+35.6+139.7-50000/' -> (lat, lon, depth_km)"""
+    m = re.match(r'([+-][0-9.]+)([+-][0-9.]+)([+-][0-9.]+)?/?', cod_str.strip())
+    if not m:
+        raise ValueError(f"座標解析失敗: {cod_str}")
+    lat   = float(m.group(1))
+    lon   = float(m.group(2))
+    depth = abs(float(m.group(3))) / 1000.0 if m.group(3) else 0.0
+    return lat, lon, depth
 
-def fetch_quakes_jma():
-    NS = {"atom": "http://www.w3.org/2005/Atom"}
+def fetch_quakes_jma_bosai():
+    """
+    気象庁 bosai JSON API から有感地震（震度1以上）を取得。
+    https://www.jma.go.jp/bosai/quake/data/list.json
+    震源・震度情報（ttl=='震源・震度情報'）かつ maxi が存在する地震のみ。
+    """
     try:
-        res  = requests.get(JMA_FEED_URL, timeout=15)
-        root = ET.fromstring(res.content)
+        res  = requests.get(JMA_LIST_URL, timeout=10,
+                            headers={"User-Agent": "EarthquakeApp/4.0"})
+        data = res.json()
     except Exception as e:
-        print(f"[JMA] フィード取得エラー: {e}")
+        print(f"[JMA-bosai] 取得エラー: {e}")
         return []
-    entries = []
-    for entry in root.findall("atom:entry", NS):
-        title = entry.findtext("atom:title", "", NS)
-        link  = entry.find("atom:link", NS)
-        if link is None:
-            continue
-        href = link.get("href", "")
-        if "VXSE53" in href or "震源・震度" in title:
-            entries.append(href)
-    entries = entries[:JMA_MAX_ENTRIES]
+
     quakes = []
-    with ThreadPoolExecutor(max_workers=JMA_WORKERS) as executor:
-        futures = {executor.submit(_fetch_one_jma, u): u for u in entries}
-        for future in as_completed(futures):
-            q = future.result()
-            if q:
-                quakes.append(q)
-    print(f"[JMA] {len(quakes)} 件取得（並列）")
+    for item in data:
+        # 震源・震度情報のみ（震度速報・震源のみは除外）
+        if item.get("ttl") != "震源・震度情報":
+            continue
+        # 訂正・取消は除外
+        if item.get("ift") in ("訂正", "取消"):
+            continue
+        # 最大震度なし（maxi未定義 or 空）は除外
+        maxi = item.get("maxi", "")
+        if not maxi:
+            continue
+        try:
+            lat, lon, depth = _parse_jma_cod(item["cod"])
+        except Exception:
+            continue
+        mag_raw = item.get("mag", "")
+        try:
+            mag = float(mag_raw)
+        except Exception:
+            mag = 0.0
+        # 発生時刻: at フィールド (ISO8601 JST)
+        at_str = item.get("at", item.get("rdt", ""))
+        try:
+            dt = datetime.fromisoformat(at_str)
+            time_str = dt.astimezone(timezone.utc).isoformat()
+        except Exception:
+            time_str = at_str
+        place = item.get("anm", "不明")
+        quakes.append({
+            "time":    time_str,
+            "lat":     lat,
+            "lon":     lon,
+            "mag":     mag,
+            "depth":   depth,
+            "source":  "jma_bosai",
+            "place":   place,
+            "max_int": maxi,
+        })
+    print(f"[JMA-bosai] {len(quakes)} 件取得")
     return quakes
 
-def _parse_jma_xml(xml_bytes):
-    try:
-        root = ET.fromstring(xml_bytes)
-    except Exception:
-        return None
-    time_el = root.find(".//{http://xml.kishou.go.jp/jmaxml1/informationBasis1/}DateTime")
-    if time_el is None:
-        time_el = root.find(".//{http://xml.kishou.go.jp/jmaxml1/}DateTime")
-    time_str = time_el.text.strip() if time_el is not None else None
-    if not time_str:
-        return None
-    hypo = root.find(".//{http://xml.kishou.go.jp/jmaxml1/elementBasis1/}Hypocenter")
-    if hypo is None:
-        return None
-    coord_el = hypo.find(".//{http://xml.kishou.go.jp/jmaxml1/elementBasis1/}Coordinate")
-    mag_el   = root.find(".//{http://xml.kishou.go.jp/jmaxml1/elementBasis1/}Magnitude")
-    if coord_el is None or mag_el is None:
-        return None
-    try:
-        lat, lon, depth = _parse_iso6709(coord_el.text.strip())
-        mag = float(mag_el.text.strip())
-    except Exception:
-        return None
-    return {"time": time_str, "lat": lat, "lon": lon,
-            "mag": mag, "depth": depth, "source": "jma"}
-
-def _parse_iso6709(coord_text):
-    parts = re.findall(r"[+-][0-9.]+", coord_text.rstrip("/"))
-    if len(parts) < 2:
-        raise ValueError(f"座標解析失敗: {coord_text}")
-    lat   = float(parts[0])
-    lon   = float(parts[1])
-    depth = abs(float(parts[2])) / 1000.0 if len(parts) >= 3 else 0.0
-    return lat, lon, depth
 
 def fetch_quakes_usgs():
     now   = datetime.now(timezone.utc)
@@ -215,17 +232,19 @@ def fetch_all_quakes():
     def _run(name, fn):
         results[name] = fn()
     threads = [
-        threading.Thread(target=_run, args=("p2p",  fetch_quakes_p2p)),
-        threading.Thread(target=_run, args=("jma",  fetch_quakes_jma)),
-        threading.Thread(target=_run, args=("usgs", fetch_quakes_usgs)),
+        threading.Thread(target=_run, args=("p2p",      fetch_quakes_p2p)),
+        threading.Thread(target=_run, args=("usgs",     fetch_quakes_usgs)),
+        threading.Thread(target=_run, args=("jma_bosai", fetch_quakes_jma_bosai)),
     ]
     for t in threads: t.start()
     for t in threads: t.join()
-    all_q = results.get("p2p",[]) + results.get("jma",[]) + results.get("usgs",[])
+    all_q = (results.get("p2p",[])
+             + results.get("usgs",[])
+             + results.get("jma_bosai",[]))
     return deduplicate(all_q)
 
 def deduplicate(quakes, time_tol_min=5, dist_tol_deg=0.3):
-    priority = {"jma": 0, "p2p": 1, "usgs": 2}
+    priority = {"jma_bosai": 0, "p2p": 1, "usgs": 2}
     quakes_sorted = sorted(quakes, key=lambda q: priority.get(q["source"], 9))
     kept = []
     for q in quakes_sorted:
@@ -263,8 +282,13 @@ def save_quakes(quakes):
         for q in quakes:
             key = (q["time"], str(q["lat"]), str(q["lon"]))
             if key not in existing:
-                writer.writerow([q["time"], q["lat"], q["lon"],
-                                  q["mag"], q["depth"], q.get("source","unknown")])
+                writer.writerow([
+                    q["time"], q["lat"], q["lon"],
+                    q["mag"], q["depth"],
+                    q.get("source", "unknown"),
+                    q.get("place", ""),
+                    q.get("max_int", ""),
+                ])
                 existing.add(key)
                 new_count += 1
     print(f"[保存] {new_count} 件追加")
@@ -276,14 +300,17 @@ def load_quakes():
     with open(DATA_FILE, encoding="utf-8") as f:
         for row in csv.reader(f):
             try:
-                data.append({
+                q = {
                     "time":   row[0],
                     "lat":    float(row[1]),
                     "lon":    float(row[2]),
                     "mag":    float(row[3]),
                     "depth":  float(row[4]),
                     "source": row[5] if len(row) > 5 else "unknown",
-                })
+                    "place":  row[6] if len(row) > 6 else "",
+                    "max_int": row[7] if len(row) > 7 else "",
+                }
+                data.append(q)
             except Exception:
                 continue
     return data
@@ -634,6 +661,7 @@ def _fetch_geonet_tec(dt: datetime) -> dict | None:
 
 
 
+def _ionex_candidates(dt):
     """
     日付に対応するIONEXファイルの(URL, ファイル名)リストを返す。
     IGS長名フォーマット（2022年以降）と旧短名フォーマット両方を含む。
@@ -725,83 +753,6 @@ def _download_ionex(dt):
 
     print(f"[IONEX] {date_str} 全ミラー失敗")
     return None
-
-
-def _parse_ionex(text):
-    """
-    IONEXテキスト（旧・新フォーマット共通）を解析。
-    戻り値: list of {"epoch": datetime, "tec": ndarray, "lat_arr": ndarray, "lon_arr": ndarray}
-    """
-    maps    = []
-    lines   = text.splitlines()
-    i       = 0
-    lat_arr = None
-    lon_arr = None
-
-    while i < len(lines):
-        line = lines[i]
-
-        if "LAT1 / LAT2 / DLAT" in line:
-            parts = line.split()
-            lat1, lat2, dlat = float(parts[0]), float(parts[1]), float(parts[2])
-            if lat_arr is None:
-                n = round(abs(lat2 - lat1) / abs(dlat)) + 1
-                lat_arr = np.linspace(lat1, lat2, n)
-
-        if "LON1 / LON2 / DLON" in line:
-            parts = line.split()
-            lon1, lon2, dlon = float(parts[0]), float(parts[1]), float(parts[2])
-            if lon_arr is None:
-                n = round(abs(lon2 - lon1) / abs(dlon)) + 1
-                lon_arr = np.linspace(lon1, lon2, n)
-
-        if "START OF TEC MAP" in line:
-            i += 1
-            # エポック
-            parts = lines[i].split()
-            try:
-                yr,mo,dy,hr,mi = int(parts[0]),int(parts[1]),int(parts[2]),\
-                                  int(parts[3]),int(parts[4])
-                epoch = datetime(yr, mo, dy, hr, mi, 0, tzinfo=timezone.utc)
-            except Exception:
-                i += 1
-                continue
-
-            if lat_arr is None or lon_arr is None:
-                i += 1
-                continue
-
-            n_lat   = len(lat_arr)
-            n_lon   = len(lon_arr)
-            tec_map = np.full((n_lat, n_lon), np.nan)
-            row_idx = 0
-            i += 1
-
-            while i < len(lines) and "END OF TEC MAP" not in lines[i]:
-                if "LAT/LON1/LON2/DLON/H" in lines[i]:
-                    i += 1
-                    col_idx = 0
-                    while i < len(lines) \
-                          and "LAT/LON1/LON2/DLON/H" not in lines[i] \
-                          and "END OF TEC MAP" not in lines[i]:
-                        for v in lines[i].split():
-                            if col_idx < n_lon:
-                                try:
-                                    tec_map[row_idx, col_idx] = float(v) * 0.1
-                                except ValueError:
-                                    pass
-                                col_idx += 1
-                        i += 1
-                    row_idx = min(row_idx + 1, n_lat - 1)
-                else:
-                    i += 1
-
-            maps.append({"epoch": epoch, "tec": tec_map,
-                         "lat_arr": lat_arr.copy(), "lon_arr": lon_arr.copy()})
-            continue
-        i += 1
-
-    return maps
 
 
 def _fetch_noaa_tec_fallback():
@@ -947,85 +898,6 @@ def compute_tec_zscore():
     # ── 3. NOAA SWPCフォールバック ──
     print("[TEC] IONEXすべて失敗 -> NOAA SWPCで代替")
     return _fetch_noaa_tec_fallback()
-
-
-    """
-    IONEXファイルの候補URLリストを返す（認証不要ミラー優先順）。
-    プロバイダ優先順: IGS/IGN(FR) -> CODE(AIUB) -> BKG(DE)
-    ファイル命名規則:
-      JPL  : jpld{DOY}0.{YY}i.gz
-      CODE : codg{DOY}0.{YY}i.gz
-      ESA  : esag{DOY}0.{YY}i.gz
-    """
-    doy  = dt.timetuple().tm_yday
-    yy   = dt.strftime("%y")
-    yyyy = dt.strftime("%Y")
-
-    candidates = []
-
-    # ── IGS/IGN Paris ミラー（認証不要 HTTPS）──
-    for prefix in ["jplg", "codg", "esag", "igsg"]:
-        fname = f"{prefix}{doy:03d}0.{yy}i.gz"
-        candidates.append((
-            f"https://igs.ign.fr/pub/igs/products/ionosphere/{yyyy}/{doy:03d}/{fname}",
-            fname,
-        ))
-
-    # ── CODE / AIUB ミラー（認証不要 FTP-over-HTTPS）──
-    for prefix in ["codg", "jplg"]:
-        fname = f"{prefix}{doy:03d}0.{yy}i.gz"
-        candidates.append((
-            f"https://ftp.aiub.unibe.ch/CODE/{yyyy}/{fname}",
-            fname,
-        ))
-
-    return candidates
-
-
-def _download_ionex(dt):
-    """
-    指定日のIONEXファイルをキャッシュから読むか、ミラーから取得して返す。
-    複数プロバイダ・複数ミラーをフォールバックしながら試みる。
-    """
-    os.makedirs(IONEX_CACHE_DIR, exist_ok=True)
-    date_str   = dt.strftime("%Y%m%d")
-    cache_path = os.path.join(IONEX_CACHE_DIR, f"tec_{date_str}.ionex")
-
-    if os.path.exists(cache_path):
-        with open(cache_path, "r", encoding="ascii", errors="ignore") as f:
-            return f.read()
-
-    for url, fname in _ionex_mirrors(dt):
-        try:
-            print(f"[IONEX] 試行: {url}")
-            r = requests.get(url, timeout=30,
-                             headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code != 200:
-                print(f"[IONEX] HTTP {r.status_code}: {url}")
-                continue
-            # .gz か生テキストかを判定
-            content = r.content
-            if content[:2] == b"\x1f\x8b":   # gzip magic bytes
-                with gzip.open(io.BytesIO(content), "rt",
-                               encoding="ascii", errors="ignore") as gz:
-                    text = gz.read()
-            else:
-                text = content.decode("ascii", errors="ignore")
-
-            if "IONEX" not in text[:200]:
-                print(f"[IONEX] IONEX形式ではない: {url}")
-                continue
-
-            with open(cache_path, "w", encoding="ascii") as f:
-                f.write(text)
-            print(f"[IONEX] 取得成功: {fname}")
-            return text
-        except Exception as e:
-            print(f"[IONEX] 失敗 {url}: {e}")
-            continue
-
-    print(f"[IONEX] {date_str} の全ミラー失敗")
-    return None
 
 def _parse_ionex(text):
     """
@@ -1283,7 +1155,7 @@ def create_etas_map(grid_scores, quakes, updated_str):
       <hr style="margin:4px 0;">
       <small>空間: べき乗則(q={EP.Q}) / 時間: Omori-Utsu(p={EP.P})<br>
       深さ補正あり / 背景活動率={EP.MU}<br>
-      JMA:{src_count.get('jma',0)} P2P:{src_count.get('p2p',0)} USGS:{src_count.get('usgs',0)}<br>
+      JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)} USGS:{src_count.get('usgs',0)}<br>
       計{len(quakes)}件 | {updated_str}</small>
     </div>"""
     m.get_root().html.add_child(Element(legend))
@@ -1487,6 +1359,247 @@ def create_combined_map(grid_scores, tec_result, quakes, updated_str):
 
 
 
+
+
+# ══════════════════════════════════════════════════════
+# 有感地震履歴タブ（JMA）
+# ══════════════════════════════════════════════════════
+
+# 震度→色
+INTENSITY_COLOR = {
+    "1": "#4ade80", "2": "#a3e635", "3": "#facc15",
+    "4": "#fb923c", "5-": "#f87171", "5+": "#ef4444",
+    "6-": "#dc2626", "6+": "#b91c1c", "7": "#7f1d1d",
+}
+INTENSITY_LABEL = {
+    "1":"震度1","2":"震度2","3":"震度3","4":"震度4",
+    "5-":"震度5弱","5+":"震度5強",
+    "6-":"震度6弱","6+":"震度6強","7":"震度7","-":"不明",
+}
+
+def _int_color(max_int):
+    return INTENSITY_COLOR.get(max_int, "#94a3b8")
+
+def _int_label(max_int):
+    return INTENSITY_LABEL.get(max_int, f"震度{max_int}" if max_int != "-" else "不明")
+
+def _fmt_time_jst(time_str):
+    """ISO8601文字列をJST表示に変換。"""
+    try:
+        dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+        jst = dt.astimezone(timezone(timedelta(hours=9)))
+        return jst.strftime("%m/%d %H:%M")
+    except Exception:
+        return time_str[:16]
+
+
+def create_felt_quake_page(jma_quakes, updated_str):
+    """
+    有感地震履歴: 左リスト + 右foliumマップ の分割レイアウトHTMLを返す。
+    iframeを使わず単一HTMLページとして生成。
+    """
+    # 時刻降順でソート
+    sorted_q = sorted(
+        jma_quakes,
+        key=lambda q: q.get("time", ""),
+        reverse=True
+    )[:60]  # 最大60件
+
+    # ── foliumマップ生成 ──
+    m = _base_map()
+    for q in sorted_q:
+        ci = _int_color(q.get("max_int", "-"))
+        mi = q.get("max_int", "-")
+        place = q.get("place", "不明")
+        mag   = q.get("mag", 0)
+        depth = q.get("depth", 0)
+        t_str = _fmt_time_jst(q.get("time", ""))
+        radius = max(5, mag * 3)
+        folium.CircleMarker(
+            location=[q["lat"], q["lon"]],
+            radius=radius,
+            color=ci, fill=True, fill_color=ci, fill_opacity=0.8,
+            tooltip=f"{place} M{mag:.1f} {_int_label(mi)} {t_str}",
+            popup=folium.Popup(
+                f"<b>{place}</b><br>"
+                f"発生: {t_str} JST<br>"
+                f"M{mag:.1f} / {_int_label(mi)}<br>"
+                f"深さ {depth:.0f}km",
+                max_width=220
+            ),
+        ).add_to(m)
+
+    map_html = m._repr_html_()
+
+    # ── リストHTML生成 ──
+    rows = ""
+    for i, q in enumerate(sorted_q):
+        ci    = _int_color(q.get("max_int", "-"))
+        mi    = _int_label(q.get("max_int", "-"))
+        place = q.get("place", "不明")
+        mag   = q.get("mag", 0)
+        depth = q.get("depth", 0)
+        t_str = _fmt_time_jst(q.get("time", ""))
+        mag_s = f"M{mag:.1f}"
+        depth_s = f"{depth:.0f}km"
+        rows += f"""
+        <tr onclick="focusQuake({q['lat']},{q['lon']},'{place}','{mi}','{mag_s}','{depth_s}','{t_str}')"
+            style="cursor:pointer;" class="qrow">
+          <td style="padding:7px 8px;font-weight:600;color:#f3f4f6;">{place}</td>
+          <td style="padding:7px 4px;color:#9ca3af;font-size:12px;">{t_str}</td>
+          <td style="padding:7px 4px;text-align:center;font-weight:700;color:#60a5fa;">{mag_s}</td>
+          <td style="padding:7px 4px;text-align:center;">
+            <span style="background:{ci};color:#000;padding:2px 6px;border-radius:4px;font-size:12px;font-weight:700;">
+              {mi}
+            </span>
+          </td>
+          <td style="padding:7px 4px;text-align:center;color:#9ca3af;font-size:12px;">{depth_s}</td>
+        </tr>"""
+
+    page = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ display: flex; height: 100vh; background: #0f172a; color: white;
+            font-family: "Helvetica Neue", Arial, sans-serif; overflow: hidden; }}
+    #list-panel {{
+      width: 380px; flex-shrink: 0;
+      background: #111827;
+      border-right: 2px solid #1f2937;
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }}
+    #list-header {{
+      padding: 14px 16px 10px;
+      background: #1f2937;
+      border-bottom: 1px solid #374151;
+      flex-shrink: 0;
+    }}
+    #list-header h2 {{ font-size: 16px; color: #f3f4f6; margin-bottom: 4px; }}
+    #list-header p  {{ font-size: 11px; color: #6b7280; }}
+    #list-scroll {{ flex: 1; overflow-y: auto; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    thead tr {{ background: #1f2937; position: sticky; top: 0; z-index: 10; }}
+    thead th {{ padding: 8px 6px; font-size: 11px; color: #9ca3af;
+                text-align: left; border-bottom: 1px solid #374151; }}
+    .qrow:hover {{ background: #1f2937; }}
+    .qrow:nth-child(even) {{ background: #0d1117; }}
+    #map-panel {{ flex: 1; }}
+    #map-panel iframe {{ width: 100%; height: 100%; border: none; }}
+    #detail-bar {{
+      position: fixed; bottom: 0; left: 380px; right: 0;
+      background: rgba(17,24,39,0.95);
+      border-top: 1px solid #374151;
+      padding: 8px 16px;
+      font-size: 13px; color: #d1d5db;
+      display: none; z-index: 999;
+    }}
+  </style>
+</head>
+<body>
+  <div id="list-panel">
+    <div id="list-header">
+      <h2>&#127981; 有感地震履歴（JMA）</h2>
+      <p>直近{len(sorted_q)}件 / {updated_str}</p>
+    </div>
+    <div id="list-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>震源名</th>
+            <th>発生時刻(JST)</th>
+            <th>M</th>
+            <th>最大震度</th>
+            <th>深さ</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="map-panel">
+    <iframe id="mapframe" srcdoc="{map_html.replace(chr(34), '&quot;')}"></iframe>
+  </div>
+
+  <div id="detail-bar" id="detail-bar">
+    <span id="detail-text"></span>
+  </div>
+
+  <script>
+    function focusQuake(lat, lon, place, intens, mag, depth, t) {{
+      var bar  = document.getElementById('detail-bar');
+      var text = document.getElementById('detail-text');
+      text.innerHTML = '&#128205; <b>' + place + '</b> &nbsp; '
+        + t + ' JST &nbsp; '
+        + mag + ' &nbsp; ' + intens + ' &nbsp; 深さ ' + depth;
+      bar.style.display = 'block';
+    }}
+  </script>
+</body>
+</html>"""
+    return page
+
+
+# ══════════════════════════════════════════════════════
+# 無感地震履歴タブ（P2P + USGS）
+# ══════════════════════════════════════════════════════
+
+def create_unfelt_quake_map(unfelt_quakes, updated_str):
+    """
+    無感地震履歴: P2P・USGSの地震をfoliumマップに表示。
+    マグニチュードで色分け・サイズ変更。
+    """
+    m = _base_map()
+
+    sorted_q = sorted(unfelt_quakes, key=lambda q: q.get("time",""), reverse=True)
+
+    # M別色
+    def _mag_color(mag):
+        if   mag >= 5.0: return "#ef4444"
+        elif mag >= 4.0: return "#fb923c"
+        elif mag >= 3.0: return "#facc15"
+        elif mag >= 2.0: return "#4ade80"
+        else:            return "#94a3b8"
+
+    src_count = {}
+    for q in sorted_q:
+        src = q.get("source", "?")
+        src_count[src] = src_count.get(src, 0) + 1
+        mag   = q.get("mag", 0)
+        depth = q.get("depth", 0)
+        t_str = _fmt_time_jst(q.get("time",""))
+        ci    = _mag_color(mag)
+        folium.CircleMarker(
+            location=[q["lat"], q["lon"]],
+            radius=max(3, mag * 2.5),
+            color=ci, fill=True, fill_color=ci, fill_opacity=0.7,
+            tooltip=f"M{mag:.1f} / {depth:.0f}km / {t_str} [{src}]",
+            popup=folium.Popup(
+                f"M{mag:.1f}<br>深さ {depth:.0f}km<br>{t_str} JST<br>ソース: {src}",
+                max_width=180
+            ),
+        ).add_to(m)
+
+    legend = f"""
+    <div style="position:fixed;bottom:30px;left:30px;z-index:1000;
+                background:rgba(17,24,39,0.92);padding:12px 16px;border-radius:8px;
+                border:1px solid #374151;font-size:13px;line-height:2.1;color:#f3f4f6;">
+      <b>&#127774; 無感地震履歴</b><br>
+      <span style="color:#ef4444;">&#9679;</span> M5.0以上<br>
+      <span style="color:#fb923c;">&#9679;</span> M4.0〜4.9<br>
+      <span style="color:#facc15;">&#9679;</span> M3.0〜3.9<br>
+      <span style="color:#4ade80;">&#9679;</span> M2.0〜2.9<br>
+      <span style="color:#94a3b8;">&#9679;</span> M2.0未満<br>
+      <hr style="border-color:#374151;margin:6px 0;">
+      <small>P2P:{src_count.get("p2p",0)}件 USGS:{src_count.get("usgs",0)}件<br>
+      計{len(sorted_q)}件 | {updated_str}</small>
+    </div>"""
+    m.get_root().html.add_child(Element(legend))
+    return m._repr_html_()
+
 def create_placeholder_map(title, subtitle):
     m = _base_map()
 
@@ -1667,11 +1780,11 @@ TAB_TEMPLATE = """<!DOCTYPE html>
   <div id="content">
 
     <div class="tab-panel active">
-      <iframe srcdoc="{{ felt_quake_map|e }}"></iframe>
+      <iframe srcdoc="{{ felt_quake_map|e }}" style="width:100%;height:100%;border:none;"></iframe>
     </div>
 
     <div class="tab-panel">
-      <iframe srcdoc="{{ unfelt_quake_map|e }}"></iframe>
+      <iframe srcdoc="{{ unfelt_quake_map|e }}" style="width:100%;height:100%;border:none;"></iframe>
     </div>
 
     <div class="tab-panel">
@@ -1720,7 +1833,7 @@ LOADING_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <title>地震リスクマップ - 起動中</title>
-  <meta http-equiv="refresh" content="15">
+  <meta http-equiv="refresh" content="5">
   <style>
     body { background:#1a1a2e; color:white; display:flex;
            align-items:center; justify-content:center; height:100vh;
@@ -1740,66 +1853,100 @@ LOADING_TEMPLATE = """<!DOCTYPE html>
 
 
 # ══════════════════════════════════════════════════════
-# バックグラウンド更新
+# バックグラウンド更新（段階的ロード）
 # ══════════════════════════════════════════════════════
+def _make_maps(quakes, tec_result, updated_str):
+    """地震データとTEC結果からマップ辞書を生成して返す。"""
+    grid_scores = analyze_etas(quakes)
+    m1 = create_etas_map(grid_scores, quakes, updated_str)
+    m2 = create_tec_map(tec_result, updated_str)
+    m3 = create_combined_map(grid_scores, tec_result, quakes, updated_str)
+
+    # 有感地震: JMAデータのみ（place/max_int フィールドあり）
+    # 有感地震: 気象庁bosai JSONデータ（震度1以上・place/max_int フィールドあり）
+    jma_quakes   = [q for q in quakes if q.get("source") == "jma_bosai"]
+    # 無感地震: P2P・USGSデータ（有感情報なし）
+    # 無感地震: P2P・USGSデータ（有感フラグなし・位置情報のみ）
+    unfelt_quakes = [q for q in quakes if q.get("source") in ("p2p", "usgs")]
+
+    return {
+        "felt_quake":  create_felt_quake_page(jma_quakes, updated_str),
+        "unfelt_quake": create_unfelt_quake_map(unfelt_quakes, updated_str),
+        "amedas": create_placeholder_map(
+            "アメダス観測値",
+            "気温・降水量・風速・積雪・気圧の統合表示を実装予定です。"
+        )._repr_html_(),
+        "radar": create_placeholder_map(
+            "雨雲レーダー",
+            "JMA雨雲レーダー統合を実装予定です。"
+        )._repr_html_(),
+        "warning": create_placeholder_map(
+            "警報・注意報",
+            "気象警報・注意報表示を実装予定です。"
+        )._repr_html_(),
+        "etas": m1._repr_html_(),
+        "tec": m2._repr_html_(),
+        "combined": m3._repr_html_(),
+    }
+
+
 def _background_updater():
-    global _cached_maps, _last_update
+    global _cached_maps, _last_update, _ready_phase
+    first_run = True
     while True:
         try:
             print("[BG] 更新開始")
             updated_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-            # 地震データ & TEC を並列取得
-            results = {}
-            def _fetch_quakes():
+            if first_run:
+                # ── フェーズ1: 地震データのみ（高速・数秒）──
+                # USGSはキャッシュ不要で即取得できるので単独で先行
+                print("[BG] フェーズ1: 地震データ取得中...")
                 new_q = fetch_all_quakes()
                 save_quakes(new_q)
-                results["quakes"] = load_quakes()
-            def _fetch_tec():
-                results["tec"] = compute_tec_zscore()
+                quakes = load_quakes()
+                maps_phase1 = _make_maps(quakes, None, updated_str + " ※TEC読込中")
+                with _cache_lock:
+                    _cached_maps = maps_phase1
+                    _last_update = time.time()
+                    _ready_phase = 1
+                print(f"[BG] フェーズ1完了（地震:{len(quakes)}件）→ 表示可能")
 
-            t1 = threading.Thread(target=_fetch_quakes)
-            t2 = threading.Thread(target=_fetch_tec)
-            t1.start(); t2.start()
-            t1.join();  t2.join()
+                # ── フェーズ2: TEC計算（低速・数十秒〜数分）──
+                print("[BG] フェーズ2: TEC計算中（バックグラウンド）...")
+                tec_result = compute_tec_zscore()
+                maps_phase2 = _make_maps(quakes, tec_result, updated_str)
+                with _cache_lock:
+                    _cached_maps = maps_phase2
+                    _last_update = time.time()
+                    _ready_phase = 2
+                print(f"[BG] フェーズ2完了（TEC:{'OK' if tec_result else 'NG'}）")
+                first_run = False
 
-            quakes     = results.get("quakes", [])
-            tec_result = results.get("tec")
+            else:
+                # 2回目以降: 地震とTECを並列取得
+                results = {}
+                def _fetch_quakes():
+                    new_q = fetch_all_quakes()
+                    save_quakes(new_q)
+                    results["quakes"] = load_quakes()
+                def _fetch_tec():
+                    results["tec"] = compute_tec_zscore()
 
-            # ETAS計算
-            grid_scores = analyze_etas(quakes)
+                t1 = threading.Thread(target=_fetch_quakes)
+                t2 = threading.Thread(target=_fetch_tec)
+                t1.start(); t2.start()
+                t1.join();  t2.join()
 
-            # 3マップ生成
-            m1 = create_etas_map(grid_scores, quakes, updated_str)
-            m2 = create_tec_map(tec_result, updated_str)
-            m3 = create_combined_map(grid_scores, tec_result, quakes, updated_str)
+                quakes     = results.get("quakes", [])
+                tec_result = results.get("tec")
+                maps = _make_maps(quakes, tec_result, updated_str)
+                with _cache_lock:
+                    _cached_maps = maps
+                    _last_update = time.time()
+                    _ready_phase = 2
+                print(f"[BG] 更新完了（地震:{len(quakes)} TEC:{'OK' if tec_result else 'NG'}）")
 
-            maps = {
-                "felt_quake": m1._repr_html_(),
-                "unfelt_quake": create_placeholder_map(
-                    "無感地震履歴",
-                    "無感地震マップ機能は今後追加予定です。"
-                )._repr_html_(),
-                "amedas": create_placeholder_map(
-                    "アメダス観測値",
-                    "気温・降水量・風速・積雪・気圧の統合表示を実装予定です。"
-                )._repr_html_(),
-                "radar": create_placeholder_map(
-                    "雨雲レーダー",
-                    "JMA雨雲レーダー統合を実装予定です。"
-                )._repr_html_(),
-                "warning": create_placeholder_map(
-                    "警報・注意報",
-                    "気象警報・注意報表示を実装予定です。"
-                )._repr_html_(),
-                "etas": m1._repr_html_(),
-                "tec": m2._repr_html_(),
-                "combined": m3._repr_html_(),
-            }
-            with _cache_lock:
-                _cached_maps = maps
-                _last_update = time.time()
-            print(f"[BG] 更新完了（地震:{len(quakes)} TEC:{'OK' if tec_result else 'NG'}）")
         except Exception as e:
             import traceback
             print(f"[BG] エラー: {e}")
@@ -1808,27 +1955,46 @@ def _background_updater():
         time.sleep(FETCH_INTERVAL_SEC)
 
 
+
 # ══════════════════════════════════════════════════════
 # Web ルーティング
 # ══════════════════════════════════════════════════════
 @app.route("/")
 def index():
     with _cache_lock:
-        maps = _cached_maps
+        maps  = _cached_maps
+        phase = _ready_phase
     if maps is None:
         return LOADING_TEMPLATE
 
-    return render_template_string(
+    # フェーズ1（地震のみ）の場合: 表示しつつTEC完了後に自動リロード
+    extra_head = ""
+    if phase == 1:
+        extra_head = '<meta http-equiv="refresh" content="30">'
+
+    html = render_template_string(
         TAB_TEMPLATE,
-        felt_quake_map = maps["felt_quake"],
+        felt_quake_map   = maps["felt_quake"],
         unfelt_quake_map = maps["unfelt_quake"],
-        amedas_map = maps["amedas"],
-        radar_map = maps["radar"],
-        warning_map = maps["warning"],
-        etas_map = maps["etas"],
-        tec_map = maps["tec"],
-        combined_map = maps["combined"],
+        amedas_map       = maps["amedas"],
+        radar_map        = maps["radar"],
+        warning_map      = maps["warning"],
+        etas_map         = maps["etas"],
+        tec_map          = maps["tec"],
+        combined_map     = maps["combined"],
     )
+    # フェーズ1のときだけ自動リロードを挿入
+    if phase == 1:
+        html = html.replace("</head>", f"{extra_head}</head>", 1)
+    return html
+
+
+@app.route("/status")
+def status():
+    with _cache_lock:
+        phase = _ready_phase
+        lu    = _last_update
+    return {"phase": phase, "last_update": lu}
 
 
 if __name__ == "__main__":
