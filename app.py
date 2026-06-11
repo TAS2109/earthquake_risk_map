@@ -52,7 +52,7 @@ ETAS_COLOR = {5:"#1a0033",4:"#8000ff",3:"#ff0000",2:"#ff8800",1:"#66ccff"}
 def fetch_quakes_p2p():
     url = "https://api.p2pquake.net/v2/history?codes=551&limit=100"
     try:
-        data = requests.get(url, timeout=10, headers={"User-Agent":"App/4.1"}).json()
+        data = requests.get(url, timeout=8, headers={"User-Agent":"App/4.1"}).json()
     except Exception as e:
         print(f"[P2P] {e}"); return []
     quakes = []
@@ -108,7 +108,7 @@ def fetch_quakes_usgs():
     url = (f"https://earthquake.usgs.gov/fdsnws/event/1/query"
            f"?format=geojson&starttime={start}&minlatitude=24&maxlatitude=46"
            f"&minlongitude=122&maxlongitude=146&minmagnitude=1.0&orderby=time&limit=500")
-    try: data = requests.get(url, timeout=15).json()
+    try: data = requests.get(url, timeout=12).json()
     except Exception as e:
         print(f"[USGS] {e}"); return []
     quakes = []
@@ -123,11 +123,20 @@ def fetch_quakes_usgs():
 
 def fetch_all_quakes():
     results = {}
-    def _run(name, fn): results[name] = fn()
-    threads = [threading.Thread(target=_run, args=(n,f)) for n,f in
+    errors  = {}
+    def _run(name, fn):
+        try:
+            results[name] = fn()
+        except Exception as e:
+            print(f"[fetch_all] {name} 例外: {e}")
+            errors[name] = e
+            results[name] = []
+
+    threads = [threading.Thread(target=_run, args=(n,f), daemon=True) for n,f in
                [("p2p",fetch_quakes_p2p),("usgs",fetch_quakes_usgs),("jma",fetch_quakes_jma_bosai)]]
     for t in threads: t.start()
-    for t in threads: t.join()
+    # 各スレッドに最大 20 秒のタイムアウト
+    for t in threads: t.join(timeout=20)
     all_q = results.get("p2p",[]) + results.get("usgs",[]) + results.get("jma",[])
     return _deduplicate(all_q)
 
@@ -164,13 +173,39 @@ def save_quakes(quakes):
                             q.get("source",""),q.get("place",""),q.get("max_int","")])
                 existing.add(key); new_count += 1
     print(f"[保存] {new_count}件追加")
+    _cleanup_old_quakes()
 
-def load_quakes():
+def _cleanup_old_quakes(keep_days=65):
+    """CSVから keep_days 日以前の古いデータを削除してファイル肥大化を防ぐ"""
+    if not os.path.exists(DATA_FILE): return
+    cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+    kept = []
+    removed = 0
+    with open(DATA_FILE, encoding="utf-8") as f:
+        for row in csv.reader(f):
+            try:
+                t = datetime.fromisoformat(row[0].replace("Z","+00:00"))
+                if t >= cutoff:
+                    kept.append(row)
+                else:
+                    removed += 1
+            except Exception:
+                kept.append(row)  # パース失敗行は保持
+    if removed > 0:
+        with open(DATA_FILE, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(kept)
+        print(f"[CSV整理] {removed}件削除、{len(kept)}件保持")
+
+def load_quakes(days=60):
+    """CSVから地震データを読み込む。days日以内のデータのみ返す（デフォルト60日）"""
     if not os.path.exists(DATA_FILE): return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     data = []
     with open(DATA_FILE, encoding="utf-8") as f:
         for row in csv.reader(f):
             try:
+                t = datetime.fromisoformat(row[0].replace("Z","+00:00"))
+                if t < cutoff: continue
                 data.append({"time":row[0],"lat":float(row[1]),"lon":float(row[2]),
                              "mag":float(row[3]),"depth":float(row[4]),
                              "source":row[5] if len(row)>5 else "","place":row[6] if len(row)>6 else "",
@@ -930,10 +965,27 @@ height:100vh;font-family:sans-serif;flex-direction:column;gap:16px}
 # ══════════════════════════════════════════════════════
 def _update_data():
     global _cached_data, _last_update, _ready_phase
+    first_run = True
     while True:
         try:
             print("[BG] 更新開始")
             updated_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+            if first_run:
+                # ── フェーズ1: CSVが既にあればすぐ表示可能にする ──
+                existing = load_quakes()
+                if existing:
+                    grid_scores = analyze_etas(existing)
+                    jma  = [q for q in existing if q.get("source")=="jma_bosai"]
+                    unft = [q for q in existing if q.get("source") in ("p2p","usgs")]
+                    with _cache_lock:
+                        _cached_data = {"jma":jma,"unfelt":unft,"etas":grid_scores,
+                                        "all":existing,"updated":updated_str+"(キャッシュ)"}
+                        _last_update = time.time()
+                        _ready_phase = 2
+                    print(f"[BG] フェーズ1完了: CSVから {len(existing)} 件即時表示")
+
+            # ── フェーズ2: 新規データ取得（必ず実行）──
             new_q = fetch_all_quakes()
             save_quakes(new_q)
             quakes = load_quakes()
@@ -946,8 +998,17 @@ def _update_data():
                 _last_update = time.time()
                 _ready_phase = 2
             print(f"[BG] 完了 JMA:{len(jma)} 無感:{len(unft)} ETAS格子:{len(grid_scores)}")
+            first_run = False
+
         except Exception as e:
             import traceback; print(f"[BG] エラー: {e}"); traceback.print_exc()
+            # エラー時も最低限表示できるよう ready_phase を 2 にする
+            with _cache_lock:
+                if _ready_phase < 2 and _cached_data is None:
+                    _cached_data = {"jma":[],"unfelt":[],"etas":{},"all":[],"updated":"取得失敗"}
+                    _ready_phase = 2
+            first_run = False
+
         time.sleep(FETCH_INTERVAL_SEC)
 
 
