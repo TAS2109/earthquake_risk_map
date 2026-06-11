@@ -52,7 +52,7 @@ ETAS_COLOR = {5:"#1a0033",4:"#8000ff",3:"#ff0000",2:"#ff8800",1:"#66ccff"}
 def fetch_quakes_p2p():
     url = "https://api.p2pquake.net/v2/history?codes=551&limit=100"
     try:
-        data = requests.get(url, timeout=8, headers={"User-Agent":"App/4.1"}).json()
+        data = requests.get(url, timeout=8, headers={"User-Agent":"App/4.2"}).json()
     except Exception as e:
         print(f"[P2P] {e}"); return []
     quakes = []
@@ -69,7 +69,13 @@ def fetch_quakes_p2p():
                 dt_jst = datetime.strptime(f"{now_y}/{raw_time}", "%Y/%m/%d %H:%M")
                 time_str = dt_jst.replace(tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc).isoformat()
             except Exception: time_str = raw_time
-            quakes.append({"time":time_str,"lat":lat,"lon":lon,"mag":mag,"depth":depth,"source":"p2p"})
+            # P2Pは有感地震データ（震度情報付き）
+            max_int = item.get("points", [{}])[0].get("scale","") if item.get("points") else ""
+            # scaleを震度文字列に変換
+            scale_map = {10:"1",20:"2",30:"3",40:"4",45:"5-",50:"5+",55:"6-",60:"6+",70:"7"}
+            if isinstance(max_int, int): max_int = scale_map.get(max_int, str(max_int))
+            quakes.append({"time":time_str,"lat":lat,"lon":lon,"mag":mag,"depth":depth,
+                           "source":"p2p","place":hypo.get("name","不明"),"max_int":str(max_int)})
         except Exception: continue
     print(f"[P2P] {len(quakes)}件"); return quakes
 
@@ -82,7 +88,7 @@ def _parse_jma_cod(cod_str):
 
 def fetch_quakes_jma_bosai():
     try:
-        data = requests.get(JMA_LIST_URL, timeout=10, headers={"User-Agent":"App/4.1"}).json()
+        data = requests.get(JMA_LIST_URL, timeout=10, headers={"User-Agent":"App/4.2"}).json()
     except Exception as e:
         print(f"[JMA] {e}"); return []
     quakes = []
@@ -90,7 +96,7 @@ def fetch_quakes_jma_bosai():
         if item.get("ttl") != "震源・震度情報": continue
         if item.get("ift") in ("訂正","取消"): continue
         maxi = item.get("maxi","")
-        if not maxi: continue
+        # max_intがなくても震源情報があれば取得（無感地震も含む）
         try: lat, lon, depth = _parse_jma_cod(item["cod"])
         except Exception: continue
         try: mag = float(item.get("mag","0"))
@@ -117,25 +123,23 @@ def fetch_quakes_usgs():
             props = feat["properties"]; coords = feat["geometry"]["coordinates"]
             t = datetime.fromtimestamp(props["time"]/1000, tz=timezone.utc)
             quakes.append({"time":t.isoformat(),"lat":float(coords[1]),"lon":float(coords[0]),
-                           "mag":float(props["mag"]),"depth":float(coords[2]),"source":"usgs"})
+                           "mag":float(props["mag"]),"depth":float(coords[2]),"source":"usgs",
+                           "place":props.get("place",""),"max_int":""})
         except Exception: continue
     print(f"[USGS] {len(quakes)}件"); return quakes
 
 def fetch_all_quakes():
     results = {}
-    errors  = {}
     def _run(name, fn):
         try:
             results[name] = fn()
         except Exception as e:
             print(f"[fetch_all] {name} 例外: {e}")
-            errors[name] = e
             results[name] = []
 
     threads = [threading.Thread(target=_run, args=(n,f), daemon=True) for n,f in
                [("p2p",fetch_quakes_p2p),("usgs",fetch_quakes_usgs),("jma",fetch_quakes_jma_bosai)]]
     for t in threads: t.start()
-    # 各スレッドに最大 20 秒のタイムアウト
     for t in threads: t.join(timeout=20)
     all_q = results.get("p2p",[]) + results.get("usgs",[]) + results.get("jma",[])
     return _deduplicate(all_q)
@@ -176,7 +180,6 @@ def save_quakes(quakes):
     _cleanup_old_quakes()
 
 def _cleanup_old_quakes(keep_days=65):
-    """CSVから keep_days 日以前の古いデータを削除してファイル肥大化を防ぐ"""
     if not os.path.exists(DATA_FILE): return
     cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
     kept = []
@@ -190,14 +193,13 @@ def _cleanup_old_quakes(keep_days=65):
                 else:
                     removed += 1
             except Exception:
-                kept.append(row)  # パース失敗行は保持
+                kept.append(row)
     if removed > 0:
         with open(DATA_FILE, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerows(kept)
         print(f"[CSV整理] {removed}件削除、{len(kept)}件保持")
 
 def load_quakes(days=60):
-    """CSVから地震データを読み込む。days日以内のデータのみ返す（デフォルト60日）"""
     if not os.path.exists(DATA_FILE): return []
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     data = []
@@ -315,10 +317,13 @@ DARK_TILE = "L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}
 # ══════════════════════════════════════════════════════
 def render_felt_quake(jma_quakes, updated_str):
     one_month_ago = datetime.now(timezone.utc) - timedelta(days=31)
-    sorted_q = sorted([q for q in jma_quakes if _quake_after(q, one_month_ago)],
+    # 有感地震 = max_int が設定されているもの（JMA + P2Pから）
+    felt = [q for q in jma_quakes if q.get("max_int","") not in ("","-","")]
+    # さらにmax_intが実際に存在するものに限定
+    felt = [q for q in jma_quakes if q.get("max_int","").strip() not in ("","−","-")]
+    sorted_q = sorted([q for q in felt if _quake_after(q, one_month_ago)],
                       key=lambda q: q.get("time",""), reverse=True)
 
-    # マーカーデータをJSに渡す（foliumなし）
     markers = []
     for i, q in enumerate(sorted_q):
         ci  = _int_color(q.get("max_int","-"))
@@ -367,7 +372,7 @@ thead th{{padding:7px 5px;font-size:11px;color:#9ca3af;text-align:left;border-bo
     border-top:1px solid #374151;padding:7px 14px;font-size:12px;color:#d1d5db;display:none;z-index:999}}
 </style></head><body>
 <div id="lp">
-  <div id="lh"><h2>&#127981; 有感地震履歴（JMA）</h2><p>直近{len(sorted_q)}件 / {updated_str}</p></div>
+  <div id="lh"><h2>有感地震履歴（JMA）</h2><p>直近{len(sorted_q)}件 / {updated_str}</p></div>
   <div id="ls"><table>
     <thead><tr><th>震源名</th><th>発生時刻</th><th>M</th><th>最大震度</th><th>深さ</th></tr></thead>
     <tbody>{rows}</tbody>
@@ -381,7 +386,7 @@ var map = L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
 {GEOJSON_JS}
 var MK = {markers_js};
 var layers = MK.map(function(d){{
-  return L.circleMarker([d.lat,d.lon],{{radius:d.radius,color:d.color,fillColor:d.color,fillOpacity:0.8,weight:1}})
+  return L.circleMarker([d.lat,d.lon],{{radius:d.radius,color:d.color,fillColor:d.color,fillOpacity:0.9,weight:1}})
           .bindTooltip(d.tip).bindPopup(d.pop);
 }});
 var lg = L.layerGroup(layers).addTo(map);
@@ -391,7 +396,7 @@ function focusQ(idx,lat,lon){{
   map.flyTo([lat,lon],8,{{duration:0.8}});
   if(layers[idx]) setTimeout(function(){{layers[idx].openPopup()}},900);
   var d=MK[idx];
-  document.getElementById('dt').innerHTML='&#128205; <b>'+d.tip+'</b>';
+  document.getElementById('dt').innerHTML='<b>'+d.tip+'</b>';
   document.getElementById('db').style.display='block';
 }}
 </script></body></html>"""
@@ -401,6 +406,7 @@ function focusQ(idx,lat,lon){{
 # 無感地震履歴タブ
 # ══════════════════════════════════════════════════════
 def render_unfelt_quake(unfelt_quakes, updated_str):
+    # 無感地震 = max_intが空または存在しないもの（USGS, P2Pの一部, JMAの無感）
     sorted_q = sorted(unfelt_quakes, key=lambda q: q.get("time",""), reverse=True)
 
     def _mag_color(mag):
@@ -432,7 +438,7 @@ def render_unfelt_quake(unfelt_quakes, updated_str):
 <div id="map"></div>
 <div style="position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
     padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:2;color:#f3f4f6">
-  <b>&#127774; 無感地震履歴</b><br>
+  <b>無感地震履歴</b><br>
   <span style="color:#ff00ff">&#9679;</span> M8.0以上<br>
   <span style="color:#7f1d1d">&#9679;</span> M7.0〜7.9<br>
   <span style="color:#ef4444">&#9679;</span> M6.0〜6.9<br>
@@ -461,7 +467,7 @@ MK.forEach(function(d){{
 def _fetch_amedas_table():
     url = "https://www.jma.go.jp/bosai/amedas/const/amedastable.json"
     try:
-        raw = requests.get(url, timeout=10, headers={"User-Agent":"App/4.1"}).json()
+        raw = requests.get(url, timeout=10, headers={"User-Agent":"App/4.2"}).json()
         table = {}
         for sid, info in raw.items():
             lr = info.get("lat",[0,0]); lo = info.get("lon",[0,0])
@@ -474,11 +480,11 @@ def _fetch_amedas_table():
 def _fetch_amedas_latest():
     try:
         t_text = requests.get("https://www.jma.go.jp/bosai/amedas/data/latest_time.txt",
-                              timeout=8, headers={"User-Agent":"App/4.1"}).text.strip()
+                              timeout=8, headers={"User-Agent":"App/4.2"}).text.strip()
         dt = datetime.fromisoformat(t_text)
         ts = dt.strftime("%Y%m%d%H%M%S")
         data = requests.get(f"https://www.jma.go.jp/bosai/amedas/data/map/{ts}.json",
-                            timeout=10, headers={"User-Agent":"App/4.1"}).json()
+                            timeout=10, headers={"User-Agent":"App/4.2"}).json()
         time_label = dt.astimezone(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M JST")
         print(f"[AMEDAS] 観測値:{len(data)}局 ({time_label})"); return data, time_label
     except Exception as e:
@@ -488,9 +494,11 @@ def _gradient_color(val, vmin, vmax, scheme):
     ratio = max(0.0, min(1.0, (val-vmin)/max(vmax-vmin, 0.01)))
     SCHEMES = {
         "heat": [(0,(0,0,180)),(0.20,(0,80,255)),(0.35,(0,220,100)),(0.50,(255,255,0)),(0.65,(255,160,0)),(0.80,(255,60,0)),(1.0,(180,0,0))],
-        "prec": [(0,(255,255,255)),(0.10,(150,220,255)),(0.25,(0,80,220)),(0.40,(0,200,80)),(0.55,(230,230,0)),(0.70,(255,130,0)),(0.85,(220,20,20)),(1.0,(140,0,200))],
+        # 降水量: 0.5mm〜80mm以上に対応
+        "prec": [(0,(200,240,255)),(0.10,(80,180,255)),(0.25,(0,80,220)),(0.40,(0,180,80)),(0.55,(220,220,0)),(0.70,(255,130,0)),(0.85,(220,20,20)),(1.0,(140,0,200))],
         "pres": [(0,(80,0,180)),(0.25,(160,80,240)),(0.50,(230,230,230)),(0.75,(255,180,40)),(1.0,(200,80,0))],
-        "wind": [(0,(240,240,255)),(0.15,(80,220,240)),(0.30,(0,100,220)),(0.50,(230,230,0)),(0.65,(255,130,0)),(0.80,(220,20,20)),(1.0,(140,0,200))],
+        # 風速: 0〜30m/s以上に対応
+        "wind": [(0,(200,220,255)),(0.10,(80,200,240)),(0.25,(0,100,220)),(0.45,(100,220,100)),(0.60,(230,230,0)),(0.75,(255,130,0)),(0.90,(220,20,20)),(1.0,(140,0,200))],
     }
     stops = SCHEMES.get(scheme, [(0,(128,128,128)),(1,(128,128,128))])
     r,g,b = stops[-1][1]
@@ -524,13 +532,17 @@ def render_amedas(updated_str):
     for sid,obs in obs_data.items():
         v=_gv(obs,"temp");            temp_vals.append(v) if v is not None else None
         v=_gv(obs,"precipitation1h"); prec_vals.append(v) if v is not None else None
-        v=_gv(obs,"pressure");        pres_vals.append(v) if v is not None else None
+        # 海面気圧 normalPressure を使用（現地気圧 pressure ではなく）
+        v=_gv(obs,"normalPressure");  pres_vals.append(v) if v is not None else None
         v=_gv(obs,"wind");            wind_vals.append(v) if v is not None else None
 
     t_min=-20.0; t_max=45.0
-    p_min=min(prec_vals) if prec_vals else 0;   p_max=max(prec_vals) if prec_vals else 50
+    # 降水量: 0.5mm〜80mm固定レンジ
+    p_min=0.5; p_max=80.0
+    # 気圧: 実データの範囲
     pr_min=min(pres_vals) if pres_vals else 980; pr_max=max(pres_vals) if pres_vals else 1030
-    w_min=0; w_max=max(wind_vals) if wind_vals else 20
+    # 風速: 0〜30m/s固定レンジ
+    w_min=0.0; w_max=30.0
 
     layers = {"temp":[],"prec":[],"pres":[],"wind":[]}
     for sid, obs in obs_data.items():
@@ -540,13 +552,14 @@ def render_amedas(updated_str):
         if not (24<=lat<=46 and 122<=lon<=146): continue
         name=info["name"]
         temp=_gv(obs,"temp"); prec=_gv(obs,"precipitation1h")
-        pres=_gv(obs,"pressure"); wind=_gv(obs,"wind")
+        # 海面気圧を取得
+        pres=_gv(obs,"normalPressure"); wind=_gv(obs,"wind")
         wdir_raw=obs.get("windDirection"); wdir_idx=wdir_raw[0] if isinstance(wdir_raw,list) else None
         wdir_str=WIND_DIR_16[wdir_idx-1] if wdir_idx and 1<=wdir_idx<=16 else "静穏"
         if temp is not None:
             layers["temp"].append({"lat":lat,"lon":lon,"color":_gradient_color(temp,t_min,t_max,"heat"),
                 "tip":f"{name} {temp}℃","pop":f"<b>{name}</b><br>気温:<b>{temp}℃</b>"})
-        if prec is not None and prec > 0:
+        if prec is not None and prec >= 0.5:
             layers["prec"].append({"lat":lat,"lon":lon,"color":_gradient_color(prec,p_min,p_max,"prec"),
                 "tip":f"{name} {prec}mm/h","pop":f"<b>{name}</b><br>降水量:<b>{prec}mm/h</b>"})
         if pres is not None:
@@ -556,14 +569,14 @@ def render_amedas(updated_str):
             ang = (wdir_idx-1)*22.5 if wdir_idx and 1<=wdir_idx<=16 else 0
             layers["wind"].append({"lat":lat,"lon":lon,"color":_gradient_color(wind,w_min,w_max,"wind"),
                 "tip":f"{name} {wdir_str} {wind}m/s","pop":f"<b>{name}</b><br>風速:<b>{wind}m/s</b><br>風向:{wdir_str}",
-                "angle":ang})
+                "angle":ang,"wdir_str":wdir_str,"wind_val":wind})
 
     data_js = json.dumps(layers)
     legends = {
-        "temp": f'<b>🌡 気温</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#0000b4,#0050ff,#00e050,#ffff00,#ff8200,#ff3c00,#b40000);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>-20℃</span><span>45℃</span></div>',
-        "prec": f'<b>🌧 降水量</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#fff,#96dcff,#0050dc,#00c850,#e6e600,#ff8200,#dc1414,#8c00c8);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>0mm</span><span>{p_max:.0f}mm</span></div>',
-        "pres": f'<b>📊 海面気圧</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#5000b4,#a050f0,#e6e6e6,#ffb428,#c85000);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>{pr_min:.0f}hPa</span><span>{pr_max:.0f}hPa</span></div>',
-        "wind": f'<b>💨 風速（▲風向）</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#f0f0ff,#50dcf0,#0064dc,#e6e600,#ff8200,#dc1414,#8c00c8);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>0m/s</span><span>{w_max:.0f}m/s</span></div>',
+        "temp": f'<b>気温</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#0000b4,#0050ff,#00e050,#ffff00,#ff8200,#ff3c00,#b40000);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>-20℃</span><span>45℃</span></div>',
+        "prec": f'<b>降水量</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#c8f0ff,#50b4ff,#0050dc,#00b450,#dcdc00,#ff8200,#dc1414,#8c00c8);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>0.5mm</span><span>80mm+</span></div>',
+        "pres": f'<b>海面気圧</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#5000b4,#a050f0,#e6e6e6,#ffb428,#c85000);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>{pr_min:.0f}hPa</span><span>{pr_max:.0f}hPa</span></div>',
+        "wind": f'<b>風速・風向</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#c8dcff,#50c8f0,#0064dc,#64dc64,#e6e600,#ff8200,#dc1414,#8c00c8);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>0m/s</span><span>30m/s+</span></div><div style="font-size:10px;color:#9ca3af;margin-top:3px">矢印の向き=風向き</div>',
     }
     legends_js = json.dumps(legends)
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -577,10 +590,10 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
 #lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:1.8;color:#f3f4f6;pointer-events:none}}
 </style></head><body>
 <div id="tb">
-  <button class="at active" onclick="sw('temp',this)">🌡 気温</button>
-  <button class="at" onclick="sw('prec',this)">🌧 降水量</button>
-  <button class="at" onclick="sw('pres',this)">📊 気圧</button>
-  <button class="at" onclick="sw('wind',this)">💨 風速</button>
+  <button class="at active" onclick="sw('temp',this)">気温</button>
+  <button class="at" onclick="sw('prec',this)">降水量</button>
+  <button class="at" onclick="sw('pres',this)">気圧</button>
+  <button class="at" onclick="sw('wind',this)">風速</button>
 </div>
 <div id="map"></div>
 <div id="lg"></div>
@@ -590,21 +603,51 @@ var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
 var DATA={data_js};
 var LGD={legends_js};
 var cur=null;
-function mkWindIcon(color,angle){{
-  var sz=14,c=document.createElement('canvas');c.width=sz;c.height=sz;
-  var ctx=c.getContext('2d');ctx.save();ctx.translate(sz/2,sz/2);ctx.rotate(angle*Math.PI/180);
-  ctx.beginPath();ctx.moveTo(0,-sz/2+1);ctx.lineTo(sz/2-1,sz/2-2);ctx.lineTo(-sz/2+1,sz/2-2);
-  ctx.closePath();ctx.fillStyle=color;ctx.globalAlpha=0.9;ctx.fill();ctx.restore();
+
+// 風向矢印アイコン（方向が明確な矢印デザイン）
+function mkWindIcon(color,angle,wdir_str,wind_val){{
+  var sz=20;
+  var c=document.createElement('canvas');
+  c.width=sz;c.height=sz;
+  var ctx=c.getContext('2d');
+  ctx.save();
+  ctx.translate(sz/2,sz/2);
+  // 風向きの方向に矢印を向ける（気象の風向=風が吹いてくる方向→矢印は吹いていく方向へ）
+  ctx.rotate(angle*Math.PI/180);
+  // 矢印（三角形の先端が進む方向）
+  ctx.beginPath();
+  // 矢印の幹
+  ctx.moveTo(0, 6);
+  ctx.lineTo(0, -4);
+  // 矢印の頭（上向き三角）
+  ctx.moveTo(0, -9);
+  ctx.lineTo(-5, -2);
+  ctx.lineTo(5, -2);
+  ctx.closePath();
+  ctx.fillStyle=color;
+  ctx.fill();
+  // 中心に小さな円
+  ctx.beginPath();
+  ctx.arc(0,5,2,0,Math.PI*2);
+  ctx.fillStyle='rgba(255,255,255,0.6)';
+  ctx.fill();
+  ctx.restore();
   return L.icon({{iconUrl:c.toDataURL(),iconSize:[sz,sz],iconAnchor:[sz/2,sz/2]}});
 }}
+
 function sw(key,btn){{
   document.querySelectorAll('.at').forEach(function(b){{b.classList.remove('active')}});
   btn.classList.add('active');
   if(cur)map.removeLayer(cur);
   var items=DATA[key];
   var mk=items.map(function(d){{
-    if(key==='wind')return L.marker([d.lat,d.lon],{{icon:mkWindIcon(d.color,d.angle||0)}}).bindTooltip(d.tip).bindPopup(d.pop);
-    return L.circleMarker([d.lat,d.lon],{{radius:5,color:d.color,fillColor:d.color,fillOpacity:0.85,weight:1}}).bindTooltip(d.tip).bindPopup(d.pop);
+    if(key==='wind'){{
+      return L.marker([d.lat,d.lon],{{icon:mkWindIcon(d.color,d.angle||0,d.wdir_str,d.wind_val)}})
+               .bindTooltip(d.tip).bindPopup(d.pop);
+    }}
+    // 円を小さく(radius:3)・不透明に(fillOpacity:1.0)
+    return L.circleMarker([d.lat,d.lon],{{radius:3,color:d.color,fillColor:d.color,fillOpacity:1.0,weight:0.5}})
+             .bindTooltip(d.tip).bindPopup(d.pop);
   }});
   cur=L.layerGroup(mk).addTo(map);
   document.getElementById('lg').innerHTML=LGD[key]+'<hr style="border-color:#374151;margin:5px 0"><small>{time_label}<br>{updated_str}</small>';
@@ -638,12 +681,12 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
 </style></head><body>
 <div id="map"></div>
 <div id="ctrl">
-  <button id="pb" onclick="tp()">▶ 再生</button>
+  <button id="pb" onclick="tp()">&#9654; 再生</button>
   <input type="range" id="sl" min="0" max="23" value="23" step="1" oninput="sf(+this.value)">
   <span id="tl">--:-- JST</span>
 </div>
 <div id="lg">
-  <b>🌧 高解像度降水ナウキャスト</b><br>
+  <b>高解像度降水ナウキャスト</b><br>
   <div style="display:flex;gap:3px;align-items:center;font-size:11px;margin-top:4px">
     <div style="width:12px;height:10px;background:#c8f0ff;border:1px solid #555"></div>1未満
     <div style="width:12px;height:10px;background:#5db8f5;border:1px solid #555;margin-left:2px"></div>5
@@ -662,13 +705,53 @@ var map=L.map('map',{{center:[36,138],zoom:6,preferCanvas:true}});
 fetch('https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson')
   .then(r=>r.json()).then(d=>L.geoJSON(d,{{style:{{fillOpacity:0,color:'#555',weight:1}}}}).addTo(map));
 var rl=null,ci=FRAMES.length-1,playing=false,pt=null;
-function sf(idx){{ci=idx;document.getElementById('sl').value=idx;document.getElementById('tl').textContent=FRAMES[idx].label;
+
+function sf(idx){{
+  ci=idx;
+  document.getElementById('sl').value=idx;
+  document.getElementById('tl').textContent=FRAMES[idx].label;
   var dt=FRAMES[idx].dt_str;
-  if(rl)map.removeLayer(rl);
-  rl=L.tileLayer('https://www.jma.go.jp/bosai/jmatile/data/nowc/'+dt+'/none/'+dt+'/surf/hrpns/{{z}}/{{x}}/{{y}}.png',
-    {{attribution:'気象庁',opacity:0.75,minZoom:4,maxZoom:14,errorTileUrl:''}}).addTo(map);
+  // 既存レイヤーを削除
+  if(rl){{ map.removeLayer(rl); rl=null; }}
+  // 新しいタイルレイヤーを追加（zoomchangeに依存せず毎回再生成）
+  rl=L.tileLayer(
+    'https://www.jma.go.jp/bosai/jmatile/data/nowc/'+dt+'/none/'+dt+'/surf/hrpns/{{z}}/{{x}}/{{y}}.png',
+    {{
+      attribution:'気象庁',
+      opacity:0.75,
+      minZoom:4,
+      maxZoom:14,
+      errorTileUrl:'',
+      // ズーム変化後もタイルを再読込するためキャッシュを無効化
+      updateWhenZooming:false,
+      keepBuffer:0
+    }}
+  ).addTo(map);
 }}
-function tp(){{playing=!playing;document.getElementById('pb').textContent=playing?'⏸ 停止':'▶ 再生';
+
+// ズーム・移動後にレーダーレイヤーを再描画（消えるバグの修正）
+map.on('zoomend moveend', function(){{
+  if(rl){{
+    var currentDt = FRAMES[ci].dt_str;
+    map.removeLayer(rl);
+    rl=L.tileLayer(
+      'https://www.jma.go.jp/bosai/jmatile/data/nowc/'+currentDt+'/none/'+currentDt+'/surf/hrpns/{{z}}/{{x}}/{{y}}.png',
+      {{
+        attribution:'気象庁',
+        opacity:0.75,
+        minZoom:4,
+        maxZoom:14,
+        errorTileUrl:'',
+        updateWhenZooming:false,
+        keepBuffer:0
+      }}
+    ).addTo(map);
+  }}
+}});
+
+function tp(){{
+  playing=!playing;
+  document.getElementById('pb').textContent=playing?'&#9646;&#9646; 停止':'&#9654; 再生';
   if(playing){{pt=setInterval(function(){{sf((ci+1)%FRAMES.length)}},800)}}else{{clearInterval(pt)}}
 }}
 sf(ci);
@@ -728,31 +811,45 @@ def _fetch_warnings_all():
 
     unique_codes = list(dict.fromkeys(PREF_CODE_LIST))
     warning_data = {}
+    lock = threading.Lock()
+
     def _fetch_one(code):
         url = f"https://www.jma.go.jp/bosai/warning/data/warning/{code}.json"
         try:
-            data = requests.get(url, timeout=8, headers={"User-Agent":"App/4.1"}).json()
-        except Exception: return
-        for area_type in ("areaWarning","areaForecast"):
-            for area in data.get(area_type,[]):
-                items = area.get("warnings",[])
+            resp = requests.get(url, timeout=8, headers={"User-Agent":"App/4.2"})
+            if resp.status_code != 200: return
+            data = resp.json()
+        except Exception as e:
+            print(f"[WARNING] {code} エラー: {e}"); return
+
+        # JMA警報APIのレスポンス構造: {"areaTypes": [...]}
+        area_types = data.get("areaTypes", [])
+        for area_type_obj in area_types:
+            for area in area_type_obj.get("areas", []):
+                items = area.get("warnings", [])
                 if not items: continue
                 active = []
                 for w in items:
-                    if w.get("status") not in ("発表","継続","特別警報"): continue
+                    status = w.get("status","")
+                    if status not in ("発表","継続","特別警報"): continue
                     wcode = str(w.get("code",""))
                     if wcode in WARNING_TYPES:
                         name,level,color = WARNING_TYPES[wcode]
                         active.append({"type_name":name,"level":level,"color":color})
                 if active:
                     active.sort(key=lambda x: -x["level"])
-                    area_name = area.get("name",code)
-                    key = f"{area_name}:{code}"
-                    if key not in warning_data:
-                        warning_data[key] = {"pref_code":code,"area_name":area_name,"warnings":active}
+                    area_name = area.get("name", code)
+                    area_code = area.get("code", code)
+                    key = f"{area_name}:{area_code}"
+                    with lock:
+                        if key not in warning_data:
+                            warning_data[key] = {"pref_code":code,"area_name":area_name,
+                                                  "area_code":area_code,"warnings":active}
+
     threads = [threading.Thread(target=_fetch_one, args=(c,)) for c in unique_codes]
     for t in threads: t.start()
-    for t in threads: t.join()
+    for t in threads: t.join(timeout=30)
+    print(f"[WARNING] {len(warning_data)}地域で警報・注意報")
     _warning_cache = {"data": warning_data, "ts": now}
     return warning_data
 
@@ -761,8 +858,8 @@ def render_warning(updated_str):
 
     markers = []
     for key, info in warning_data.items():
-        pref_code = info["pref_code"]; area_code = key.split(":")[-1] if ":" in key else pref_code
-        coord = PREF_CENTERS.get(area_code) or PREF_CENTERS.get(pref_code)
+        pref_code = info["pref_code"]
+        coord = PREF_CENTERS.get(pref_code)
         if not coord:
             for k in PREF_CENTERS:
                 if k.startswith(pref_code[:3]): coord = PREF_CENTERS[k]; break
@@ -798,7 +895,7 @@ def render_warning(updated_str):
 {no_warn_html}
 <div style="position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
     padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:2;color:#f3f4f6">
-  <b>&#9888; 警報・注意報</b><br>
+  <b>警報・注意報</b><br>
   <span style="color:#ef4444">&#9679;</span> 警報発令中<br>
   <span style="color:#fb923c">&#9679;</span> 注意報発令中<br>
   <span style="color:#fbbf24">&#9679;</span> その他注意報<br>
@@ -811,7 +908,7 @@ var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
 {GEOJSON_JS}
 var MK={markers_js};
 MK.forEach(function(d){{
-  L.circleMarker([d.lat,d.lon],{{radius:d.radius,color:d.color,fillColor:d.color,fillOpacity:0.75,weight:2}})
+  L.circleMarker([d.lat,d.lon],{{radius:d.radius,color:d.color,fillColor:d.color,fillOpacity:0.9,weight:2}})
    .bindTooltip(d.tip).bindPopup(d.pop).addTo(map);
 }});
 </script></body></html>"""
@@ -845,15 +942,15 @@ def render_etas(grid_scores, quakes, updated_str):
 <style>*{{box-sizing:border-box;margin:0;padding:0}}body,html{{height:100%;overflow:hidden}}
 #map{{width:100%;height:100vh}}</style></head><body>
 <div id="map"></div>
-<div style="position:fixed;bottom:20px;left:20px;z-index:1000;background:white;
-    padding:11px 14px;border-radius:8px;border:2px solid #8800cc;font-size:12px;line-height:2;color:#111">
-  <b>&#9312; ETAS 地震発生確率</b><br>
-  <span style="color:#1a0033">&#9632;</span> Level 5（上位0.2%）<br>
+<div style="position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:11px 14px;border-radius:8px;border:1px solid #8800cc;font-size:12px;line-height:2;color:#f3f4f6">
+  <b>ETAS 地震発生確率</b><br>
+  <span style="color:#1a0033;background:#1a0033;padding:0 6px">&#9632;</span> Level 5（上位0.2%）<br>
   <span style="color:#8000ff">&#9632;</span> Level 4（上位1.5%）<br>
   <span style="color:#ff0000">&#9632;</span> Level 3（上位5.0%）<br>
   <span style="color:#ff8800">&#9632;</span> Level 2（上位15%）<br>
   <span style="color:#66ccff">&#9632;</span> Level 1（上位50%）<br>
-  <hr style="border-color:#ccc;margin:5px 0">
+  <hr style="border-color:#374151;margin:5px 0">
   <small>JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)} USGS:{src_count.get('usgs',0)}<br>
   計{len(quakes)}件 | {updated_str}</small>
 </div>
@@ -913,7 +1010,7 @@ SHELL_HTML = """<!DOCTYPE html>
 </head>
 <body>
   <div id="sidebar">
-    <div class="app-title">&#127981; 気象地震情報</div>
+    <div class="app-title">気象地震情報</div>
     <div class="group-title">地震</div>
     <button class="tab-btn active" onclick="sw(0)">有感地震履歴</button>
     <button class="tab-btn" onclick="sw(1)">無感地震履歴</button>
@@ -923,7 +1020,7 @@ SHELL_HTML = """<!DOCTYPE html>
     <button class="tab-btn" onclick="sw(4)">警報・注意報</button>
     <div class="group-title">地震リスクマップ</div>
     <button class="tab-btn" onclick="sw(5)">ETASマップ</button>
-    <div class="version">β4.2.0</div>
+    <div class="version">v4.3.0</div>
   </div>
   <div id="main">
     <iframe id="f0" class="active" src="/tab/felt"></iframe>
@@ -972,12 +1069,13 @@ def _update_data():
             updated_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
             if first_run:
-                # ── フェーズ1: CSVが既にあればすぐ表示可能にする ──
                 existing = load_quakes()
                 if existing:
                     grid_scores = analyze_etas(existing)
-                    jma  = [q for q in existing if q.get("source")=="jma_bosai"]
-                    unft = [q for q in existing if q.get("source") in ("p2p","usgs")]
+                    # 有感地震: max_intがあるもの
+                    jma  = [q for q in existing if q.get("max_int","").strip() not in ("","−","-")]
+                    # 無感地震: max_intが空のもの（全ソース）
+                    unft = [q for q in existing if q.get("max_int","").strip() in ("","−","-")]
                     with _cache_lock:
                         _cached_data = {"jma":jma,"unfelt":unft,"etas":grid_scores,
                                         "all":existing,"updated":updated_str+"(キャッシュ)"}
@@ -985,24 +1083,22 @@ def _update_data():
                         _ready_phase = 2
                     print(f"[BG] フェーズ1完了: CSVから {len(existing)} 件即時表示")
 
-            # ── フェーズ2: 新規データ取得（必ず実行）──
             new_q = fetch_all_quakes()
             save_quakes(new_q)
             quakes = load_quakes()
             grid_scores = analyze_etas(quakes)
-            jma  = [q for q in quakes if q.get("source")=="jma_bosai"]
-            unft = [q for q in quakes if q.get("source") in ("p2p","usgs")]
+            jma  = [q for q in quakes if q.get("max_int","").strip() not in ("","−","-")]
+            unft = [q for q in quakes if q.get("max_int","").strip() in ("","−","-")]
             with _cache_lock:
                 _cached_data = {"jma":jma,"unfelt":unft,"etas":grid_scores,
                                 "all":quakes,"updated":updated_str}
                 _last_update = time.time()
                 _ready_phase = 2
-            print(f"[BG] 完了 JMA:{len(jma)} 無感:{len(unft)} ETAS格子:{len(grid_scores)}")
+            print(f"[BG] 完了 有感:{len(jma)} 無感:{len(unft)} ETAS格子:{len(grid_scores)}")
             first_run = False
 
         except Exception as e:
             import traceback; print(f"[BG] エラー: {e}"); traceback.print_exc()
-            # エラー時も最低限表示できるよう ready_phase を 2 にする
             with _cache_lock:
                 if _ready_phase < 2 and _cached_data is None:
                     _cached_data = {"jma":[],"unfelt":[],"etas":{},"all":[],"updated":"取得失敗"}
