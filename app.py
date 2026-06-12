@@ -1,58 +1,67 @@
 # -*- coding: utf-8 -*-
 """
-地震発生確率マップ + 気象情報 統合版 (軽量版)
+地震研究統合プラットフォーム v5.0
 
-メモリ軽量化のポイント:
-  - folium を完全廃止 → 純 Leaflet JS HTML
-  - _cached_maps にデータのみ保持（HTML文字列を保持しない）
-  - タブは /tab/<name> エンドポイントでリクエスト時レンダリング
-  - アメダス・警報はオンデマンド取得 + 短期キャッシュ
-  - GeoJSON はブラウザ側でフェッチ（srcdoc には含めない）
+タブ構成:
+  1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
+  2. ETASマップ   - 地震発生確率 + ETAS残差（研究用）
+  3. b値マップ    - グリッドごとのGutenberg-Richter b値
+  4. TEC          - 電離圏全電子数 (NICT SCIDAS リンク)
+  5. GNSS         - 地殻変動 (GEONET リンク + 変位プレースホルダー)
+  6. 海面気圧     - アメダス海面気圧マップ
 """
 
 from flask import Flask, Response
-import requests, csv, os, math, re, hashlib, json, threading, time
+import requests, csv, os, math, re, json, threading, time
 from datetime import datetime, timezone, timedelta
 import numpy as np
 
 app = Flask(__name__)
 
-# ── 定数 ──────────────────────────────────────────────
+# ── 定数 ────────────────────────────────────────────
 DATA_FILE          = "data/quakes.csv"
 GRID_SIZE          = 0.1
 FETCH_INTERVAL_SEC = 600
 
-# ── グローバルキャッシュ（データのみ・HTML文字列は保持しない）──
+# ── グローバルキャッシュ ──────────────────────────────
 _cache_lock   = threading.Lock()
-_cached_data  = None   # {"jma": [...], "unfelt": [...], "etas": {...}, "updated": str}
+_cached_data  = None
 _last_update  = 0.0
 _ready_phase  = 0
 
-# アメダス・警報用の短期キャッシュ（~5分）
-_amedas_cache = {"data": None, "ts": 0.0}
-_warning_cache = {"data": None, "ts": 0.0}
+_amedas_cache  = {"data": None, "ts": 0.0}
 AMEDAS_CACHE_SEC = 300
-WARNING_CACHE_SEC = 300
 
 
 # ══════════════════════════════════════════════════════
-# ETAS パラメータ
+# ETAS パラメータ (Ogata 1998)
 # ══════════════════════════════════════════════════════
 class ETASParams:
     MU=0.05; K=0.020; C=0.010; P=1.11; ALPHA=2.30; M0=1.0
     D=0.015; GAMMA=0.50; Q=1.58; DEPTH_SCALE=80.0; SPACE_RADIUS=8
 EP = ETASParams()
 
-ETAS_COLOR = {5:"#1a0033",4:"#8000ff",3:"#ff0000",2:"#ff8800",1:"#66ccff"}
+ETAS_COLOR = {5:"#1a0033", 4:"#8000ff", 3:"#ff0000", 2:"#ff8800", 1:"#66ccff"}
+
+LEAFLET_CDN = """
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>"""
+
+DARK_TILE = "L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{attribution:'&copy;CartoDB',subdomains:'abcd',maxZoom:18}).addTo(map);"
+
+GEOJSON_JS = """
+    fetch('https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson')
+      .then(r=>r.json())
+      .then(d=>L.geoJSON(d,{style:{fillOpacity:0,color:'#555',weight:1}}).addTo(map));"""
 
 
 # ══════════════════════════════════════════════════════
-# 地震データ取得
+# データ取得
 # ══════════════════════════════════════════════════════
 def fetch_quakes_p2p():
     url = "https://api.p2pquake.net/v2/history?codes=551&limit=100"
     try:
-        data = requests.get(url, timeout=8, headers={"User-Agent":"App/4.2"}).json()
+        data = requests.get(url, timeout=8, headers={"User-Agent":"SeismoApp/5.0"}).json()
     except Exception as e:
         print(f"[P2P] {e}"); return []
     quakes = []
@@ -62,17 +71,16 @@ def fetch_quakes_p2p():
         try:
             lat = float(hypo["latitude"]); lon = float(hypo["longitude"])
             if lat == -200 or lon == -200: continue
-            mag = float(hypo["magnitude"]); depth = abs(float(hypo.get("depth",0)))
-            raw_time = eq.get("time","")
+            mag = float(hypo["magnitude"]); depth = abs(float(hypo.get("depth", 0)))
+            raw_time = eq.get("time", "")
             try:
                 now_y = datetime.now().year
                 dt_jst = datetime.strptime(f"{now_y}/{raw_time}", "%Y/%m/%d %H:%M")
                 time_str = dt_jst.replace(tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc).isoformat()
-            except Exception: time_str = raw_time
-            # P2Pは有感地震データ（震度情報付き）
-            max_int = item.get("points", [{}])[0].get("scale","") if item.get("points") else ""
-            # scaleを震度文字列に変換
+            except Exception:
+                time_str = raw_time
             scale_map = {10:"1",20:"2",30:"3",40:"4",45:"5-",50:"5+",55:"6-",60:"6+",70:"7"}
+            max_int = item.get("points", [{}])[0].get("scale","") if item.get("points") else ""
             if isinstance(max_int, int): max_int = scale_map.get(max_int, str(max_int))
             quakes.append({"time":time_str,"lat":lat,"lon":lon,"mag":mag,"depth":depth,
                            "source":"p2p","place":hypo.get("name","不明"),"max_int":str(max_int)})
@@ -88,15 +96,13 @@ def _parse_jma_cod(cod_str):
 
 def fetch_quakes_jma_bosai():
     try:
-        data = requests.get(JMA_LIST_URL, timeout=10, headers={"User-Agent":"App/4.2"}).json()
+        data = requests.get(JMA_LIST_URL, timeout=10, headers={"User-Agent":"SeismoApp/5.0"}).json()
     except Exception as e:
         print(f"[JMA] {e}"); return []
     quakes = []
     for item in data:
         if item.get("ttl") != "震源・震度情報": continue
         if item.get("ift") in ("訂正","取消"): continue
-        maxi = item.get("maxi","")
-        # max_intがなくても震源情報があれば取得（無感地震も含む）
         try: lat, lon, depth = _parse_jma_cod(item["cod"])
         except Exception: continue
         try: mag = float(item.get("mag","0"))
@@ -104,6 +110,7 @@ def fetch_quakes_jma_bosai():
         at_str = item.get("at", item.get("rdt",""))
         try: time_str = datetime.fromisoformat(at_str).astimezone(timezone.utc).isoformat()
         except Exception: time_str = at_str
+        maxi = item.get("maxi","")
         quakes.append({"time":time_str,"lat":lat,"lon":lon,"mag":mag,"depth":depth,
                        "source":"jma_bosai","place":item.get("anm","不明"),"max_int":maxi})
     print(f"[JMA] {len(quakes)}件"); return quakes
@@ -131,12 +138,8 @@ def fetch_quakes_usgs():
 def fetch_all_quakes():
     results = {}
     def _run(name, fn):
-        try:
-            results[name] = fn()
-        except Exception as e:
-            print(f"[fetch_all] {name} 例外: {e}")
-            results[name] = []
-
+        try: results[name] = fn()
+        except Exception as e: print(f"[fetch_all] {name} {e}"); results[name] = []
     threads = [threading.Thread(target=_run, args=(n,f), daemon=True) for n,f in
                [("p2p",fetch_quakes_p2p),("usgs",fetch_quakes_usgs),("jma",fetch_quakes_jma_bosai)]]
     for t in threads: t.start()
@@ -153,7 +156,9 @@ def _deduplicate(quakes, time_tol_min=5, dist_tol_deg=0.3):
         except Exception: t_q = None
         dup = False
         for k in kept:
-            try: t_k = datetime.fromisoformat(k["time"].replace("Z","+00:00")); dt = abs((t_q-t_k).total_seconds())/60 if t_q and t_k else 999
+            try:
+                t_k = datetime.fromisoformat(k["time"].replace("Z","+00:00"))
+                dt = abs((t_q-t_k).total_seconds())/60 if t_q and t_k else 999
             except Exception: dt = 999
             if dt < time_tol_min and math.sqrt((q["lat"]-k["lat"])**2+(q["lon"]-k["lon"])**2) < dist_tol_deg:
                 dup = True; break
@@ -182,18 +187,14 @@ def save_quakes(quakes):
 def _cleanup_old_quakes(keep_days=65):
     if not os.path.exists(DATA_FILE): return
     cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
-    kept = []
-    removed = 0
+    kept = []; removed = 0
     with open(DATA_FILE, encoding="utf-8") as f:
         for row in csv.reader(f):
             try:
                 t = datetime.fromisoformat(row[0].replace("Z","+00:00"))
-                if t >= cutoff:
-                    kept.append(row)
-                else:
-                    removed += 1
-            except Exception:
-                kept.append(row)
+                if t >= cutoff: kept.append(row)
+                else: removed += 1
+            except Exception: kept.append(row)
     if removed > 0:
         with open(DATA_FILE, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerows(kept)
@@ -210,7 +211,8 @@ def load_quakes(days=60):
                 if t < cutoff: continue
                 data.append({"time":row[0],"lat":float(row[1]),"lon":float(row[2]),
                              "mag":float(row[3]),"depth":float(row[4]),
-                             "source":row[5] if len(row)>5 else "","place":row[6] if len(row)>6 else "",
+                             "source":row[5] if len(row)>5 else "",
+                             "place":row[6] if len(row)>6 else "",
                              "max_int":row[7] if len(row)>7 else ""})
             except Exception: continue
     return data
@@ -248,8 +250,7 @@ def analyze_etas(quakes):
     dist2 = (DI[:,:,None] * GRID_SIZE)**2 + (DJ[:,:,None] * GRID_SIZE)**2
     keys_list = []; vals_list = []
     for ei in range(len(valid)):
-        sc = spatial_scale[ei]
-        q_val = EP.Q
+        sc = spatial_scale[ei]; q_val = EP.Q
         weight = contributions[ei] / (dist2[:,:,ei] + sc**2) ** q_val
         ni = gi[ei] + DI; nj = gj[ei] + DJ
         mask = (ni>=240)&(ni<=460)&(nj>=1220)&(nj<=1460)
@@ -274,21 +275,42 @@ def _percentile_thresholds(values_arr):
 
 
 # ══════════════════════════════════════════════════════
-# 色・ラベルユーティリティ
+# b値解析 (Gutenberg-Richter)
+# ══════════════════════════════════════════════════════
+def compute_bvalue_grid(quakes, grid_size=0.5, mc=2.0, min_count=10):
+    """
+    グリッドごとにb値を計算する。
+    b = log10(e) / (mean(M) - Mc)  (最尤推定)
+    """
+    from collections import defaultdict
+    bins = defaultdict(list)
+    for q in quakes:
+        if q["mag"] < mc: continue
+        gi = round(q["lat"] / grid_size)
+        gj = round(q["lon"] / grid_size)
+        bins[(gi, gj)].append(q["mag"])
+
+    result = {}
+    for (gi, gj), mags in bins.items():
+        if len(mags) < min_count: continue
+        mean_m = np.mean(mags)
+        if mean_m <= mc: continue
+        b = math.log10(math.e) / (mean_m - mc)
+        result[(gi, gj)] = {"b": round(b, 3), "n": len(mags), "mean_m": round(mean_m, 2)}
+    print(f"[b値] {len(result)}グリッド計算完了")
+    return result
+
+
+# ══════════════════════════════════════════════════════
+# ユーティリティ
 # ══════════════════════════════════════════════════════
 INTENSITY_COLOR = {"1":"#4ade80","2":"#a3e635","3":"#facc15","4":"#fb923c",
                    "5-":"#f87171","5+":"#ef4444","6-":"#dc2626","6+":"#b91c1c","7":"#7f1d1d"}
 INTENSITY_LABEL = {"1":"震度1","2":"震度2","3":"震度3","4":"震度4",
-                   "5-":"震度5弱","5+":"震度5強","6-":"震度6弱","6+":"震度6強","7":"震度7","-":"不明"}
-WIND_DIR_16 = ["北","北北東","北東","東北東","東","東南東","南東","南南東",
-               "南","南南西","南西","西南西","西","西北西","北西","北北西"]
+                   "5-":"震度5弱","5+":"震度5強","6-":"震度6弱","6+":"震度6強","7":"震度7"}
 
 def _int_color(v): return INTENSITY_COLOR.get(v,"#94a3b8")
 def _int_label(v): return INTENSITY_LABEL.get(v,"不明")
-
-def _quake_after(q, cutoff):
-    try: return datetime.fromisoformat(q["time"].replace("Z","+00:00")) >= cutoff
-    except Exception: return True
 
 def _fmt_time_jst(time_str):
     try:
@@ -296,626 +318,145 @@ def _fmt_time_jst(time_str):
         return dt.astimezone(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M")
     except Exception: return time_str
 
+def _mag_color(mag):
+    if   mag >= 8.0: return "#ff00ff"
+    elif mag >= 7.0: return "#dc2626"
+    elif mag >= 6.0: return "#ef4444"
+    elif mag >= 5.0: return "#fb923c"
+    elif mag >= 4.0: return "#facc15"
+    elif mag >= 3.0: return "#4ade80"
+    else:            return "#94a3b8"
 
-# ══════════════════════════════════════════════════════
-# 共通Leaflet HTMLヘルパー
-# ══════════════════════════════════════════════════════
-LEAFLET_CDN = """
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>"""
-
-GEOJSON_JS = """
-    fetch('https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson')
-      .then(r=>r.json())
-      .then(d=>L.geoJSON(d,{style:{fillOpacity:0,color:'#555',weight:1}}).addTo(map));"""
-
-DARK_TILE = "L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{attribution:'&copy;CartoDB',subdomains:'abcd',maxZoom:18}).addTo(map);"
+WIND_DIR_16 = ["北","北北東","北東","東北東","東","東南東","南東","南南東",
+               "南","南南西","南西","西南西","西","西北西","北西","北北西"]
 
 
 # ══════════════════════════════════════════════════════
-# 有感地震履歴タブ
+# TAB 1: 統合地震履歴
 # ══════════════════════════════════════════════════════
-def render_felt_quake(jma_quakes, updated_str):
-    one_month_ago = datetime.now(timezone.utc) - timedelta(days=31)
-    # 有感地震 = max_int が設定されているもの（JMA + P2Pから）
-    felt = [q for q in jma_quakes if q.get("max_int","") not in ("","-","")]
-    # さらにmax_intが実際に存在するものに限定
-    felt = [q for q in jma_quakes if q.get("max_int","").strip() not in ("","−","-")]
-    sorted_q = sorted([q for q in felt if _quake_after(q, one_month_ago)],
-                      key=lambda q: q.get("time",""), reverse=True)
+def render_quake_history(quakes, updated_str):
+    # 直近31日
+    cutoff = datetime.now(timezone.utc) - timedelta(days=31)
+    recent = []
+    for q in quakes:
+        try:
+            t = datetime.fromisoformat(q["time"].replace("Z","+00:00"))
+            if t >= cutoff: recent.append(q)
+        except Exception: pass
+    recent.sort(key=lambda q: q.get("time",""), reverse=True)
 
     markers = []
-    for i, q in enumerate(sorted_q):
-        ci  = _int_color(q.get("max_int","-"))
-        mi  = _int_label(q.get("max_int","-"))
-        mag = q.get("mag", 0)
-        markers.append({"lat":q["lat"],"lon":q["lon"],"color":ci,
-                        "radius":max(5,mag*3),"idx":i,
-                        "tip":f"{q.get('place','不明')} M{mag:.1f} {mi}",
-                        "pop":f"<b>{q.get('place','不明')}</b><br>{_fmt_time_jst(q.get('time',''))} JST<br>M{mag:.1f} / {mi}<br>深さ {q.get('depth',0):.0f}km"})
-
     rows = ""
-    for i, q in enumerate(sorted_q):
-        ci    = _int_color(q.get("max_int","-"))
-        mi    = _int_label(q.get("max_int","-"))
-        place = q.get("place","不明"); mag = q.get("mag",0)
-        depth = q.get("depth",0); t_str = _fmt_time_jst(q.get("time",""))
-        rows += (f'<tr onclick="focusQ({i},{q["lat"]},{q["lon"]})" '
-                 f'style="cursor:pointer" class="qrow" id="qrow_{i}">'
-                 f'<td class="c1">{place}</td>'
-                 f'<td class="c2">{t_str}</td>'
-                 f'<td class="c3">M{mag:.1f}</td>'
-                 f'<td class="c4"><span style="background:{ci};color:#000;padding:2px 5px;border-radius:3px;font-size:11px;font-weight:700;white-space:nowrap">{mi}</span></td>'
-                 f'<td class="c2">{depth:.0f}km</td></tr>')
+    for i, q in enumerate(recent):
+        mag    = q.get("mag", 0)
+        depth  = q.get("depth", 0)
+        maxi   = q.get("max_int","").strip()
+        src    = q.get("source","?")
+        place  = q.get("place","不明")
+        t_str  = _fmt_time_jst(q.get("time",""))
+        mc     = _mag_color(mag)
+        ic     = _int_color(maxi) if maxi not in ("","−","-") else "#475569"
+        il     = _int_label(maxi) if maxi not in ("","−","-") else "無感"
+        src_badge = {"jma_bosai":"JMA","p2p":"P2P","usgs":"USGS"}.get(src,"?")
+
+        # マーカー色: 有感→震度色、無感→マグニチュード色
+        marker_color = ic if maxi not in ("","−","-") else mc
+        markers.append({
+            "lat":q["lat"],"lon":q["lon"],"color":marker_color,
+            "radius":max(4, mag*2.8),"idx":i,
+            "tip":f"M{mag:.1f} / {il} [{src_badge}]",
+            "pop":f"<b>{place}</b><br>{t_str} JST<br>M{mag:.1f} / {il}<br>深さ{depth:.0f}km [{src_badge}]"
+        })
+        rows += (
+            f'<tr onclick="focusQ({i},{q["lat"]},{q["lon"]})" style="cursor:pointer" class="qrow" id="qrow_{i}">'
+            f'<td class="c1">{place}</td>'
+            f'<td class="c2">{t_str}</td>'
+            f'<td class="c3" style="color:{mc}">M{mag:.1f}</td>'
+            f'<td class="c4"><span style="background:{ic};color:#000;padding:1px 5px;border-radius:3px;font-size:11px;font-weight:700">{il}</span></td>'
+            f'<td class="c2">{depth:.0f}km</td>'
+            f'<td class="c2"><span style="background:#1e3a5f;padding:1px 5px;border-radius:3px;font-size:10px">{src_badge}</span></td>'
+            f'</tr>'
+        )
 
     markers_js = json.dumps(markers)
+    total = len(recent)
+    felt_n = sum(1 for q in recent if q.get("max_int","").strip() not in ("","−","-"))
+
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{display:flex;height:100vh;background:#0f172a;color:#fff;font-family:"Helvetica Neue",Arial,sans-serif;overflow:hidden}}
-#lp{{width:360px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;display:flex;flex-direction:column;overflow:hidden}}
+#lp{{width:380px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;display:flex;flex-direction:column;overflow:hidden}}
 #lh{{padding:12px 14px 8px;background:#1f2937;border-bottom:1px solid #374151;flex-shrink:0}}
-#lh h2{{font-size:15px;color:#f3f4f6;margin-bottom:3px}}#lh p{{font-size:11px;color:#6b7280}}
+#lh h2{{font-size:14px;color:#f3f4f6;margin-bottom:4px}}
+#lh p{{font-size:11px;color:#6b7280}}
+#fbar{{display:flex;gap:6px;padding:8px 10px;border-bottom:1px solid #1f2937;flex-shrink:0}}
+.fb{{flex:1;padding:5px 2px;text-align:center;cursor:pointer;font-size:11px;font-weight:600;
+     color:#9ca3af;border:none;background:#1f2937;border-radius:5px}}
+.fb:hover{{color:#f3f4f6;background:#374151}}
+.fb.on{{color:#fff;background:linear-gradient(135deg,#2563eb,#7c3aed)}}
 #ls{{flex:1;overflow-y:auto}}
 table{{width:100%;border-collapse:collapse}}
 thead tr{{background:#1f2937;position:sticky;top:0;z-index:10}}
-thead th{{padding:7px 5px;font-size:11px;color:#9ca3af;text-align:left;border-bottom:1px solid #374151}}
-.qrow:hover{{background:#1f2937}}.qrow:nth-child(even){{background:#0d1117}}
-.c1{{padding:6px 7px;font-weight:600;color:#f3f4f6;font-size:12px}}
-.c2{{padding:6px 4px;color:#9ca3af;font-size:11px}}
-.c3{{padding:6px 4px;text-align:center;font-weight:700;color:#60a5fa;font-size:12px}}
-.c4{{padding:6px 4px;text-align:center}}
-#mp{{flex:1;overflow:hidden;position:relative}}
-#map{{width:100%;height:100%}}
-#db{{position:fixed;bottom:0;left:360px;right:0;background:rgba(17,24,39,.95);
-    border-top:1px solid #374151;padding:7px 14px;font-size:12px;color:#d1d5db;display:none;z-index:999}}
+thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bottom:1px solid #374151}}
+.qrow:hover{{background:#1e2d40}}
+.c1{{padding:5px 7px;font-weight:600;color:#f3f4f6;font-size:12px}}
+.c2{{padding:5px 4px;color:#9ca3af;font-size:11px}}
+.c3{{padding:5px 4px;text-align:center;font-weight:700;font-size:12px}}
+.c4{{padding:5px 4px;text-align:center}}
+#mp{{flex:1;overflow:hidden}}#map{{width:100%;height:100%}}
 </style></head><body>
 <div id="lp">
-  <div id="lh"><h2>有感地震履歴（JMA）</h2><p>直近{len(sorted_q)}件 / {updated_str}</p></div>
+  <div id="lh">
+    <h2>統合地震履歴（直近31日: {total}件 / 有感:{felt_n}件）</h2>
+    <p>更新: {updated_str}</p>
+  </div>
+  <div id="fbar">
+    <button class="fb on" onclick="filter('all',this)">すべて</button>
+    <button class="fb" onclick="filter('felt',this)">有感のみ</button>
+    <button class="fb" onclick="filter('unfelt',this)">無感のみ</button>
+    <button class="fb" onclick="filter('jma',this)">JMA</button>
+    <button class="fb" onclick="filter('usgs',this)">USGS</button>
+  </div>
   <div id="ls"><table>
-    <thead><tr><th>震源名</th><th>発生時刻</th><th>M</th><th>最大震度</th><th>深さ</th></tr></thead>
-    <tbody>{rows}</tbody>
+    <thead><tr><th>震源名</th><th>発生時刻</th><th>M</th><th>最大震度</th><th>深さ</th><th>ソース</th></tr></thead>
+    <tbody id="tbody">{rows}</tbody>
   </table></div>
 </div>
 <div id="mp"><div id="map"></div></div>
-<div id="db"><span id="dt"></span></div>
 <script>
-var map = L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
+var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
 {DARK_TILE}
 {GEOJSON_JS}
-var MK = {markers_js};
-var layers = MK.map(function(d){{
-  return L.circleMarker([d.lat,d.lon],{{radius:d.radius,color:d.color,fillColor:d.color,fillOpacity:0.9,weight:1}})
+var MK={markers_js};
+var layers=MK.map(function(d){{
+  return L.circleMarker([d.lat,d.lon],{{radius:d.radius,color:d.color,fillColor:d.color,fillOpacity:0.85,weight:1}})
           .bindTooltip(d.tip).bindPopup(d.pop);
 }});
-var lg = L.layerGroup(layers).addTo(map);
+var lg=L.layerGroup(layers).addTo(map);
+
 function focusQ(idx,lat,lon){{
   document.querySelectorAll('.qrow').forEach(function(r){{r.style.background=''}});
-  var row=document.getElementById('qrow_'+idx); if(row) row.style.background='#1e3a5f';
-  map.flyTo([lat,lon],8,{{duration:0.8}});
-  if(layers[idx]) setTimeout(function(){{layers[idx].openPopup()}},900);
-  var d=MK[idx];
-  document.getElementById('dt').innerHTML='<b>'+d.tip+'</b>';
-  document.getElementById('db').style.display='block';
+  var row=document.getElementById('qrow_'+idx); if(row)row.style.background='#1e3a5f';
+  map.flyTo([lat,lon],8,{{duration:0.7}});
+  if(layers[idx])setTimeout(function(){{layers[idx].openPopup()}},800);
+}}
+
+var allRows=Array.from(document.querySelectorAll('.qrow'));
+var MODE_MAP={{'all':function(r){{return true}},'felt':function(r){{return r.querySelector('.c4 span').style.background!='rgb(71, 85, 105)'}},'unfelt':function(r){{return r.querySelector('.c4 span').style.background==='rgb(71, 85, 105)'}},'jma':function(r){{return r.querySelector('.c2:last-child span').textContent==='JMA'}},'usgs':function(r){{return r.querySelector('.c2:last-child span').textContent==='USGS'}}}};
+
+function filter(mode,btn){{
+  document.querySelectorAll('.fb').forEach(function(b){{b.classList.remove('on')}});
+  btn.classList.add('on');
+  var fn=MODE_MAP[mode];
+  allRows.forEach(function(r){{r.style.display=fn(r)?'':'none'}});
 }}
 </script></body></html>"""
 
 
 # ══════════════════════════════════════════════════════
-# 無感地震履歴タブ
-# ══════════════════════════════════════════════════════
-def render_unfelt_quake(unfelt_quakes, updated_str):
-    # 無感地震 = max_intが空または存在しないもの（USGS, P2Pの一部, JMAの無感）
-    sorted_q = sorted(unfelt_quakes, key=lambda q: q.get("time",""), reverse=True)
-
-    def _mag_color(mag):
-        if   mag >= 8.0: return "#ff00ff"
-        elif mag >= 7.0: return "#7f1d1d"
-        elif mag >= 6.0: return "#ef4444"
-        elif mag >= 5.0: return "#fb923c"
-        elif mag >= 4.0: return "#facc15"
-        elif mag >= 3.0: return "#4ade80"
-        else:            return "#94a3b8"
-
-    src_count = {}
-    markers = []
-    for q in sorted_q:
-        src = q.get("source","?"); src_count[src] = src_count.get(src,0)+1
-        mag=q.get("mag",0); depth=q.get("depth",0); t_str=_fmt_time_jst(q.get("time",""))
-        ci=_mag_color(mag)
-        markers.append({"lat":q["lat"],"lon":q["lon"],"color":ci,
-                        "radius":max(3,mag*2.5),
-                        "tip":f"M{mag:.1f} / {depth:.0f}km / {t_str} [{src}]",
-                        "pop":f"M{mag:.1f}<br>深さ {depth:.0f}km<br>{t_str} JST<br>ソース:{src}"})
-
-    markers_js = json.dumps(markers)
-    p2p_n = src_count.get("p2p",0); usgs_n = src_count.get("usgs",0)
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-{LEAFLET_CDN}
-<style>*{{box-sizing:border-box;margin:0;padding:0}}body,html{{height:100%;overflow:hidden}}
-#map{{width:100%;height:100vh}}</style></head><body>
-<div id="map"></div>
-<div style="position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:2;color:#f3f4f6">
-  <b>無感地震履歴</b><br>
-  <span style="color:#ff00ff">&#9679;</span> M8.0以上<br>
-  <span style="color:#7f1d1d">&#9679;</span> M7.0〜7.9<br>
-  <span style="color:#ef4444">&#9679;</span> M6.0〜6.9<br>
-  <span style="color:#fb923c">&#9679;</span> M5.0〜5.9<br>
-  <span style="color:#facc15">&#9679;</span> M4.0〜4.9<br>
-  <span style="color:#4ade80">&#9679;</span> M3.0〜3.9<br>
-  <span style="color:#94a3b8">&#9679;</span> M2台以下<br>
-  <hr style="border-color:#374151;margin:5px 0">
-  <small>P2P:{p2p_n}件 USGS:{usgs_n}件<br>計{len(sorted_q)}件 | {updated_str}</small>
-</div>
-<script>
-var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
-{DARK_TILE}
-{GEOJSON_JS}
-var MK={markers_js};
-MK.forEach(function(d){{
-  L.circleMarker([d.lat,d.lon],{{radius:d.radius,color:d.color,fillColor:d.color,fillOpacity:0.7,weight:1}})
-   .bindTooltip(d.tip).bindPopup(d.pop).addTo(map);
-}});
-</script></body></html>"""
-
-
-# ══════════════════════════════════════════════════════
-# アメダス観測値タブ（オンデマンド取得 + 短期キャッシュ）
-# ══════════════════════════════════════════════════════
-def _fetch_amedas_table():
-    url = "https://www.jma.go.jp/bosai/amedas/const/amedastable.json"
-    try:
-        raw = requests.get(url, timeout=10, headers={"User-Agent":"App/4.2"}).json()
-        table = {}
-        for sid, info in raw.items():
-            lr = info.get("lat",[0,0]); lo = info.get("lon",[0,0])
-            table[sid] = {"name":info.get("kjName",sid),
-                          "lat":lr[0]+lr[1]/60.0, "lon":lo[0]+lo[1]/60.0}
-        print(f"[AMEDAS] テーブル:{len(table)}局"); return table
-    except Exception as e:
-        print(f"[AMEDAS] テーブルエラー: {e}"); return {}
-
-def _fetch_amedas_latest():
-    try:
-        t_text = requests.get("https://www.jma.go.jp/bosai/amedas/data/latest_time.txt",
-                              timeout=8, headers={"User-Agent":"App/4.2"}).text.strip()
-        dt = datetime.fromisoformat(t_text)
-        ts = dt.strftime("%Y%m%d%H%M%S")
-        data = requests.get(f"https://www.jma.go.jp/bosai/amedas/data/map/{ts}.json",
-                            timeout=10, headers={"User-Agent":"App/4.2"}).json()
-        time_label = dt.astimezone(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M JST")
-        print(f"[AMEDAS] 観測値:{len(data)}局 ({time_label})"); return data, time_label
-    except Exception as e:
-        print(f"[AMEDAS] 観測値エラー: {e}"); return {}, "取得失敗"
-
-def _gradient_color(val, vmin, vmax, scheme):
-    ratio = max(0.0, min(1.0, (val-vmin)/max(vmax-vmin, 0.01)))
-    SCHEMES = {
-        "heat": [(0,(0,0,180)),(0.20,(0,80,255)),(0.35,(0,220,100)),(0.50,(255,255,0)),(0.65,(255,160,0)),(0.80,(255,60,0)),(1.0,(180,0,0))],
-        # 降水量: 0.5mm〜80mm以上に対応
-        "prec": [(0,(200,240,255)),(0.10,(80,180,255)),(0.25,(0,80,220)),(0.40,(0,180,80)),(0.55,(220,220,0)),(0.70,(255,130,0)),(0.85,(220,20,20)),(1.0,(140,0,200))],
-        "pres": [(0,(80,0,180)),(0.25,(160,80,240)),(0.50,(230,230,230)),(0.75,(255,180,40)),(1.0,(200,80,0))],
-        # 風速: 0〜30m/s以上に対応
-        "wind": [(0,(200,220,255)),(0.10,(80,200,240)),(0.25,(0,100,220)),(0.45,(100,220,100)),(0.60,(230,230,0)),(0.75,(255,130,0)),(0.90,(220,20,20)),(1.0,(140,0,200))],
-    }
-    stops = SCHEMES.get(scheme, [(0,(128,128,128)),(1,(128,128,128))])
-    r,g,b = stops[-1][1]
-    for k in range(len(stops)-1):
-        lo,hi = stops[k][0], stops[k+1][0]
-        if lo <= ratio <= hi:
-            t = (ratio-lo)/(hi-lo)
-            r0,g0,b0 = stops[k][1]; r1,g1,b1 = stops[k+1][1]
-            r,g,b = int(r0+(r1-r0)*t), int(g0+(g1-g0)*t), int(b0+(b1-b0)*t)
-            break
-    return f"#{max(0,min(255,r)):02x}{max(0,min(255,g)):02x}{max(0,min(255,b)):02x}"
-
-def render_amedas(updated_str):
-    global _amedas_cache
-    now = time.time()
-    if _amedas_cache["data"] and now - _amedas_cache["ts"] < AMEDAS_CACHE_SEC:
-        cached = _amedas_cache["data"]
-        table, obs_data, time_label = cached["table"], cached["obs"], cached["label"]
-    else:
-        table = _fetch_amedas_table(); obs_data, time_label = _fetch_amedas_latest()
-        _amedas_cache = {"data":{"table":table,"obs":obs_data,"label":time_label},"ts":now}
-
-    if not obs_data or not table:
-        return "<html><body style='background:#0f172a;color:white;display:flex;align-items:center;justify-content:center;height:100vh'>アメダスデータ取得失敗</body></html>"
-
-    def _gv(obs, key):
-        raw = obs.get(key)
-        return raw[0] if isinstance(raw,list) and len(raw)>0 and raw[0] is not None else None
-
-    temp_vals=[]; prec_vals=[]; pres_vals=[]; wind_vals=[]
-    for sid,obs in obs_data.items():
-        v=_gv(obs,"temp");            temp_vals.append(v) if v is not None else None
-        v=_gv(obs,"precipitation1h"); prec_vals.append(v) if v is not None else None
-        # 海面気圧 normalPressure を使用（現地気圧 pressure ではなく）
-        v=_gv(obs,"normalPressure");  pres_vals.append(v) if v is not None else None
-        v=_gv(obs,"wind");            wind_vals.append(v) if v is not None else None
-
-    t_min=-20.0; t_max=45.0
-    # 降水量: 0.5mm〜80mm固定レンジ
-    p_min=0.5; p_max=80.0
-    # 気圧: 実データの範囲
-    pr_min=min(pres_vals) if pres_vals else 980; pr_max=max(pres_vals) if pres_vals else 1030
-    # 風速: 0〜30m/s固定レンジ
-    w_min=0.0; w_max=30.0
-
-    layers = {"temp":[],"prec":[],"pres":[],"wind":[]}
-    for sid, obs in obs_data.items():
-        info = table.get(sid)
-        if not info: continue
-        lat,lon = info["lat"], info["lon"]
-        if not (24<=lat<=46 and 122<=lon<=146): continue
-        name=info["name"]
-        temp=_gv(obs,"temp"); prec=_gv(obs,"precipitation1h")
-        # 海面気圧を取得
-        pres=_gv(obs,"normalPressure"); wind=_gv(obs,"wind")
-        wdir_raw=obs.get("windDirection"); wdir_idx=wdir_raw[0] if isinstance(wdir_raw,list) else None
-        wdir_str=WIND_DIR_16[wdir_idx-1] if wdir_idx and 1<=wdir_idx<=16 else "静穏"
-        if temp is not None:
-            layers["temp"].append({"lat":lat,"lon":lon,"color":_gradient_color(temp,t_min,t_max,"heat"),
-                "tip":f"{name} {temp}℃","pop":f"<b>{name}</b><br>気温:<b>{temp}℃</b>"})
-        if prec is not None and prec >= 0.5:
-            layers["prec"].append({"lat":lat,"lon":lon,"color":_gradient_color(prec,p_min,p_max,"prec"),
-                "tip":f"{name} {prec}mm/h","pop":f"<b>{name}</b><br>降水量:<b>{prec}mm/h</b>"})
-        if pres is not None:
-            layers["pres"].append({"lat":lat,"lon":lon,"color":_gradient_color(pres,pr_min,pr_max,"pres"),
-                "tip":f"{name} {pres}hPa","pop":f"<b>{name}</b><br>海面気圧:<b>{pres}hPa</b>"})
-        if wind is not None:
-            ang = (wdir_idx-1)*22.5 if wdir_idx and 1<=wdir_idx<=16 else 0
-            layers["wind"].append({"lat":lat,"lon":lon,"color":_gradient_color(wind,w_min,w_max,"wind"),
-                "tip":f"{name} {wdir_str} {wind}m/s","pop":f"<b>{name}</b><br>風速:<b>{wind}m/s</b><br>風向:{wdir_str}",
-                "angle":ang,"wdir_str":wdir_str,"wind_val":wind})
-
-    data_js = json.dumps(layers)
-    legends = {
-        "temp": f'<b>気温</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#0000b4,#0050ff,#00e050,#ffff00,#ff8200,#ff3c00,#b40000);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>-20℃</span><span>45℃</span></div>',
-        "prec": f'<b>降水量</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#c8f0ff,#50b4ff,#0050dc,#00b450,#dcdc00,#ff8200,#dc1414,#8c00c8);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>0.5mm</span><span>80mm+</span></div>',
-        "pres": f'<b>海面気圧</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#5000b4,#a050f0,#e6e6e6,#ffb428,#c85000);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>{pr_min:.0f}hPa</span><span>{pr_max:.0f}hPa</span></div>',
-        "wind": f'<b>風速・風向</b><br><div style="width:130px;height:10px;border-radius:3px;background:linear-gradient(to right,#c8dcff,#50c8f0,#0064dc,#64dc64,#e6e600,#ff8200,#dc1414,#8c00c8);margin:5px 0 2px"></div><div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af"><span>0m/s</span><span>30m/s+</span></div><div style="font-size:10px;color:#9ca3af;margin-top:3px">矢印の向き=風向き</div>',
-    }
-    legends_js = json.dumps(legends)
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-{LEAFLET_CDN}
-<style>*{{box-sizing:border-box;margin:0;padding:0}}
-body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
-#tb{{display:flex;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0}}
-.at{{flex:1;padding:10px 4px;text-align:center;cursor:pointer;font-size:13px;font-weight:600;color:#9ca3af;border:none;background:none}}
-.at:hover{{color:#f3f4f6;background:#1f2937}}.at.active{{color:#fff;background:linear-gradient(135deg,#2563eb,#7c3aed);border-bottom:2px solid #60a5fa}}
-#map{{flex:1}}
-#lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:1.8;color:#f3f4f6;pointer-events:none}}
-</style></head><body>
-<div id="tb">
-  <button class="at active" onclick="sw('temp',this)">気温</button>
-  <button class="at" onclick="sw('prec',this)">降水量</button>
-  <button class="at" onclick="sw('pres',this)">気圧</button>
-  <button class="at" onclick="sw('wind',this)">風速</button>
-</div>
-<div id="map"></div>
-<div id="lg"></div>
-<script>
-var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
-{DARK_TILE}
-var DATA={data_js};
-var LGD={legends_js};
-var cur=null;
-
-// 風向矢印アイコン（方向が明確な矢印デザイン）
-function mkWindIcon(color,angle,wdir_str,wind_val){{
-  var sz=20;
-  var c=document.createElement('canvas');
-  c.width=sz;c.height=sz;
-  var ctx=c.getContext('2d');
-  ctx.save();
-  ctx.translate(sz/2,sz/2);
-  // 風向きの方向に矢印を向ける（気象の風向=風が吹いてくる方向→矢印は吹いていく方向へ）
-  ctx.rotate(angle*Math.PI/180);
-  // 矢印（三角形の先端が進む方向）
-  ctx.beginPath();
-  // 矢印の幹
-  ctx.moveTo(0, 6);
-  ctx.lineTo(0, -4);
-  // 矢印の頭（上向き三角）
-  ctx.moveTo(0, -9);
-  ctx.lineTo(-5, -2);
-  ctx.lineTo(5, -2);
-  ctx.closePath();
-  ctx.fillStyle=color;
-  ctx.fill();
-  // 中心に小さな円
-  ctx.beginPath();
-  ctx.arc(0,5,2,0,Math.PI*2);
-  ctx.fillStyle='rgba(255,255,255,0.6)';
-  ctx.fill();
-  ctx.restore();
-  return L.icon({{iconUrl:c.toDataURL(),iconSize:[sz,sz],iconAnchor:[sz/2,sz/2]}});
-}}
-
-function sw(key,btn){{
-  document.querySelectorAll('.at').forEach(function(b){{b.classList.remove('active')}});
-  btn.classList.add('active');
-  if(cur)map.removeLayer(cur);
-  var items=DATA[key];
-  var mk=items.map(function(d){{
-    if(key==='wind'){{
-      return L.marker([d.lat,d.lon],{{icon:mkWindIcon(d.color,d.angle||0,d.wdir_str,d.wind_val)}})
-               .bindTooltip(d.tip).bindPopup(d.pop);
-    }}
-    // 円を小さく(radius:3)・不透明に(fillOpacity:1.0)
-    return L.circleMarker([d.lat,d.lon],{{radius:3,color:d.color,fillColor:d.color,fillOpacity:1.0,weight:0.5}})
-             .bindTooltip(d.tip).bindPopup(d.pop);
-  }});
-  cur=L.layerGroup(mk).addTo(map);
-  document.getElementById('lg').innerHTML=LGD[key]+'<hr style="border-color:#374151;margin:5px 0"><small>{time_label}<br>{updated_str}</small>';
-}}
-sw('temp',document.querySelector('.at.active'));
-</script></body></html>"""
-
-
-# ══════════════════════════════════════════════════════
-# 雨雲レーダータブ
-# ══════════════════════════════════════════════════════
-def render_radar(updated_str):
-    now_utc = datetime.now(timezone.utc)
-    hour_floor = now_utc.replace(minute=0,second=0,microsecond=0) - timedelta(hours=1)
-    frames = []
-    for i in range(23,-1,-1):
-        dt_f = hour_floor - timedelta(hours=i)
-        frames.append({"dt_str":dt_f.strftime("%Y%m%d%H%M%S"),
-                       "label":dt_f.astimezone(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M JST")})
-    frames_js = json.dumps(frames)
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-{LEAFLET_CDN}
-<style>*{{box-sizing:border-box;margin:0;padding:0}}
-body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
-#map{{flex:1}}
-#ctrl{{background:#111827;border-top:2px solid #1f2937;padding:9px 14px;flex-shrink:0;
-       display:flex;align-items:center;gap:12px;color:#f3f4f6;font-size:13px}}
-#pb{{background:#2563eb;color:white;border:none;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:13px;font-weight:600;flex-shrink:0}}
-#sl{{flex:1;accent-color:#3b82f6}}#tl{{min-width:90px;text-align:right;color:#93c5fd;font-weight:600}}
-#lg{{position:fixed;bottom:60px;left:12px;z-index:1000;background:rgba(17,24,39,.92);padding:9px 12px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:1.9;color:#f3f4f6;pointer-events:none}}
-</style></head><body>
-<div id="map"></div>
-<div id="ctrl">
-  <button id="pb" onclick="tp()">&#9654; 再生</button>
-  <input type="range" id="sl" min="0" max="23" value="23" step="1" oninput="sf(+this.value)">
-  <span id="tl">--:-- JST</span>
-</div>
-<div id="lg">
-  <b>高解像度降水ナウキャスト</b><br>
-  <div style="display:flex;gap:3px;align-items:center;font-size:11px;margin-top:4px">
-    <div style="width:12px;height:10px;background:#c8f0ff;border:1px solid #555"></div>1未満
-    <div style="width:12px;height:10px;background:#5db8f5;border:1px solid #555;margin-left:2px"></div>5
-    <div style="width:12px;height:10px;background:#0050f0;border:1px solid #555;margin-left:2px"></div>10
-    <div style="width:12px;height:10px;background:#faf500;border:1px solid #555;margin-left:2px"></div>20
-    <div style="width:12px;height:10px;background:#ff9900;border:1px solid #555;margin-left:2px"></div>30
-    <div style="width:12px;height:10px;background:#ff2800;border:1px solid #555;margin-left:2px"></div>50
-    <div style="width:12px;height:10px;background:#b400e6;border:1px solid #555;margin-left:2px"></div>80+
-  </div>
-  <hr style="border-color:#374151;margin:5px 0"><small>出典: 気象庁<br>{updated_str}</small>
-</div>
-<script>
-var FRAMES={frames_js};
-var map=L.map('map',{{center:[36,138],zoom:6,preferCanvas:true}});
-{DARK_TILE}
-fetch('https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson')
-  .then(r=>r.json()).then(d=>L.geoJSON(d,{{style:{{fillOpacity:0,color:'#555',weight:1}}}}).addTo(map));
-var rl=null,ci=FRAMES.length-1,playing=false,pt=null;
-
-function sf(idx){{
-  ci=idx;
-  document.getElementById('sl').value=idx;
-  document.getElementById('tl').textContent=FRAMES[idx].label;
-  var dt=FRAMES[idx].dt_str;
-  // 既存レイヤーを削除
-  if(rl){{ map.removeLayer(rl); rl=null; }}
-  // 新しいタイルレイヤーを追加（zoomchangeに依存せず毎回再生成）
-  rl=L.tileLayer(
-    'https://www.jma.go.jp/bosai/jmatile/data/nowc/'+dt+'/none/'+dt+'/surf/hrpns/{{z}}/{{x}}/{{y}}.png',
-    {{
-      attribution:'気象庁',
-      opacity:0.75,
-      minZoom:4,
-      maxZoom:14,
-      errorTileUrl:'',
-      // ズーム変化後もタイルを再読込するためキャッシュを無効化
-      updateWhenZooming:false,
-      keepBuffer:0
-    }}
-  ).addTo(map);
-}}
-
-// ズーム・移動後にレーダーレイヤーを再描画（消えるバグの修正）
-map.on('zoomend moveend', function(){{
-  if(rl){{
-    var currentDt = FRAMES[ci].dt_str;
-    map.removeLayer(rl);
-    rl=L.tileLayer(
-      'https://www.jma.go.jp/bosai/jmatile/data/nowc/'+currentDt+'/none/'+currentDt+'/surf/hrpns/{{z}}/{{x}}/{{y}}.png',
-      {{
-        attribution:'気象庁',
-        opacity:0.75,
-        minZoom:4,
-        maxZoom:14,
-        errorTileUrl:'',
-        updateWhenZooming:false,
-        keepBuffer:0
-      }}
-    ).addTo(map);
-  }}
-}});
-
-function tp(){{
-  playing=!playing;
-  document.getElementById('pb').textContent=playing?'&#9646;&#9646; 停止':'&#9654; 再生';
-  if(playing){{pt=setInterval(function(){{sf((ci+1)%FRAMES.length)}},800)}}else{{clearInterval(pt)}}
-}}
-sf(ci);
-</script></body></html>"""
-
-
-# ══════════════════════════════════════════════════════
-# 警報・注意報タブ（オンデマンド取得 + 短期キャッシュ）
-# ══════════════════════════════════════════════════════
-PREF_CODE_LIST = [
-    "011000","012000","013000","014030","014100","015000","016000","017000","018000","019000",
-    "020000","030000","040000","050000","060000","070000","080000","090000","100000",
-    "110000","120000","130000","140000","150000","160000","170000","180000","190000","200000",
-    "210000","220000","230000","240000","250000","260000","270000","280000","290000","300000",
-    "310000","320000","330000","340000","350000","360000","370000","380000","390000","400000",
-    "410000","420000","430000","440000","450000","460100","471000","472000","473000","474000",
-]
-WARNING_TYPES = {
-    "10":("大雨警報",3,"#ef4444"),"12":("洪水警報",3,"#ef4444"),"14":("暴風警報",3,"#ef4444"),
-    "15":("暴風雪警報",3,"#ef4444"),"16":("大雪警報",3,"#ef4444"),"17":("波浪警報",3,"#ef4444"),
-    "18":("高潮警報",3,"#ef4444"),"19":("津波警報",3,"#ef4444"),"20":("大津波警報",3,"#7f1d1d"),
-    "32":("大雨注意報",2,"#fb923c"),"33":("洪水注意報",2,"#fb923c"),"34":("強風注意報",2,"#fb923c"),
-    "35":("風雪注意報",2,"#fb923c"),"36":("大雪注意報",2,"#fb923c"),"37":("波浪注意報",2,"#fb923c"),
-    "38":("高潮注意報",2,"#fb923c"),"39":("濃霧注意報",1,"#fbbf24"),"40":("雷注意報",1,"#fbbf24"),
-    "42":("乾燥注意報",1,"#fbbf24"),"43":("なだれ注意報",1,"#fbbf24"),"44":("低温注意報",1,"#fbbf24"),
-    "45":("霜注意報",1,"#fbbf24"),"46":("着氷注意報",1,"#fbbf24"),"47":("着雪注意報",1,"#fbbf24"),
-    "50":("記録的短時間大雨情報",2,"#c026d3"),
-}
-PREF_CENTERS = {
-    "011000":(43.06,141.35),"012000":(43.4,142.8),"013000":(42.5,143.5),
-    "014030":(41.8,140.7),"014100":(42.3,143.3),"015000":(43.5,144.4),
-    "016000":(43.3,145.2),"017000":(42.7,141.7),"018000":(43.1,140.6),
-    "019000":(42.1,142.9),"020000":(40.82,140.74),"030000":(39.70,141.15),
-    "040000":(38.27,140.87),"050000":(39.72,140.10),"060000":(38.24,140.36),
-    "070000":(37.75,140.47),"080000":(36.34,140.45),"090000":(36.56,139.88),
-    "100000":(36.39,139.06),"110000":(35.86,139.65),"120000":(35.61,140.12),
-    "130000":(35.69,139.69),"140000":(35.45,139.64),"150000":(37.90,139.02),
-    "160000":(36.70,137.21),"170000":(36.59,136.63),"180000":(36.06,136.22),
-    "190000":(35.66,138.57),"200000":(36.65,138.18),"210000":(35.39,136.72),
-    "220000":(34.98,138.38),"230000":(35.18,136.91),"240000":(34.73,136.51),
-    "250000":(35.00,135.87),"260000":(35.02,135.76),"270000":(34.69,135.50),
-    "280000":(34.69,135.18),"290000":(34.69,135.83),"300000":(33.77,135.37),
-    "310000":(35.50,134.24),"320000":(35.47,133.06),"330000":(34.66,133.93),
-    "340000":(34.40,132.46),"350000":(34.19,131.48),"360000":(34.07,134.56),
-    "370000":(34.34,134.05),"380000":(33.84,132.77),"390000":(33.56,133.53),
-    "400000":(33.61,130.42),"410000":(33.27,130.30),"420000":(32.74,129.87),
-    "430000":(32.79,130.74),"440000":(33.24,131.61),"450000":(31.91,131.42),
-    "460100":(31.56,130.56),"471000":(26.21,127.68),"472000":(26.19,127.68),
-    "473000":(24.34,124.16),"474000":(24.80,125.28),
-}
-
-def _fetch_warnings_all():
-    global _warning_cache
-    now = time.time()
-    if _warning_cache["data"] is not None and now - _warning_cache["ts"] < WARNING_CACHE_SEC:
-        return _warning_cache["data"]
-
-    unique_codes = list(dict.fromkeys(PREF_CODE_LIST))
-    warning_data = {}
-    lock = threading.Lock()
-
-    def _fetch_one(code):
-        url = f"https://www.jma.go.jp/bosai/warning/data/warning/{code}.json"
-        try:
-            resp = requests.get(url, timeout=8, headers={"User-Agent":"App/4.2"})
-            if resp.status_code != 200: return
-            data = resp.json()
-        except Exception as e:
-            print(f"[WARNING] {code} エラー: {e}"); return
-
-        # JMA警報APIのレスポンス構造: {"areaTypes": [...]}
-        area_types = data.get("areaTypes", [])
-        for area_type_obj in area_types:
-            for area in area_type_obj.get("areas", []):
-                items = area.get("warnings", [])
-                if not items: continue
-                active = []
-                for w in items:
-                    status = w.get("status","")
-                    if status not in ("発表","継続","特別警報"): continue
-                    wcode = str(w.get("code",""))
-                    if wcode in WARNING_TYPES:
-                        name,level,color = WARNING_TYPES[wcode]
-                        active.append({"type_name":name,"level":level,"color":color})
-                if active:
-                    active.sort(key=lambda x: -x["level"])
-                    area_name = area.get("name", code)
-                    area_code = area.get("code", code)
-                    key = f"{area_name}:{area_code}"
-                    with lock:
-                        if key not in warning_data:
-                            warning_data[key] = {"pref_code":code,"area_name":area_name,
-                                                  "area_code":area_code,"warnings":active}
-
-    threads = [threading.Thread(target=_fetch_one, args=(c,)) for c in unique_codes]
-    for t in threads: t.start()
-    for t in threads: t.join(timeout=30)
-    print(f"[WARNING] {len(warning_data)}地域で警報・注意報")
-    _warning_cache = {"data": warning_data, "ts": now}
-    return warning_data
-
-def render_warning(updated_str):
-    warning_data = _fetch_warnings_all()
-
-    markers = []
-    for key, info in warning_data.items():
-        pref_code = info["pref_code"]
-        coord = PREF_CENTERS.get(pref_code)
-        if not coord:
-            for k in PREF_CENTERS:
-                if k.startswith(pref_code[:3]): coord = PREF_CENTERS[k]; break
-        if not coord: continue
-        h = int(hashlib.md5(key.encode()).hexdigest()[:4], 16)
-        lat = coord[0]+((h%100)-50)*0.008; lon = coord[1]+((h//100%100)-50)*0.010
-        top = info["warnings"][0]; color = top["color"]
-        radius = {3:14,2:10,1:7}.get(top["level"],7)
-        names = "・".join(w["type_name"] for w in info["warnings"])
-        popup = (f"<b>{info['area_name']}</b><br>"
-                 + "<br>".join(f'<span style="color:{w["color"]};font-weight:700">&#9632; {w["type_name"]}</span>'
-                               for w in info["warnings"]))
-        markers.append({"lat":lat,"lon":lon,"color":color,"radius":radius,
-                        "tip":f"{info['area_name']}: {names}","pop":popup})
-
-    markers_js = json.dumps(markers)
-    n_alert = sum(1 for v in warning_data.values() if any(w["level"]==3 for w in v["warnings"]))
-    n_adv   = sum(1 for v in warning_data.values() if all(w["level"]<3  for w in v["warnings"]))
-
-    no_warn_html = ""
-    if not warning_data:
-        no_warn_html = """<div id="nw" style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
-          z-index:1000;background:rgba(17,24,39,.95);padding:24px 32px;border-radius:12px;
-          border:2px solid #10b981;font-size:15px;color:#f3f4f6;text-align:center">
-          <div style="font-size:40px;margin-bottom:12px">&#9989;</div>
-          <b>現在、警報・注意報の発表はありません。</b></div>"""
-
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-{LEAFLET_CDN}
-<style>*{{box-sizing:border-box;margin:0;padding:0}}body,html{{height:100%;overflow:hidden}}
-#map{{width:100%;height:100vh}}</style></head><body>
-<div id="map"></div>
-{no_warn_html}
-<div style="position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:2;color:#f3f4f6">
-  <b>警報・注意報</b><br>
-  <span style="color:#ef4444">&#9679;</span> 警報発令中<br>
-  <span style="color:#fb923c">&#9679;</span> 注意報発令中<br>
-  <span style="color:#fbbf24">&#9679;</span> その他注意報<br>
-  <hr style="border-color:#374151;margin:5px 0">
-  <small>警報:{n_alert}地域 / 注意報:{n_adv}地域<br>出典: 気象庁<br>{updated_str}</small>
-</div>
-<script>
-var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
-{DARK_TILE}
-{GEOJSON_JS}
-var MK={markers_js};
-MK.forEach(function(d){{
-  L.circleMarker([d.lat,d.lon],{{radius:d.radius,color:d.color,fillColor:d.color,fillOpacity:0.9,weight:2}})
-   .bindTooltip(d.tip).bindPopup(d.pop).addTo(map);
-}});
-</script></body></html>"""
-
-
-# ══════════════════════════════════════════════════════
-# ETASマップタブ
+# TAB 2: ETASマップ（研究用強化版）
 # ══════════════════════════════════════════════════════
 def render_etas(grid_scores, quakes, updated_str):
     src_count = {}
@@ -933,26 +474,179 @@ def render_etas(grid_scores, quakes, updated_str):
             elif s>=th2: lv=2
             elif s>=th1: lv=1
             else: continue
-            cells.append({"lat":gi*GRID_SIZE,"lon":gj*GRID_SIZE,"color":ETAS_COLOR[lv],"lv":lv,"score":round(score,4)})
+            cells.append({"lat":gi*GRID_SIZE,"lon":gj*GRID_SIZE,
+                          "color":ETAS_COLOR[lv],"lv":lv,"score":round(score,4)})
+
+    # 最近72時間の地震をマーカーとしてオーバーレイ
+    cutoff72 = datetime.now(timezone.utc) - timedelta(hours=72)
+    recent_markers = []
+    for q in quakes:
+        try:
+            t = datetime.fromisoformat(q["time"].replace("Z","+00:00"))
+            if t < cutoff72: continue
+            mag = q.get("mag",0)
+            recent_markers.append({
+                "lat":q["lat"],"lon":q["lon"],"mag":mag,
+                "tip":f"M{mag:.1f} {_fmt_time_jst(q['time'])}",
+                "r":max(3,mag*2.5)
+            })
+        except Exception: pass
 
     cells_js = json.dumps(cells)
+    recent_js = json.dumps(recent_markers)
     gs = GRID_SIZE
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 {LEAFLET_CDN}
-<style>*{{box-sizing:border-box;margin:0;padding:0}}body,html{{height:100%;overflow:hidden}}
-#map{{width:100%;height:100vh}}</style></head><body>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
+#tb{{display:flex;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;padding:6px 10px;gap:8px;align-items:center}}
+#tb span{{font-size:12px;color:#9ca3af}}
+.tog{{padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;border:none;border-radius:5px;background:#1f2937;color:#9ca3af}}
+.tog.on{{background:#2563eb;color:#fff}}
+#map{{flex:1}}
+#lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:11px 14px;border-radius:8px;border:1px solid #8800cc;font-size:12px;line-height:2;color:#f3f4f6}}
+#info{{position:fixed;top:60px;right:10px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:10px 14px;border-radius:8px;border:1px solid #374151;font-size:11px;color:#9ca3af;max-width:200px}}
+</style></head><body>
+<div id="tb">
+  <span>表示レイヤー:</span>
+  <button class="tog on" id="togEtas" onclick="toggleLayer('etas',this)">ETASグリッド</button>
+  <button class="tog on" id="togRecent" onclick="toggleLayer('recent',this)">直近72h地震</button>
+  <span style="margin-left:auto;color:#6b7280;font-size:11px">更新: {updated_str}</span>
+</div>
 <div id="map"></div>
-<div style="position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:11px 14px;border-radius:8px;border:1px solid #8800cc;font-size:12px;line-height:2;color:#f3f4f6">
+<div id="lg">
   <b>ETAS 地震発生確率</b><br>
-  <span style="color:#1a0033;background:#1a0033;padding:0 6px">&#9632;</span> Level 5（上位0.2%）<br>
-  <span style="color:#8000ff">&#9632;</span> Level 4（上位1.5%）<br>
-  <span style="color:#ff0000">&#9632;</span> Level 3（上位5.0%）<br>
-  <span style="color:#ff8800">&#9632;</span> Level 2（上位15%）<br>
-  <span style="color:#66ccff">&#9632;</span> Level 1（上位50%）<br>
+  <span style="color:#1a0033;background:#1a0033;padding:0 6px">■</span> Lv5 (上位0.2%)<br>
+  <span style="color:#8000ff">■</span> Lv4 (上位1.5%)<br>
+  <span style="color:#ff0000">■</span> Lv3 (上位5.0%)<br>
+  <span style="color:#ff8800">■</span> Lv2 (上位15%)<br>
+  <span style="color:#66ccff">■</span> Lv1 (上位50%)<br>
   <hr style="border-color:#374151;margin:5px 0">
-  <small>JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)} USGS:{src_count.get('usgs',0)}<br>
-  計{len(quakes)}件 | {updated_str}</small>
+  <small>JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)} USGS:{src_count.get('usgs',0)}<br>計{len(quakes)}件</small>
+</div>
+<div id="info">
+  <b style="color:#60a5fa">研究メモ</b><br>
+  ETASモデルは過去60日の地震から算出。<br>
+  b値・GNSS比較のベースラインとして使用。<br>
+  残差 = 実測 − ETAS予測 (Phase2で実装予定)
+</div>
+<script>
+var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
+{DARK_TILE}
+{GEOJSON_JS}
+
+var CELLS={cells_js};
+var gs={gs};
+var etasGroup=L.layerGroup().addTo(map);
+CELLS.forEach(function(c){{
+  L.rectangle([[c.lat,c.lon],[c.lat+gs,c.lon+gs]],
+    {{color:null,weight:0,fill:true,fillColor:c.color,fillOpacity:0.65}})
+   .bindTooltip('Level '+c.lv+' / rate='+c.score).addTo(etasGroup);
+}});
+
+var RECENT={recent_js};
+var recentGroup=L.layerGroup().addTo(map);
+RECENT.forEach(function(d){{
+  L.circleMarker([d.lat,d.lon],{{radius:d.r,color:'#fff',fillColor:'#fff',fillOpacity:0.9,weight:1.5}})
+   .bindTooltip(d.tip).addTo(recentGroup);
+}});
+
+var groups={{'etas':etasGroup,'recent':recentGroup}};
+function toggleLayer(key,btn){{
+  btn.classList.toggle('on');
+  var g=groups[key];
+  if(map.hasLayer(g))map.removeLayer(g); else g.addTo(map);
+}}
+</script></body></html>"""
+
+
+# ══════════════════════════════════════════════════════
+# TAB 3: b値マップ
+# ══════════════════════════════════════════════════════
+def render_bvalue(bvalue_grid, quakes, updated_str):
+    # b値カラースケール: 低b値(赤)→高b値(青)
+    # 低b値は大地震の前兆として注目される
+    def b_color(b):
+        # b値の典型的な範囲は 0.5 〜 2.0
+        ratio = max(0.0, min(1.0, (b - 0.5) / 1.5))
+        r = int(220 * (1 - ratio))
+        g = int(60 + 100 * ratio)
+        bl = int(220 * ratio)
+        return f"#{r:02x}{g:02x}{bl:02x}"
+
+    cells = []
+    for (gi, gj), info in bvalue_grid.items():
+        b = info["b"]; n = info["n"]; mean_m = info["mean_m"]
+        lat = gi * 0.5; lon = gj * 0.5
+        if not (24<=lat<=46 and 122<=lon<=146): continue
+        cells.append({
+            "lat": lat, "lon": lon,
+            "color": b_color(b), "b": b, "n": n, "mean_m": mean_m
+        })
+
+    cells_js = json.dumps(cells)
+    gs = 0.5  # b値計算のグリッドサイズ
+
+    # 統計サマリー
+    if bvalue_grid:
+        all_b = [v["b"] for v in bvalue_grid.values()]
+        b_mean = round(np.mean(all_b), 3)
+        b_min  = round(np.min(all_b), 3)
+        b_max  = round(np.max(all_b), 3)
+        b_std  = round(np.std(all_b), 3)
+    else:
+        b_mean = b_min = b_max = b_std = "N/A"
+
+    total_used = sum(v["n"] for v in bvalue_grid.values())
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+{LEAFLET_CDN}
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
+#hdr{{padding:8px 14px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;
+       display:flex;align-items:center;gap:16px;font-size:12px;color:#9ca3af}}
+#hdr b{{color:#f3f4f6;font-size:13px}}
+.stat{{background:#1f2937;padding:4px 10px;border-radius:5px;font-size:11px;color:#d1d5db}}
+.stat span{{color:#60a5fa;font-weight:700}}
+#map{{flex:1}}
+#lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:2;color:#f3f4f6}}
+#info{{position:fixed;top:60px;right:10px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:10px 14px;border-radius:8px;border:1px solid #374151;font-size:11px;color:#9ca3af;max-width:210px}}
+</style></head><body>
+<div id="hdr">
+  <b>b値マップ (Gutenberg-Richter則)</b>
+  <div class="stat">グリッド数: <span>{len(cells)}</span></div>
+  <div class="stat">使用地震数: <span>{total_used}</span></div>
+  <div class="stat">b平均: <span>{b_mean}</span></div>
+  <div class="stat">b最小: <span style="color:#ef4444">{b_min}</span></div>
+  <div class="stat">b最大: <span style="color:#60a5fa">{b_max}</span></div>
+  <div style="margin-left:auto;color:#6b7280">更新: {updated_str}</div>
+</div>
+<div id="map"></div>
+<div id="lg">
+  <b>b値カラースケール</b><br>
+  <div style="width:130px;height:10px;border-radius:3px;
+    background:linear-gradient(to right,#dc3c3c,#60a0dc);margin:5px 0 2px"></div>
+  <div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af">
+    <span>低 (0.5)</span><span>高 (2.0)</span>
+  </div>
+  <hr style="border-color:#374151;margin:5px 0">
+  <small>低b値地域 = 大地震の可能性<br>Mc = 2.0 / 最小{10}件/グリッド<br>グリッドサイズ: 0.5°</small>
+</div>
+<div id="info">
+  <b style="color:#60a5fa">研究メモ</b><br>
+  Gutenberg-Richter則:<br>
+  log N = a − bM<br><br>
+  最尤推定:<br>
+  b = log₁₀(e) / (M̄ − Mc)<br><br>
+  ETAS異常地域と比較して<br>
+  b値低下の相関を調べる。<br>
+  (Phase4)
 </div>
 <script>
 var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
@@ -962,8 +656,355 @@ var CELLS={cells_js};
 var gs={gs};
 CELLS.forEach(function(c){{
   L.rectangle([[c.lat,c.lon],[c.lat+gs,c.lon+gs]],
-    {{color:null,weight:0,fill:true,fillColor:c.color,fillOpacity:0.65}})
-   .bindTooltip('Level '+c.lv+' rate='+c.score).addTo(map);
+    {{color:null,weight:0,fill:true,fillColor:c.color,fillOpacity:0.75}})
+   .bindTooltip('b='+c.b+' / N='+c.n+' / M̄='+c.mean_m)
+   .bindPopup('<b>b値: '+c.b+'</b><br>地震数: '+c.n+'<br>平均M: '+c.mean_m)
+   .addTo(map);
+}});
+</script></body></html>"""
+
+
+# ══════════════════════════════════════════════════════
+# TAB 4: TEC（電離圏全電子数）
+# ══════════════════════════════════════════════════════
+def render_tec(updated_str):
+    # NICT SCIDASの最新TECマップをiframe埋め込み
+    # 注: 直接埋め込めない場合はリンクとサムネイル表示に切り替え
+    nict_url = "https://aer-nc-web.nict.go.jp/iono/GEONET/latest_map.png"
+    now_jst = datetime.now(timezone(timedelta(hours=9)))
+    date_str = now_jst.strftime("%Y年%m月%d日 %H:%M JST")
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-serif;height:100vh;display:flex;flex-direction:column}}
+#hdr{{padding:12px 20px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0}}
+#hdr h2{{font-size:15px;font-weight:700;color:#f3f4f6;margin-bottom:4px}}
+#hdr p{{font-size:11px;color:#6b7280}}
+#body{{flex:1;display:flex;gap:0;overflow:hidden}}
+#left{{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:20px;overflow-y:auto}}
+#right{{width:280px;flex-shrink:0;background:#111827;border-left:2px solid #1f2937;padding:16px;overflow-y:auto}}
+.card{{background:#1f2937;border:1px solid #374151;border-radius:10px;padding:16px;margin-bottom:12px;width:100%;max-width:700px}}
+.card h3{{font-size:13px;font-weight:700;color:#60a5fa;margin-bottom:8px}}
+.card p{{font-size:12px;color:#9ca3af;line-height:1.7}}
+.link-btn{{display:block;padding:10px 16px;background:linear-gradient(135deg,#1d4ed8,#7c3aed);
+           color:#fff;font-weight:700;font-size:13px;text-decoration:none;border-radius:8px;
+           text-align:center;margin-top:8px;transition:opacity 0.2s}}
+.link-btn:hover{{opacity:0.85}}
+.tec-img{{width:100%;border-radius:6px;border:1px solid #374151;margin-top:8px}}
+.badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;
+        background:#1e3a5f;color:#93c5fd;margin-right:4px;margin-bottom:4px}}
+#right h3{{font-size:13px;font-weight:700;color:#f3f4f6;margin-bottom:10px;border-bottom:1px solid #374151;padding-bottom:6px}}
+.note{{font-size:12px;color:#9ca3af;line-height:1.8;margin-bottom:12px}}
+.phase{{background:#1f2937;border-left:3px solid #7c3aed;padding:8px 10px;border-radius:0 6px 6px 0;margin-bottom:8px;font-size:11px;color:#d1d5db}}
+</style></head><body>
+<div id="hdr">
+  <h2>TEC（電離圏全電子数）モニタリング</h2>
+  <p>NICT GEONET TEC / {date_str} / 更新: {updated_str}</p>
+</div>
+<div id="body">
+  <div id="left">
+    <div class="card">
+      <h3>NICT 最新 TEC マップ（GEONET）</h3>
+      <p>NICTが提供するGEONETベースのTECマップです。地震前後の電離圏擾乱をモニタリングします。</p>
+      <img src="{nict_url}" class="tec-img" alt="NICT TEC Map"
+           onerror="this.style.display='none';document.getElementById('img-err').style.display='block'">
+      <div id="img-err" style="display:none;padding:12px;background:#1f2937;border-radius:6px;margin-top:8px;font-size:12px;color:#9ca3af">
+        ⚠ 画像の直接読み込みができません（CORSポリシー）。<br>下のリンクから直接確認してください。
+      </div>
+      <a href="https://aer-nc-web.nict.go.jp/iono/GEONET/" target="_blank" class="link-btn">
+        🌐 NICT GEONET TECページを開く
+      </a>
+    </div>
+    <div class="card">
+      <h3>その他のデータソース</h3>
+      <p>TECデータを提供する主要な機関・ツール</p>
+      <div style="margin-top:8px">
+        <a href="https://scidas.nict.go.jp/" target="_blank" class="link-btn" style="margin-bottom:6px">
+          📡 NICT SCIDAS（宇宙天気情報）
+        </a>
+        <a href="https://www.gsi.go.jp/denshi/denshi.html" target="_blank" class="link-btn" style="background:linear-gradient(135deg,#065f46,#047857);margin-bottom:6px">
+          🛰 国土地理院 電子基準点 TEC
+        </a>
+        <a href="https://ionex.jpl.nasa.gov/" target="_blank" class="link-btn" style="background:linear-gradient(135deg,#7f1d1d,#b91c1c)">
+          🚀 JPL Global Ionosphere Maps (GIM)
+        </a>
+      </div>
+    </div>
+    <div class="card">
+      <h3>現在の取得状況</h3>
+      <p style="margin-bottom:8px">
+        <span class="badge">状態</span>
+        <span style="color:#fbbf24;font-weight:700">⚠ 準備中</span> — NICT APIへの直接アクセスは今後実装予定。
+      </p>
+      <p>TECの時系列データ自動取得については、NICTのIONEX形式データ（ftp://ftp.nict.go.jp/）からの自動ダウンロードを予定しています。</p>
+    </div>
+  </div>
+  <div id="right">
+    <h3>研究における位置づけ</h3>
+    <div class="note">
+      <b style="color:#60a5fa">当面やらないもの</b><br>
+      TECは現在の研究フェーズでは<b>導入しない</b>予定。<br>
+      テーマのぼやけを防ぐため、<br>
+      まずETAS残差・b値・GNSSに集中。
+    </div>
+    <div class="note">
+      <b style="color:#34d399">将来の可能性</b><br>
+      ETAS異常地域でのTEC擾乱<br>との相関解析が Phase 5以降の<br>候補テーマ。
+    </div>
+    <div class="phase">📌 Phase 1–4: TEC は使わない</div>
+    <div class="phase" style="border-color:#34d399">📌 Phase 5+: TEC 相関解析（候補）</div>
+    <hr style="border-color:#374151;margin:12px 0">
+    <h3>TECとは</h3>
+    <div class="note">
+      電離圏の全電子数 (Total Electron Content)。<br>
+      大地震の数時間〜数日前に異常増減する<br>
+      という報告があるが、<br>
+      <b style="color:#fbbf24">学術的には未確立</b>。<br>
+      1 TECU = 10¹⁶ el/m²
+    </div>
+  </div>
+</div>
+</body></html>"""
+
+
+# ══════════════════════════════════════════════════════
+# TAB 5: GNSS（地殻変動）
+# ══════════════════════════════════════════════════════
+def render_gnss(updated_str):
+    now_jst = datetime.now(timezone(timedelta(hours=9)))
+    date_str = now_jst.strftime("%Y年%m月%d日")
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+{LEAFLET_CDN}
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-serif;overflow:hidden}}
+#hdr{{padding:10px 16px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;display:flex;align-items:center;gap:12px}}
+#hdr h2{{font-size:14px;font-weight:700}}
+#hdr p{{font-size:11px;color:#6b7280}}
+.hbadge{{padding:3px 10px;border-radius:5px;font-size:11px;font-weight:700}}
+#content{{flex:1;display:flex;overflow:hidden}}
+#map{{flex:1}}
+#panel{{width:260px;flex-shrink:0;background:#111827;border-left:2px solid #1f2937;overflow-y:auto;padding:14px}}
+.sec{{margin-bottom:14px}}
+.sec h3{{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid #1f2937;padding-bottom:4px}}
+.sec p{{font-size:11px;color:#9ca3af;line-height:1.7}}
+.link-btn{{display:block;padding:8px 12px;background:linear-gradient(135deg,#1d4ed8,#7c3aed);
+           color:#fff;font-weight:700;font-size:12px;text-decoration:none;border-radius:6px;
+           text-align:center;margin-bottom:6px;transition:opacity 0.2s}}
+.link-btn:hover{{opacity:0.85}}
+.phase{{background:#1f2937;border-left:3px solid #7c3aed;padding:6px 8px;border-radius:0 5px 5px 0;
+        margin-bottom:6px;font-size:11px;color:#d1d5db}}
+</style></head><body>
+<div id="hdr">
+  <div>
+    <h2>GNSS 地殻変動モニタリング（GEONET）</h2>
+    <p>国土地理院 電子基準点ネットワーク / {date_str} / 更新: {updated_str}</p>
+  </div>
+  <span class="hbadge" style="background:#1e3a5f;color:#93c5fd;margin-left:auto">Phase 5 実装予定</span>
+</div>
+<div id="content">
+  <div id="map"></div>
+  <div id="panel">
+    <div class="sec">
+      <h3>データソース</h3>
+      <a href="https://terras.gsi.go.jp/" target="_blank" class="link-btn">
+        🛰 国土地理院 TERRAS
+      </a>
+      <a href="https://www.gsi.go.jp/kanshi/gnss_crust.html" target="_blank" class="link-btn" style="background:linear-gradient(135deg,#065f46,#047857)">
+        📊 GEONET 地殻変動情報
+      </a>
+      <a href="https://mekira.gsi.go.jp/" target="_blank" class="link-btn" style="background:linear-gradient(135deg,#78350f,#b45309)">
+        📡 MEKIRA（地殻変動モニタ）
+      </a>
+    </div>
+    <div class="sec">
+      <h3>研究における位置づけ</h3>
+      <div class="phase">📌 Phase 5: GNSS導入</div>
+      <p style="margin-top:6px">
+        ETAS異常地域と地殻変動（水平・上下変位）の相関を調べる。<br><br>
+        GEONETの日座標値（F5ソリューション）を自動取得し、直前30日の変位速度を計算する予定。
+      </p>
+    </div>
+    <div class="sec">
+      <h3>実装予定の内容</h3>
+      <p>
+        ① GEONET F5座標の自動DL<br>
+        ② 各基準点の変位ベクトル計算<br>
+        ③ ETAS残差マップとの重ね合わせ<br>
+        ④ 統計的相関検定 (Spearman ρ)
+      </p>
+    </div>
+    <div class="sec">
+      <h3>現在の地図</h3>
+      <p>下の地図は GEONET 電子基準点の<br>配置を示すプレースホルダーです。<br>実データは Phase 5 で実装。</p>
+    </div>
+  </div>
+</div>
+<script>
+var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
+{DARK_TILE}
+{GEOJSON_JS}
+
+// GEONET 電子基準点の代表的な配置をプレースホルダーとして表示
+// 実際のGEONET座標は約1300点存在する
+var placeholders=[
+  [43.1,141.3],[42.9,143.2],[41.8,140.7],[40.8,140.7],[39.7,141.1],[38.3,140.9],
+  [37.7,140.5],[37.0,140.4],[36.6,140.9],[36.4,140.5],[36.1,140.1],[35.9,139.6],
+  [35.7,139.7],[35.5,139.6],[35.2,136.9],[35.0,135.8],[34.7,135.5],[34.4,132.5],
+  [33.8,132.8],[33.6,133.5],[33.3,131.6],[33.2,130.3],[32.8,130.7],[31.9,131.4],
+  [31.6,130.6],[26.2,127.7],[24.3,124.2],
+  [36.7,137.2],[36.6,136.6],[36.1,136.2],[35.7,138.6],[35.4,133.9],[35.5,134.2]
+];
+
+placeholders.forEach(function(p){{
+  L.circleMarker(p,{{radius:4,color:'#34d399',fillColor:'#34d399',fillOpacity:0.7,weight:1}})
+   .bindTooltip('GEONET電子基準点（プレースホルダー）').addTo(map);
+}});
+
+// 凡例
+var legend=L.control({{position:'bottomleft'}});
+legend.onAdd=function(){{
+  var d=L.DomUtil.create('div');
+  d.style.cssText='background:rgba(17,24,39,.92);padding:10px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;color:#f3f4f6;line-height:2';
+  d.innerHTML='<b>GNSS 電子基準点</b><br><span style="color:#34d399">●</span> GEONET基準点（仮）<br><hr style="border-color:#374151;margin:4px 0"><small>変位ベクトル表示は Phase 5 で実装</small>';
+  return d;
+}};
+legend.addTo(map);
+</script></body></html>"""
+
+
+# ══════════════════════════════════════════════════════
+# TAB 6: 海面気圧（アメダス）
+# ══════════════════════════════════════════════════════
+def _fetch_amedas_table():
+    url = "https://www.jma.go.jp/bosai/amedas/const/amedastable.json"
+    try:
+        raw = requests.get(url, timeout=10, headers={"User-Agent":"SeismoApp/5.0"}).json()
+        table = {}
+        for sid, info in raw.items():
+            lr = info.get("lat",[0,0]); lo = info.get("lon",[0,0])
+            table[sid] = {"name":info.get("kjName",sid),
+                          "lat":lr[0]+lr[1]/60.0, "lon":lo[0]+lo[1]/60.0}
+        return table
+    except Exception as e:
+        print(f"[AMEDAS table] {e}"); return {}
+
+def _fetch_amedas_latest():
+    try:
+        t_text = requests.get("https://www.jma.go.jp/bosai/amedas/data/latest_time.txt",
+                              timeout=8, headers={"User-Agent":"SeismoApp/5.0"}).text.strip()
+        dt = datetime.fromisoformat(t_text)
+        ts = dt.strftime("%Y%m%d%H%M%S")
+        data = requests.get(f"https://www.jma.go.jp/bosai/amedas/data/map/{ts}.json",
+                            timeout=10, headers={"User-Agent":"SeismoApp/5.0"}).json()
+        time_label = dt.astimezone(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M JST")
+        return data, time_label
+    except Exception as e:
+        print(f"[AMEDAS obs] {e}"); return {}, "取得失敗"
+
+def _pres_color(val, vmin, vmax):
+    ratio = max(0.0, min(1.0, (val - vmin) / max(vmax - vmin, 0.01)))
+    # 低気圧(赤/紫) → 高気圧(青/白)
+    stops = [(0,(180,0,180)),(0.25,(160,60,240)),(0.50,(100,160,255)),(0.75,(200,220,255)),(1.0,(255,255,255))]
+    r,g,b = stops[-1][1]
+    for k in range(len(stops)-1):
+        lo,hi = stops[k][0], stops[k+1][0]
+        if lo <= ratio <= hi:
+            t = (ratio-lo)/(hi-lo)
+            r0,g0,b0 = stops[k][1]; r1,g1,b1 = stops[k+1][1]
+            r,g,b = int(r0+(r1-r0)*t),int(g0+(g1-g0)*t),int(b0+(b1-b0)*t)
+            break
+    return f"#{max(0,min(255,r)):02x}{max(0,min(255,g)):02x}{max(0,min(255,b)):02x}"
+
+def render_pressure(updated_str):
+    global _amedas_cache
+    now = time.time()
+    if _amedas_cache["data"] and now - _amedas_cache["ts"] < AMEDAS_CACHE_SEC:
+        cached = _amedas_cache["data"]
+        table, obs_data, time_label = cached["table"], cached["obs"], cached["label"]
+    else:
+        table = _fetch_amedas_table(); obs_data, time_label = _fetch_amedas_latest()
+        _amedas_cache = {"data":{"table":table,"obs":obs_data,"label":time_label},"ts":now}
+
+    def _gv(obs, key):
+        raw = obs.get(key)
+        return raw[0] if isinstance(raw,list) and len(raw)>0 and raw[0] is not None else None
+
+    pres_vals_all = []
+    markers = []
+    for sid, obs in obs_data.items():
+        info = table.get(sid)
+        if not info: continue
+        lat,lon = info["lat"],info["lon"]
+        if not (24<=lat<=46 and 122<=lon<=146): continue
+        pres = _gv(obs,"normalPressure")
+        if pres is None: continue
+        pres_vals_all.append(pres)
+
+    pr_min = min(pres_vals_all) if pres_vals_all else 980
+    pr_max = max(pres_vals_all) if pres_vals_all else 1030
+    pr_mean = round(sum(pres_vals_all)/len(pres_vals_all), 1) if pres_vals_all else 0
+
+    for sid, obs in obs_data.items():
+        info = table.get(sid)
+        if not info: continue
+        lat,lon = info["lat"],info["lon"]
+        if not (24<=lat<=46 and 122<=lon<=146): continue
+        pres = _gv(obs,"normalPressure")
+        if pres is None: continue
+        name = info["name"]
+        markers.append({
+            "lat":lat,"lon":lon,
+            "color":_pres_color(pres, pr_min, pr_max),
+            "pres":pres,
+            "tip":f"{name} {pres}hPa",
+            "pop":f"<b>{name}</b><br>海面気圧: <b>{pres}hPa</b>"
+        })
+
+    markers_js = json.dumps(markers)
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+{LEAFLET_CDN}
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
+#hdr{{padding:8px 16px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;
+       display:flex;align-items:center;gap:14px;font-size:12px;color:#9ca3af}}
+#hdr b{{color:#f3f4f6;font-size:14px}}
+.stat{{background:#1f2937;padding:4px 10px;border-radius:5px;font-size:11px;color:#d1d5db}}
+.stat span{{color:#60a5fa;font-weight:700}}
+#map{{flex:1}}
+#lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:2;color:#f3f4f6}}
+</style></head><body>
+<div id="hdr">
+  <b>海面平均気圧マップ</b>
+  <div class="stat">観測点数: <span>{len(markers)}</span></div>
+  <div class="stat">最低: <span style="color:#c084fc">{pr_min:.1f}hPa</span></div>
+  <div class="stat">最高: <span style="color:#93c5fd">{pr_max:.1f}hPa</span></div>
+  <div class="stat">平均: <span>{pr_mean}hPa</span></div>
+  <div style="margin-left:auto;color:#6b7280">{time_label} / 更新: {updated_str}</div>
+</div>
+<div id="map"></div>
+<div id="lg">
+  <b>海面気圧スケール</b><br>
+  <div style="width:130px;height:10px;border-radius:3px;
+    background:linear-gradient(to right,#b400b4,#a03cf0,#64a0ff,#c8dcff,#ffffff);margin:5px 0 2px"></div>
+  <div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af">
+    <span>低({pr_min:.0f})</span><span>高({pr_max:.0f})hPa</span>
+  </div>
+  <hr style="border-color:#374151;margin:5px 0">
+  <small>出典: 気象庁アメダス<br>正規圧力（海面気圧）<br>{updated_str}</small>
+</div>
+<script>
+var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
+{DARK_TILE}
+{GEOJSON_JS}
+var MK={markers_js};
+MK.forEach(function(d){{
+  L.circleMarker([d.lat,d.lon],{{radius:4,color:d.color,fillColor:d.color,fillOpacity:1.0,weight:0.5}})
+   .bindTooltip(d.tip).bindPopup(d.pop).addTo(map);
 }});
 </script></body></html>"""
 
@@ -975,55 +1016,90 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震・気象統合情報システム</title>
+  <title>地震研究統合プラットフォーム v5.0</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
     #sidebar{
-      position:fixed;top:0;left:0;width:180px;height:100%;
-      background:#111827;border-right:2px solid #1f2937;
-      display:flex;flex-direction:column;padding-top:10px;z-index:100;
+      position:fixed;top:0;left:0;width:188px;height:100%;
+      background:#0d1117;border-right:2px solid #1f2937;
+      display:flex;flex-direction:column;padding-top:0;z-index:100;
     }
     .app-title{
-      padding:10px 14px 14px;font-size:13px;font-weight:700;
-      color:#60a5fa;letter-spacing:0.5px;border-bottom:1px solid #1f2937;margin-bottom:6px;
+      padding:14px 14px 12px;
+      background:linear-gradient(135deg,#1e3a5f,#1a1a2e);
+      border-bottom:2px solid #1f2937;
     }
+    .app-title div:first-child{font-size:12px;font-weight:700;color:#60a5fa;letter-spacing:0.5px}
+    .app-title div:last-child{font-size:10px;color:#4b5563;margin-top:2px}
     .group-title{
-      padding:8px 14px 4px;font-size:10px;font-weight:700;
-      color:#4b5563;text-transform:uppercase;letter-spacing:1px;
+      padding:10px 14px 4px;font-size:10px;font-weight:700;
+      color:#374151;text-transform:uppercase;letter-spacing:1px;
     }
     .tab-btn{
-      width:100%;text-align:left;padding:10px 14px;cursor:pointer;
-      font-size:13px;font-weight:500;color:#9ca3af;
-      border:none;background:none;transition:0.15s;
+      width:100%;text-align:left;padding:10px 14px 10px 16px;cursor:pointer;
+      font-size:13px;font-weight:500;color:#6b7280;
+      border:none;background:none;transition:0.15s;display:flex;align-items:center;gap:8px;
     }
-    .tab-btn:hover{color:#f3f4f6;background:#1f2937}
+    .tab-btn:hover{color:#f3f4f6;background:#161b22}
     .tab-btn.active{
-      color:#fff;background:linear-gradient(90deg,#1e3a5f,#1f2937);
-      border-left:3px solid #3b82f6;
+      color:#fff;background:linear-gradient(90deg,#162032,#0d1117);
+      border-left:3px solid #3b82f6;padding-left:13px;
     }
-    .version{margin-top:auto;padding:10px 14px;font-size:10px;color:#374151}
-    #main{margin-left:180px;height:100vh;overflow:hidden}
+    .tab-btn .icon{font-size:14px;flex-shrink:0}
+    .tab-btn .label{flex:1}
+    .tab-btn .badge{font-size:9px;padding:1px 5px;border-radius:3px;background:#1e3a5f;color:#93c5fd;flex-shrink:0}
+    .tab-btn.active .badge{background:#2563eb}
+    .sep{height:1px;background:#1f2937;margin:6px 12px}
+    .version{margin-top:auto;padding:10px 14px;font-size:10px;color:#374151;border-top:1px solid #1f2937}
+    #main{margin-left:188px;height:100vh;overflow:hidden}
     iframe{width:100%;height:100%;border:none;display:none}
     iframe.active{display:block}
   </style>
 </head>
 <body>
   <div id="sidebar">
-    <div class="app-title">気象地震情報</div>
-    <div class="group-title">地震</div>
-    <button class="tab-btn active" onclick="sw(0)">有感地震履歴</button>
-    <button class="tab-btn" onclick="sw(1)">無感地震履歴</button>
+    <div class="app-title">
+      <div>地震研究統合プラットフォーム</div>
+      <div>v5.0 / 研究用</div>
+    </div>
+
+    <div class="group-title">地震データ</div>
+    <button class="tab-btn active" onclick="sw(0)">
+      <span class="icon">🗺</span><span class="label">地震履歴</span>
+      <span class="badge">有感+無感</span>
+    </button>
+    <button class="tab-btn" onclick="sw(1)">
+      <span class="icon">📊</span><span class="label">ETASマップ</span>
+      <span class="badge">P1</span>
+    </button>
+    <button class="tab-btn" onclick="sw(2)">
+      <span class="icon">📉</span><span class="label">b値マップ</span>
+      <span class="badge">P4</span>
+    </button>
+
+    <div class="sep"></div>
+    <div class="group-title">地球物理データ</div>
+    <button class="tab-btn" onclick="sw(3)">
+      <span class="icon">🌐</span><span class="label">TEC</span>
+      <span class="badge">P5+</span>
+    </button>
+    <button class="tab-btn" onclick="sw(4)">
+      <span class="icon">🛰</span><span class="label">GNSS変位</span>
+      <span class="badge">P5</span>
+    </button>
+
+    <div class="sep"></div>
     <div class="group-title">気象</div>
-    <button class="tab-btn" onclick="sw(2)">アメダス観測値</button>
-    <button class="tab-btn" onclick="sw(3)">雨雲レーダー</button>
-    <button class="tab-btn" onclick="sw(4)">警報・注意報</button>
-    <div class="group-title">地震リスクマップ</div>
-    <button class="tab-btn" onclick="sw(5)">ETASマップ</button>
-    <div class="version">v4.3.0</div>
+    <button class="tab-btn" onclick="sw(5)">
+      <span class="icon">🌀</span><span class="label">海面気圧</span>
+      <span class="badge">AMeDAS</span>
+    </button>
+
+    <div class="version">ETAS残差研究プロジェクト</div>
   </div>
   <div id="main">
-    <iframe id="f0" class="active" src="/tab/felt"></iframe>
+    <iframe id="f0" class="active" src="/tab/history"></iframe>
     <iframe id="f1" src=""></iframe>
     <iframe id="f2" src=""></iframe>
     <iframe id="f3" src=""></iframe>
@@ -1031,9 +1107,8 @@ SHELL_HTML = """<!DOCTYPE html>
     <iframe id="f5" src=""></iframe>
   </div>
   <script>
-    var URLS=['felt','unfelt','amedas','radar','warning','etas'];
+    var URLS=['history','etas','bvalue','tec','gnss','pressure'];
     var loaded=[true,false,false,false,false,false];
-    var cur=0;
     function sw(idx){
       document.querySelectorAll('.tab-btn').forEach(function(b,i){b.classList.toggle('active',i===idx)});
       document.querySelectorAll('iframe').forEach(function(f,i){f.classList.toggle('active',i===idx)});
@@ -1041,24 +1116,23 @@ SHELL_HTML = """<!DOCTYPE html>
         document.getElementById('f'+idx).src='/tab/'+URLS[idx];
         loaded[idx]=true;
       }
-      cur=idx;
     }
   </script>
 </body>
 </html>"""
 
 LOADING_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>起動中</title><meta http-equiv="refresh" content="5">
-<style>body{background:#1a1a2e;color:white;display:flex;align-items:center;justify-content:center;
+<meta http-equiv="refresh" content="5">
+<style>body{background:#0d1117;color:white;display:flex;align-items:center;justify-content:center;
 height:100vh;font-family:sans-serif;flex-direction:column;gap:16px}
-.sp{width:48px;height:48px;border:5px solid #0f3460;border-top-color:#e94560;border-radius:50%;animation:spin 1s linear infinite}
+.sp{width:48px;height:48px;border:5px solid #1f2937;border-top-color:#3b82f6;border-radius:50%;animation:spin 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}</style></head>
 <body><div class="sp"></div><p>データを準備中...</p>
-<p style="font-size:12px;color:#aaa">数秒〜数十秒でロードされます</p></body></html>"""
+<p style="font-size:12px;color:#4b5563">地震データ取得 → ETAS解析 → b値計算...</p></body></html>"""
 
 
 # ══════════════════════════════════════════════════════
-# バックグラウンド更新（データのみキャッシュ）
+# バックグラウンド更新
 # ══════════════════════════════════════════════════════
 def _update_data():
     global _cached_data, _last_update, _ready_phase
@@ -1066,43 +1140,35 @@ def _update_data():
     while True:
         try:
             print("[BG] 更新開始")
-            updated_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+            updated_str = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M JST")
 
             if first_run:
                 existing = load_quakes()
                 if existing:
                     grid_scores = analyze_etas(existing)
-                    # 有感地震: max_intがあるもの
-                    jma  = [q for q in existing if q.get("max_int","").strip() not in ("","−","-")]
-                    # 無感地震: max_intが空のもの（全ソース）
-                    unft = [q for q in existing if q.get("max_int","").strip() in ("","−","-")]
+                    bvalue_grid = compute_bvalue_grid(existing)
                     with _cache_lock:
-                        _cached_data = {"jma":jma,"unfelt":unft,"etas":grid_scores,
-                                        "all":existing,"updated":updated_str+"(キャッシュ)"}
-                        _last_update = time.time()
-                        _ready_phase = 2
-                    print(f"[BG] フェーズ1完了: CSVから {len(existing)} 件即時表示")
+                        _cached_data = {"all":existing,"etas":grid_scores,"bvalue":bvalue_grid,
+                                        "updated":updated_str+"(キャッシュ)"}
+                        _last_update = time.time(); _ready_phase = 2
+                    print(f"[BG] フェーズ1完了: {len(existing)}件")
 
             new_q = fetch_all_quakes()
             save_quakes(new_q)
             quakes = load_quakes()
             grid_scores = analyze_etas(quakes)
-            jma  = [q for q in quakes if q.get("max_int","").strip() not in ("","−","-")]
-            unft = [q for q in quakes if q.get("max_int","").strip() in ("","−","-")]
+            bvalue_grid = compute_bvalue_grid(quakes)
             with _cache_lock:
-                _cached_data = {"jma":jma,"unfelt":unft,"etas":grid_scores,
-                                "all":quakes,"updated":updated_str}
-                _last_update = time.time()
-                _ready_phase = 2
-            print(f"[BG] 完了 有感:{len(jma)} 無感:{len(unft)} ETAS格子:{len(grid_scores)}")
+                _cached_data = {"all":quakes,"etas":grid_scores,"bvalue":bvalue_grid,"updated":updated_str}
+                _last_update = time.time(); _ready_phase = 2
+            print(f"[BG] 完了 地震:{len(quakes)}件 ETAS格子:{len(grid_scores)} b値格子:{len(bvalue_grid)}")
             first_run = False
 
         except Exception as e:
             import traceback; print(f"[BG] エラー: {e}"); traceback.print_exc()
             with _cache_lock:
                 if _ready_phase < 2 and _cached_data is None:
-                    _cached_data = {"jma":[],"unfelt":[],"etas":{},"all":[],"updated":"取得失敗"}
-                    _ready_phase = 2
+                    _cached_data = {"all":[],"etas":{},"bvalue":{},"updated":"取得失敗"}; _ready_phase = 2
             first_run = False
 
         time.sleep(FETCH_INTERVAL_SEC)
@@ -1120,20 +1186,23 @@ def index():
 @app.route("/tab/<name>")
 def tab(name):
     with _cache_lock: data = _cached_data
-    if data is None: return Response("<html><body style='background:#0f172a;color:white;padding:20px'>ロード中...</body></html>", mimetype="text/html")
+    if data is None:
+        return Response("<html><body style='background:#0d1117;color:white;padding:20px'>ロード中...</body></html>", mimetype="text/html")
     upd = data["updated"]
-    if   name == "felt":    html = render_felt_quake(data["jma"], upd)
-    elif name == "unfelt":  html = render_unfelt_quake(data["unfelt"], upd)
-    elif name == "amedas":  html = render_amedas(upd)
-    elif name == "radar":   html = render_radar(upd)
-    elif name == "warning": html = render_warning(upd)
-    elif name == "etas":    html = render_etas(data["etas"], data["all"], upd)
+    if   name == "history":  html = render_quake_history(data["all"], upd)
+    elif name == "etas":     html = render_etas(data["etas"], data["all"], upd)
+    elif name == "bvalue":   html = render_bvalue(data["bvalue"], data["all"], upd)
+    elif name == "tec":      html = render_tec(upd)
+    elif name == "gnss":     html = render_gnss(upd)
+    elif name == "pressure": html = render_pressure(upd)
     else: return Response("Not found", status=404)
     return Response(html, mimetype="text/html")
 
 @app.route("/status")
 def status():
-    with _cache_lock: return {"phase":_ready_phase,"last_update":_last_update}
+    with _cache_lock:
+        return {"phase":_ready_phase,"last_update":_last_update,
+                "quakes":len(_cached_data["all"]) if _cached_data else 0}
 
 if __name__ == "__main__":
     threading.Thread(target=_update_data, daemon=True).start()
