@@ -74,9 +74,16 @@ def fetch_quakes_p2p():
             mag = float(hypo["magnitude"]); depth = abs(float(hypo.get("depth", 0)))
             raw_time = eq.get("time", "")
             try:
-                now_y = datetime.now().year
-                dt_jst = datetime.strptime(f"{now_y}/{raw_time}", "%Y/%m/%d %H:%M")
-                time_str = dt_jst.replace(tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc).isoformat()
+                # P2P形式例: "2024/01/01 12:34" or "2024/01/01 12:34:00"
+                for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+                    try:
+                        dt_jst = datetime.strptime(raw_time, fmt)
+                        time_str = dt_jst.replace(tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc).isoformat()
+                        break
+                    except ValueError:
+                        continue
+                else:
+                    time_str = raw_time
             except Exception:
                 time_str = raw_time
             scale_map = {10:"1",20:"2",30:"3",40:"4",45:"5-",50:"5+",55:"6-",60:"6+",70:"7"}
@@ -90,9 +97,18 @@ def fetch_quakes_p2p():
 JMA_LIST_URL = "https://www.jma.go.jp/bosai/quake/data/list.json"
 
 def _parse_jma_cod(cod_str):
-    m = re.match(r'([+-][0-9.]+)([+-][0-9.]+)([+-][0-9.]+)?/?', cod_str.strip())
+    # 例: +35.6+139.7-070000/ または +35.6+139.7+0700/
+    # 緯度・経度は小数点あり、深さは整数のこともある
+    m = re.match(r'([+-]\d+\.?\d*)([+-]\d+\.?\d*)([+-]\d+\.?\d*)?', cod_str.strip())
     if not m: raise ValueError(cod_str)
-    return float(m.group(1)), float(m.group(2)), abs(float(m.group(3)))/1000.0 if m.group(3) else 0.0
+    lat = float(m.group(1))
+    lon = float(m.group(2))
+    depth = 0.0
+    if m.group(3):
+        raw_d = float(m.group(3))
+        # 深さの値が大きい場合はメートル表記 → km変換
+        depth = abs(raw_d) / 1000.0 if abs(raw_d) >= 1000 else abs(raw_d)
+    return lat, lon, depth
 
 def fetch_quakes_jma_bosai():
     try:
@@ -108,7 +124,11 @@ def fetch_quakes_jma_bosai():
         try: mag = float(item.get("mag","0"))
         except Exception: mag = 0.0
         at_str = item.get("at", item.get("rdt",""))
-        try: time_str = datetime.fromisoformat(at_str).astimezone(timezone.utc).isoformat()
+        try:
+            dt = datetime.fromisoformat(at_str.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))
+            time_str = dt.astimezone(timezone.utc).isoformat()
         except Exception: time_str = at_str
         maxi = item.get("maxi","")
         quakes.append({"time":time_str,"lat":lat,"lon":lon,"mag":mag,"depth":depth,
@@ -248,23 +268,22 @@ def analyze_etas(quakes):
     di_arr = np.arange(-R, R+1); dj_arr = np.arange(-R, R+1)
     DI, DJ = np.meshgrid(di_arr, dj_arr, indexing="ij")
     dist2 = (DI[:,:,None] * GRID_SIZE)**2 + (DJ[:,:,None] * GRID_SIZE)**2
-    keys_list = []; vals_list = []
+    from collections import defaultdict
+    agg_dict = defaultdict(float)
     for ei in range(len(valid)):
         sc = spatial_scale[ei]; q_val = EP.Q
         weight = contributions[ei] / (dist2[:,:,ei] + sc**2) ** q_val
         ni = gi[ei] + DI; nj = gj[ei] + DJ
         mask = (ni>=240)&(ni<=460)&(nj>=1220)&(nj<=1460)
-        keys_flat = ni[mask].astype(np.int64)*100000 + nj[mask].astype(np.int64)
-        keys_list.append(keys_flat); vals_list.append(weight[mask])
-    if not keys_list: return {}
-    all_keys = np.concatenate(keys_list); all_vals = np.concatenate(vals_list)
-    unique_keys, inverse = np.unique(all_keys, return_inverse=True)
-    agg_vals = np.zeros(len(unique_keys)); np.add.at(agg_vals, inverse, all_vals)
+        ni_m = ni[mask]; nj_m = nj[mask]; w_m = weight[mask]
+        for k in range(len(ni_m)):
+            agg_dict[(int(ni_m[k]), int(nj_m[k]))] += float(w_m[k])
+    if not agg_dict: return {}
     grid_scores = {}
-    for idx, k in enumerate(unique_keys):
-        gi_k = int(k) // 100000; gj_k = int(k) % 100000
-        v = float(agg_vals[idx]) + EP.MU
-        if v > EP.MU * 1.01: grid_scores[(gi_k, gj_k)] = v
+    for (gi_k, gj_k), agg_val in agg_dict.items():
+        v = agg_val + EP.MU
+        if v > EP.MU * 1.01:
+            grid_scores[(gi_k, gj_k)] = v
     return grid_scores
 
 def _percentile_thresholds(values_arr):
@@ -741,20 +760,6 @@ body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-s
     </div>
   </div>
   <div id="right">
-    <h3>研究における位置づけ</h3>
-    <div class="note">
-      <b style="color:#60a5fa">当面やらないもの</b><br>
-      TECは現在の研究フェーズでは<b>導入しない</b>予定。<br>
-      テーマのぼやけを防ぐため、<br>
-      まずETAS残差・b値・GNSSに集中。
-    </div>
-    <div class="note">
-      <b style="color:#34d399">将来の可能性</b><br>
-      ETAS異常地域でのTEC擾乱<br>との相関解析が Phase 5以降の<br>候補テーマ。
-    </div>
-    <div class="phase">📌 Phase 1–4: TEC は使わない</div>
-    <div class="phase" style="border-color:#34d399">📌 Phase 5+: TEC 相関解析（候補）</div>
-    <hr style="border-color:#374151;margin:12px 0">
     <h3>TECとは</h3>
     <div class="note">
       電離圏の全電子数 (Total Electron Content)。<br>
@@ -771,6 +776,44 @@ body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-s
 # ══════════════════════════════════════════════════════
 # TAB 5: GNSS（地殻変動）
 # ══════════════════════════════════════════════════════
+def _make_gnss_vectors():
+    """
+    GEONETの代表的な電子基準点に対して、
+    日本列島のプレート運動を模した擬似変位ベクトルを生成する。
+    実データ取得（F5ソリューション）は Phase 5 で実装予定。
+    ベクトル: [lat, lon, dE_mm/yr, dN_mm/yr] (東方向・北方向変位速度)
+    """
+    # 日本列島の主要なプレート運動パターンを反映した代表点
+    # 参考: 国土地理院 GEONET F3解 基準速度場（Honshu fixed）
+    stations = [
+        # 北海道（オホーツクプレート、北西方向）
+        [43.1, 141.3, -10, -5],  [42.9, 143.2, -8, -6],
+        [41.8, 140.7, -12, -4],
+        # 東北（太平洋プレート沈み込み、西方向成分）
+        [40.8, 140.7, -22, -8],  [39.7, 141.1, -25, -7],
+        [38.3, 140.9, -28, -6],  [37.7, 140.5, -30, -5],
+        [37.0, 140.4, -28, -5],
+        # 関東（複合プレート境界、南西方向）
+        [36.6, 140.9, -20, -8],  [36.4, 140.5, -22, -9],
+        [36.1, 140.1, -24, -10], [35.9, 139.6, -20, -12],
+        [35.7, 139.7, -18, -13], [35.5, 139.6, -16, -14],
+        # 中部（ユーラシアプレート）
+        [36.7, 137.2, -5,  -8],  [36.6, 136.6, -4, -9],
+        [36.1, 136.2, -3, -10],  [35.7, 138.6, -10, -12],
+        [35.2, 136.9, -4,  -9],
+        # 近畿・中国・四国
+        [35.0, 135.8, -2, -10],  [34.7, 135.5, -1, -11],
+        [34.4, 132.5,  5, -12],  [33.8, 132.8,  6, -11],
+        [33.6, 133.5,  4, -10],
+        # 九州（フィリピン海プレート）
+        [33.3, 131.6, 12, -10],  [33.2, 130.3, 14, -9],
+        [32.8, 130.7, 15, -8],   [31.9, 131.4, 18, -6],
+        [31.6, 130.6, 16, -7],
+        # 沖縄・南西諸島（琉球弧）
+        [26.2, 127.7, 30, -5],   [24.3, 124.2, 35, -3],
+    ]
+    return stations
+
 def render_gnss(updated_str):
     now_jst = datetime.now(timezone(timedelta(hours=9)))
     date_str = now_jst.strftime("%Y年%m月%d日")
@@ -818,14 +861,6 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;color:#
       <a href="https://mekira.gsi.go.jp/" target="_blank" class="link-btn" style="background:linear-gradient(135deg,#78350f,#b45309)">
         📡 MEKIRA（地殻変動モニタ）
       </a>
-    </div>
-    <div class="sec">
-      <h3>研究における位置づけ</h3>
-      <div class="phase">📌 Phase 5: GNSS導入</div>
-      <p style="margin-top:6px">
-        ETAS異常地域と地殻変動（水平・上下変位）の相関を調べる。<br><br>
-        GEONETの日座標値（F5ソリューション）を自動取得し、直前30日の変位速度を計算する予定。
-      </p>
     </div>
     <div class="sec">
       <h3>実装予定の内容</h3>
