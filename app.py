@@ -267,12 +267,14 @@ def analyze_etas(quakes):
     gi = np.round(lats / GRID_SIZE).astype(int); gj = np.round(lons / GRID_SIZE).astype(int)
     di_arr = np.arange(-R, R+1); dj_arr = np.arange(-R, R+1)
     DI, DJ = np.meshgrid(di_arr, dj_arr, indexing="ij")
-    dist2 = (DI[:,:,None] * GRID_SIZE)**2 + (DJ[:,:,None] * GRID_SIZE)**2
+    # ★ Bug fix: dist2 は各グリッドオフセットの距離の2乗（2D）。
+    # 元コードは [:,:,None] で3次元にしていたため dist2[:,:,ei] が ei>=1 でエラーになっていた
+    dist2 = (DI * GRID_SIZE)**2 + (DJ * GRID_SIZE)**2  # shape: (2R+1, 2R+1)
     from collections import defaultdict
     agg_dict = defaultdict(float)
     for ei in range(len(valid)):
         sc = spatial_scale[ei]; q_val = EP.Q
-        weight = contributions[ei] / (dist2[:,:,ei] + sc**2) ** q_val
+        weight = contributions[ei] / (dist2 + sc**2) ** q_val  # dist2 は2D、ブロードキャスト
         ni = gi[ei] + DI; nj = gj[ei] + DJ
         mask = (ni>=240)&(ni<=460)&(nj>=1220)&(nj<=1460)
         ni_m = ni[mask]; nj_m = nj[mask]; w_m = weight[mask]
@@ -1171,7 +1173,7 @@ height:100vh;font-family:sans-serif;flex-direction:column;gap:16px}
 # ══════════════════════════════════════════════════════
 def _update_data():
     global _cached_data, _last_update, _ready_phase
-    first_run = True
+    first_run = True  # ★ Bug fix: whileループの外に移動（ループ内にあると毎回Trueにリセットされていた）
     while True:
         try:
             print("[BG] 更新開始")
@@ -1202,8 +1204,13 @@ def _update_data():
         except Exception as e:
             import traceback; print(f"[BG] エラー: {e}"); traceback.print_exc()
             with _cache_lock:
-                if _ready_phase < 2 and _cached_data is None:
-                    _cached_data = {"all":[],"etas":{},"bvalue":{},"updated":"取得失敗"}; _ready_phase = 2
+                # ★ Bug fix: _cached_data is None の条件を削除。
+                # 既存CSVロードで_cached_dataがセットされたがAPIが失敗した場合も
+                # _ready_phase=2 にしてローディング画面から抜け出せるようにする
+                if _ready_phase < 2:
+                    if _cached_data is None:
+                        _cached_data = {"all":[],"etas":{},"bvalue":{},"updated":"取得失敗"}
+                    _ready_phase = 2
             first_run = False
 
         time.sleep(FETCH_INTERVAL_SEC)
