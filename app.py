@@ -58,41 +58,191 @@ GEOJSON_JS = """
 # ══════════════════════════════════════════════════════
 # データ取得
 # ══════════════════════════════════════════════════════
-def fetch_quakes_p2p():
-    url = "https://api.p2pquake.net/v2/history?codes=551&limit=100"
+def _parse_p2p_item(item):
+    """P2P history API (code=551) の1件をパースして dict を返す。失敗時は None。"""
+    if "earthquake" not in item:
+        return None
+    eq = item["earthquake"]; hypo = eq.get("hypocenter", {})
     try:
-        data = requests.get(url, timeout=8, headers={"User-Agent":"SeismoApp/5.0"}).json()
-    except Exception as e:
-        print(f"[P2P] {e}"); return []
-    quakes = []
-    for item in data:
-        if "earthquake" not in item: continue
-        eq = item["earthquake"]; hypo = eq.get("hypocenter", {})
-        try:
-            lat = float(hypo["latitude"]); lon = float(hypo["longitude"])
-            if lat == -200 or lon == -200: continue
-            mag = float(hypo["magnitude"]); depth = abs(float(hypo.get("depth", 0)))
-            raw_time = eq.get("time", "")
+        lat = float(hypo.get("latitude", -200))
+        lon = float(hypo.get("longitude", -200))
+        if lat == -200 or lon == -200:
+            return None
+        mag = float(hypo.get("magnitude", -1))
+        if mag < 0:
+            return None
+        depth = abs(float(hypo.get("depth", 0)))
+        raw_time = eq.get("time", "")
+        time_str = raw_time
+        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
             try:
-                # P2P形式例: "2024/01/01 12:34" or "2024/01/01 12:34:00"
-                for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
-                    try:
-                        dt_jst = datetime.strptime(raw_time, fmt)
-                        time_str = dt_jst.replace(tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc).isoformat()
-                        break
-                    except ValueError:
-                        continue
-                else:
-                    time_str = raw_time
+                dt_jst   = datetime.strptime(raw_time, fmt)
+                time_str = dt_jst.replace(tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc).isoformat()
+                break
+            except ValueError:
+                continue
+        scale_map = {10:"1",20:"2",30:"3",40:"4",45:"5-",50:"5+",55:"6-",60:"6+",70:"7"}
+        # maxScale フィールド（-1 = 無感）
+        max_scale = eq.get("maxScale", -1)
+        if max_scale == -1:
+            max_int = ""          # 無感
+        else:
+            max_int = scale_map.get(int(max_scale), str(max_scale))
+        return {"time":time_str,"lat":lat,"lon":lon,"mag":mag,"depth":depth,
+                "source":"p2p","place":hypo.get("name","不明"),"max_int":max_int}
+    except Exception:
+        return None
+
+def fetch_quakes_p2p():
+    """
+    P2P地震情報 /history?codes=551 を複数ページ取得し、
+    有感・無感を問わず震源情報のある地震をすべて収集する。
+    最大 500 件 (5ページ × 100件) を取得して直近 30 日分を返す。
+    """
+    BASE_URL = "https://api.p2pquake.net/v2/history"
+    HEADERS  = {"User-Agent": "SeismoApp/5.0"}
+    PAGES    = 5        # 1ページ100件 → 最大500件
+    cutoff   = datetime.now(timezone.utc) - timedelta(days=30)
+
+    quakes = []
+    seen_ids = set()
+    stop_early = False
+
+    for page in range(PAGES):
+        if stop_early:
+            break
+        params = {"codes": 551, "limit": 100, "offset": page * 100}
+        try:
+            resp = requests.get(BASE_URL, params=params, timeout=10, headers=HEADERS)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"[P2P] page={page} エラー: {e}")
+            break
+
+        if not data:
+            break  # これ以上データなし
+
+        for item in data:
+            # 重複排除（同一IDが来ることがある）
+            item_id = item.get("id", "")
+            if item_id and item_id in seen_ids:
+                continue
+            if item_id:
+                seen_ids.add(item_id)
+
+            q = _parse_p2p_item(item)
+            if q is None:
+                continue
+
+            # 30日カットオフ — それより古いデータが来たらページング終了
+            try:
+                t = datetime.fromisoformat(q["time"].replace("Z", "+00:00"))
+                if t < cutoff:
+                    stop_early = True
+                    break
             except Exception:
-                time_str = raw_time
-            scale_map = {10:"1",20:"2",30:"3",40:"4",45:"5-",50:"5+",55:"6-",60:"6+",70:"7"}
-            max_int = item.get("points", [{}])[0].get("scale","") if item.get("points") else ""
-            if isinstance(max_int, int): max_int = scale_map.get(max_int, str(max_int))
-            quakes.append({"time":time_str,"lat":lat,"lon":lon,"mag":mag,"depth":depth,
-                           "source":"p2p","place":hypo.get("name","不明"),"max_int":str(max_int)})
-        except Exception: continue
-    print(f"[P2P] {len(quakes)}件"); return quakes
+                pass
+
+            quakes.append(q)
+
+    print(f"[P2P] {len(quakes)}件（有感+無感）")
+    return quakes
+
+
+def fetch_quakes_p2p_jma():
+    """
+    P2P地震情報の /jma/quake API から無感地震を含む全地震を取得する。
+    /history?codes=551 では直近1週間程度しか取得できないため、
+    こちらのエンドポイントで過去30日分を補完する。
+    quake_type=Destination (震源のみ情報、無感地震を多く含む) および
+    ScaleAndDestination (震度+震源) を対象とする。
+    """
+    BASE_URL = "https://api.p2pquake.net/v2/jma/quake"
+    HEADERS  = {"User-Agent": "SeismoApp/5.0"}
+    scale_map = {10:"1",20:"2",30:"3",40:"4",45:"5-",50:"5+",55:"6-",60:"6+",70:"7"}
+    cutoff   = datetime.now(timezone.utc) - timedelta(days=30)
+    since    = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y%m%d")
+
+    quakes = []
+    seen_ids = set()
+
+    # Destination = 震源のみ（無感）、ScaleAndDestination = 震度+震源（有感）
+    for qtype in ("Destination", "ScaleAndDestination"):
+        offset = 0
+        while True:
+            params = {
+                "limit": 100, "offset": offset, "order": -1,
+                "quake_type": qtype, "since_date": since,
+            }
+            try:
+                resp = requests.get(BASE_URL, params=params, timeout=12, headers=HEADERS)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                print(f"[P2P/jma] {qtype} offset={offset} エラー: {e}")
+                break
+
+            if not data:
+                break
+
+            stop_early = False
+            for item in data:
+                item_id = item.get("id", "")
+                if item_id and item_id in seen_ids:
+                    continue
+                if item_id:
+                    seen_ids.add(item_id)
+
+                eq   = item.get("earthquake", {})
+                hypo = eq.get("hypocenter", {})
+                try:
+                    lat = float(hypo.get("latitude", -200))
+                    lon = float(hypo.get("longitude", -200))
+                    if lat == -200 or lon == -200:
+                        continue
+                    mag = float(hypo.get("magnitude", -1))
+                    if mag < 0:
+                        continue
+                    depth = abs(float(hypo.get("depth", 0)))
+
+                    raw_time = eq.get("time", "")
+                    time_str = raw_time
+                    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+                        try:
+                            dt_jst   = datetime.strptime(raw_time, fmt)
+                            time_str = dt_jst.replace(tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc).isoformat()
+                            break
+                        except ValueError:
+                            continue
+
+                    try:
+                        t = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+                        if t < cutoff:
+                            stop_early = True
+                            break
+                    except Exception:
+                        pass
+
+                    max_scale = eq.get("maxScale", -1)
+                    max_int   = "" if max_scale == -1 else scale_map.get(int(max_scale), str(max_scale))
+
+                    quakes.append({
+                        "time": time_str, "lat": lat, "lon": lon,
+                        "mag": mag, "depth": depth,
+                        "source": "p2p_jma",
+                        "place": hypo.get("name", "不明"),
+                        "max_int": max_int,
+                    })
+                except Exception:
+                    continue
+
+            if stop_early or len(data) < 100:
+                break
+            offset += 100
+
+    print(f"[P2P/jma] {len(quakes)}件（Destination+ScaleAndDestination）")
+    return quakes
 
 JMA_LIST_URL = "https://www.jma.go.jp/bosai/quake/data/list.json"
 
@@ -161,14 +311,20 @@ def fetch_all_quakes():
         try: results[name] = fn()
         except Exception as e: print(f"[fetch_all] {name} {e}"); results[name] = []
     threads = [threading.Thread(target=_run, args=(n,f), daemon=True) for n,f in
-               [("p2p",fetch_quakes_p2p),("usgs",fetch_quakes_usgs),("jma",fetch_quakes_jma_bosai)]]
+               [("p2p",     fetch_quakes_p2p),
+                ("p2p_jma", fetch_quakes_p2p_jma),
+                ("usgs",    fetch_quakes_usgs),
+                ("jma",     fetch_quakes_jma_bosai)]]
     for t in threads: t.start()
-    for t in threads: t.join(timeout=20)
-    all_q = results.get("p2p",[]) + results.get("usgs",[]) + results.get("jma",[])
+    for t in threads: t.join(timeout=30)
+    all_q = (results.get("jma",[]) + results.get("p2p",[]) +
+             results.get("p2p_jma",[]) + results.get("usgs",[]))
     return _deduplicate(all_q)
 
 def _deduplicate(quakes, time_tol_min=5, dist_tol_deg=0.3):
-    prio = {"jma_bosai":0,"p2p":1,"usgs":2}
+    # 優先度: jma_bosai > p2p > p2p_jma > usgs
+    # p2p_jmaはJMAデータの再配信なのでjma_bosaiと重複しやすい -> 低優先度
+    prio = {"jma_bosai":0,"p2p":1,"p2p_jma":2,"usgs":3}
     sorted_q = sorted(quakes, key=lambda q: prio.get(q["source"],9))
     kept = []
     for q in sorted_q:
@@ -378,7 +534,7 @@ def render_quake_history(quakes, updated_str):
         mc     = _mag_color(mag)
         ic     = _int_color(maxi) if maxi not in ("","−","-") else "#475569"
         il     = _int_label(maxi) if maxi not in ("","−","-") else "無感"
-        src_badge = {"jma_bosai":"JMA","p2p":"P2P","usgs":"USGS"}.get(src,"?")
+        src_badge = {"jma_bosai":"JMA","p2p":"P2P","p2p_jma":"P2P","usgs":"USGS"}.get(src,"?")
 
         # マーカー色: 有感→震度色、無感→マグニチュード色
         marker_color = ic if maxi not in ("","−","-") else mc
@@ -546,7 +702,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
   <span style="color:#ff8800">■</span> Lv2 (上位15%)<br>
   <span style="color:#66ccff">■</span> Lv1 (上位50%)<br>
   <hr style="border-color:#374151;margin:5px 0">
-  <small>JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)} USGS:{src_count.get('usgs',0)}<br>計{len(quakes)}件</small>
+  <small>JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)+src_count.get('p2p_jma',0)} USGS:{src_count.get('usgs',0)}<br>計{len(quakes)}件</small>
 </div>
 <div id="info">
   <b style="color:#60a5fa">研究メモ</b><br>
