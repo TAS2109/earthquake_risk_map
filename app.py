@@ -348,7 +348,7 @@ def fetch_all_quakes():
     # 旧コードは timeout=30 で join していたため、p2p_jma が時間内に完了せず
     # results["p2p_jma"] が一切セットされない（=空扱いになる）ことが多発し、
     # 無感地震が取得できていなかった。十分なタイムアウトに変更する。
-    for t in threads: t.join(timeout=150)
+    for t in threads: t.join()
     for name in ("p2p", "p2p_jma", "usgs", "jma"):
         if name not in results:
             print(f"[fetch_all] {name} タイムアウトで未完了のためスキップ")
@@ -828,7 +828,7 @@ def render_bvalue(bvalue_grid, quakes, updated_str):
     cells = []
     for (gi, gj), info in bvalue_grid.items():
         b = info["b"]; n = info["n"]; mean_m = info["mean_m"]
-        lat = gi * 0.5; lon = gj * 0.5
+        lat = gi * 2.0; lon = gj * 2.0
         if not (24<=lat<=46 and 122<=lon<=146): continue
         cells.append({
             "lat": lat, "lon": lon,
@@ -836,7 +836,7 @@ def render_bvalue(bvalue_grid, quakes, updated_str):
         })
 
     cells_js = json.dumps(cells)
-    gs = 0.5  # b値計算のグリッドサイズ
+    gs = 2.0  # b値計算のグリッドサイズ
 
     # 統計サマリー
     if bvalue_grid:
