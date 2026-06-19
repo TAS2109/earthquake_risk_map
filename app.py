@@ -157,6 +157,16 @@ def fetch_quakes_p2p_jma():
     こちらのエンドポイントで過去30日分を補完する。
     quake_type=Destination (震源のみ情報、無感地震を多く含む) および
     ScaleAndDestination (震度+震源) を対象とする。
+
+    ★ Bug fix: /jma エンドポイントは 10 リクエスト/分 のレート制限がある
+    (P2P地震情報 API仕様書 v2.3.0 より)。元コードはページング時にリクエスト間隔を
+    空けずに連続でAPIを呼んでいたため、30日分（数百件規模）を取得しようとすると
+    すぐ429 (Too Many Requests) となり、resp.raise_for_status() で例外 → breakして
+    そのqtypeの取得が早期終了し、無感地震（Destination）がほとんど取れなくなっていた。
+    さらに fetch_all_quakes() 側の thread.join(timeout=30) によって、ページングが
+    終わる前にスレッドがタイムアウトし、結果が一切resultsに書き込まれず空リストに
+    なるケースもあった（このタイムアウト自体も併せて修正している）。
+    対策: リクエスト毎に十分なスリープを入れ、レート制限内に収める。
     """
     BASE_URL = "https://api.p2pquake.net/v2/jma/quake"
     HEADERS  = {"User-Agent": "SeismoApp/5.0"}
@@ -164,19 +174,35 @@ def fetch_quakes_p2p_jma():
     cutoff   = datetime.now(timezone.utc) - timedelta(days=30)
     since    = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y%m%d")
 
+    # /jma エンドポイントは 10 リクエスト/分。安全マージンを取って 6.5 秒間隔にする
+    # (= 1分あたり約9リクエストでレート制限に抵触しないようにする)
+    REQUEST_INTERVAL_SEC = 6.5
+    MAX_PAGES_PER_TYPE    = 8   # 1タイプあたり最大8ページ(800件)で打ち切り、暴走を防ぐ
+
     quakes = []
     seen_ids = set()
+    request_count = 0
 
     # Destination = 震源のみ（無感）、ScaleAndDestination = 震度+震源（有感）
     for qtype in ("Destination", "ScaleAndDestination"):
         offset = 0
-        while True:
+        for page in range(MAX_PAGES_PER_TYPE):
+            if request_count > 0:
+                time.sleep(REQUEST_INTERVAL_SEC)
+
             params = {
                 "limit": 100, "offset": offset, "order": -1,
                 "quake_type": qtype, "since_date": since,
             }
             try:
-                resp = requests.get(BASE_URL, params=params, timeout=12, headers=HEADERS)
+                resp = requests.get(BASE_URL, params=params, timeout=15, headers=HEADERS)
+                request_count += 1
+                if resp.status_code == 429:
+                    # レート制限に達した場合は少し長めに待ってリトライ
+                    print(f"[P2P/jma] {qtype} offset={offset} レート制限(429)。待機して再試行")
+                    time.sleep(10)
+                    resp = requests.get(BASE_URL, params=params, timeout=15, headers=HEADERS)
+                    request_count += 1
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as e:
@@ -241,7 +267,7 @@ def fetch_quakes_p2p_jma():
                 break
             offset += 100
 
-    print(f"[P2P/jma] {len(quakes)}件（Destination+ScaleAndDestination）")
+    print(f"[P2P/jma] {len(quakes)}件（Destination+ScaleAndDestination） リクエスト数={request_count}")
     return quakes
 
 JMA_LIST_URL = "https://www.jma.go.jp/bosai/quake/data/list.json"
@@ -316,7 +342,16 @@ def fetch_all_quakes():
                 ("usgs",    fetch_quakes_usgs),
                 ("jma",     fetch_quakes_jma_bosai)]]
     for t in threads: t.start()
-    for t in threads: t.join(timeout=30)
+    # ★ Bug fix: p2p_jma は /jma のレート制限(10req/分)に対応するため
+    # リクエスト間に約6.5秒のスリープを挟んでいる。Destination/ScaleAndDestination
+    # 各最大8ページなので、最悪ケースで約2分ほどかかる。
+    # 旧コードは timeout=30 で join していたため、p2p_jma が時間内に完了せず
+    # results["p2p_jma"] が一切セットされない（=空扱いになる）ことが多発し、
+    # 無感地震が取得できていなかった。十分なタイムアウトに変更する。
+    for t in threads: t.join(timeout=150)
+    for name in ("p2p", "p2p_jma", "usgs", "jma"):
+        if name not in results:
+            print(f"[fetch_all] {name} タイムアウトで未完了のためスキップ")
     all_q = (results.get("jma",[]) + results.get("p2p",[]) +
              results.get("p2p_jma",[]) + results.get("usgs",[]))
     return _deduplicate(all_q)
@@ -454,10 +489,16 @@ def _percentile_thresholds(values_arr):
 # ══════════════════════════════════════════════════════
 # b値解析 (Gutenberg-Richter)
 # ══════════════════════════════════════════════════════
-def compute_bvalue_grid(quakes, grid_size=0.5, mc=2.0, min_count=10):
+def compute_bvalue_grid(quakes, grid_size=2.0, mc=1.5, min_count=8):
     """
     グリッドごとにb値を計算する。
     b = log10(e) / (mean(M) - Mc)  (最尤推定)
+
+    ★ Bug fix: 元のデフォルト (grid_size=0.5°, mc=2.0, min_count=10) では、
+    60日分の地震データであっても 0.5°グリッド（約55km四方）の中にM2.0以上の
+    地震が10件以上集まることが日本周辺でもほとんど無く、b値マップが常に
+    空になっていた。grid_sizeを2.0°に広げ、mc/min_countも実データ量に
+    見合う値に緩和した。
     """
     from collections import defaultdict
     bins = defaultdict(list)
@@ -467,13 +508,25 @@ def compute_bvalue_grid(quakes, grid_size=0.5, mc=2.0, min_count=10):
         gj = round(q["lon"] / grid_size)
         bins[(gi, gj)].append(q["mag"])
 
-    result = {}
-    for (gi, gj), mags in bins.items():
-        if len(mags) < min_count: continue
-        mean_m = np.mean(mags)
-        if mean_m <= mc: continue
-        b = math.log10(math.e) / (mean_m - mc)
-        result[(gi, gj)] = {"b": round(b, 3), "n": len(mags), "mean_m": round(mean_m, 2)}
+    def _build(min_count_eff):
+        result = {}
+        for (gi, gj), mags in bins.items():
+            if len(mags) < min_count_eff: continue
+            mean_m = np.mean(mags)
+            if mean_m <= mc: continue
+            b = math.log10(math.e) / (mean_m - mc)
+            result[(gi, gj)] = {"b": round(b, 3), "n": len(mags), "mean_m": round(mean_m, 2)}
+        return result
+
+    result = _build(min_count)
+    # データが少ない期間でもマップが完全に空にならないよう、段階的に条件を緩和する
+    for fallback_min_count in (5, 3):
+        if result:
+            break
+        result = _build(fallback_min_count)
+        if result:
+            print(f"[b値] min_count={min_count}→{fallback_min_count}に緩和して再計算")
+
     print(f"[b値] {len(result)}グリッド計算完了")
     return result
 
@@ -536,8 +589,12 @@ def render_quake_history(quakes, updated_str):
         il     = _int_label(maxi) if maxi not in ("","−","-") else "無感"
         src_badge = {"jma_bosai":"JMA","p2p":"P2P","p2p_jma":"P2P","usgs":"USGS"}.get(src,"?")
 
-        # マーカー色: 有感→震度色、無感→マグニチュード色
-        marker_color = ic if maxi not in ("","−","-") else mc
+        # ★ Bug fix: マップの円はマグニチュードで色分けする。
+        # 元コードは「有感→震度色、無感→マグニチュード色」という条件分岐になっていたため、
+        # 無感地震の取得漏れ（別のバグ）でデータがほぼ有感のみになり、結果的に
+        # 地図上のほぼ全ての円が震度色で表示されていた。テーブルの最大震度バッジ(ic/il)は
+        # そのまま残し、地図の円色は常にマグニチュード基準にする。
+        marker_color = mc
         markers.append({
             "lat":q["lat"],"lon":q["lon"],"color":marker_color,
             "radius":max(4, mag*2.8),"idx":i,
@@ -582,7 +639,10 @@ thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bo
 .c2{{padding:5px 4px;color:#9ca3af;font-size:11px}}
 .c3{{padding:5px 4px;text-align:center;font-weight:700;font-size:12px}}
 .c4{{padding:5px 4px;text-align:center}}
-#mp{{flex:1;overflow:hidden}}#map{{width:100%;height:100%}}
+#mp{{flex:1;overflow:hidden;position:relative}}#map{{width:100%;height:100%}}
+#mglg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:10px 13px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.8;color:#f3f4f6}}
+#mglg b{{font-size:12px}}
 </style></head><body>
 <div id="lp">
   <div id="lh">
@@ -601,7 +661,18 @@ thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bo
     <tbody id="tbody">{rows}</tbody>
   </table></div>
 </div>
-<div id="mp"><div id="map"></div></div>
+<div id="mp"><div id="map"></div>
+  <div id="mglg">
+    <b>マップの円色（マグニチュード）</b><br>
+    <span style="color:#ff00ff">●</span> M8.0以上&nbsp;
+    <span style="color:#dc2626">●</span> M7.0+&nbsp;
+    <span style="color:#ef4444">●</span> M6.0+<br>
+    <span style="color:#fb923c">●</span> M5.0+&nbsp;
+    <span style="color:#facc15">●</span> M4.0+&nbsp;
+    <span style="color:#4ade80">●</span> M3.0+&nbsp;
+    <span style="color:#94a3b8">●</span> M3.0未満
+  </div>
+</div>
 <script>
 var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
 {DARK_TILE}
