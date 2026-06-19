@@ -313,10 +313,10 @@ def fetch_quakes_jma_bosai():
 
 def fetch_quakes_usgs():
     now = datetime.now(timezone.utc)
-    start = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+    start = (now - timedelta(days=90)).strftime("%Y-%m-%d")
     url = (f"https://earthquake.usgs.gov/fdsnws/event/1/query"
            f"?format=geojson&starttime={start}&minlatitude=24&maxlatitude=46"
-           f"&minlongitude=122&maxlongitude=146&minmagnitude=1.0&orderby=time&limit=500")
+           f"&minlongitude=122&maxlongitude=146&minmagnitude=0.0&orderby=time&limit=2000")
     try: data = requests.get(url, timeout=12).json()
     except Exception as e:
         print(f"[USGS] {e}"); return []
@@ -348,7 +348,7 @@ def fetch_all_quakes():
     # 旧コードは timeout=30 で join していたため、p2p_jma が時間内に完了せず
     # results["p2p_jma"] が一切セットされない（=空扱いになる）ことが多発し、
     # 無感地震が取得できていなかった。十分なタイムアウトに変更する。
-    for t in threads: t.join()
+    for t in threads: t.join(timeout=150)
     for name in ("p2p", "p2p_jma", "usgs", "jma"):
         if name not in results:
             print(f"[fetch_all] {name} タイムアウトで未完了のためスキップ")
@@ -489,7 +489,7 @@ def _percentile_thresholds(values_arr):
 # ══════════════════════════════════════════════════════
 # b値解析 (Gutenberg-Richter)
 # ══════════════════════════════════════════════════════
-def compute_bvalue_grid(quakes, grid_size=2.0, mc=1.5, min_count=8):
+def compute_bvalue_grid(quakes, grid_size=1.0, mc=1.0, min_count=5):
     """
     グリッドごとにb値を計算する。
     b = log10(e) / (mean(M) - Mc)  (最尤推定)
@@ -828,7 +828,7 @@ def render_bvalue(bvalue_grid, quakes, updated_str):
     cells = []
     for (gi, gj), info in bvalue_grid.items():
         b = info["b"]; n = info["n"]; mean_m = info["mean_m"]
-        lat = gi * 2.0; lon = gj * 2.0
+        lat = gi * 1.0; lon = gj * 1.0
         if not (24<=lat<=46 and 122<=lon<=146): continue
         cells.append({
             "lat": lat, "lon": lon,
@@ -836,7 +836,7 @@ def render_bvalue(bvalue_grid, quakes, updated_str):
         })
 
     cells_js = json.dumps(cells)
-    gs = 2.0  # b値計算のグリッドサイズ
+    gs = 1.0  # b値計算のグリッドサイズ
 
     # 統計サマリー
     if bvalue_grid:
