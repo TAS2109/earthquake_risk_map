@@ -1405,13 +1405,18 @@ tr:hover td{background:#161b22}
 var GRID_SIZE = __GRID_SIZE__;
 var ETAS_COLOR = {5:'#1a0033',4:'#8000ff',3:'#ff0000',2:'#ff8800',1:'#66ccff'};
 var snapshots = [];
-var curMap = null;
+var map = null;
 var curGroups = {};
 
 function fmtTime(fname){
   var m = fname.match(/(\\d{4})(\\d{2})(\\d{2})_(\\d{2})(\\d{2})(\\d{2})/);
   if(!m) return fname;
-  return m[1]+'-'+m[2]+'-'+m[3]+' '+m[4]+':'+m[5]+':'+m[6]+' UTC';
+  // ファイル名はUTC基準のタイムスタンプなのでJST(+9h)に変換して表示する
+  var utcMs = Date.UTC(parseInt(m[1]), parseInt(m[2])-1, parseInt(m[3]), parseInt(m[4]), parseInt(m[5]), parseInt(m[6]));
+  var jst = new Date(utcMs + 9*3600*1000);
+  function pad(n){return n<10?'0'+n:''+n}
+  return jst.getUTCFullYear()+'-'+pad(jst.getUTCMonth()+1)+'-'+pad(jst.getUTCDate())+' '+
+         pad(jst.getUTCHours())+':'+pad(jst.getUTCMinutes())+':'+pad(jst.getUTCSeconds())+' JST';
 }
 
 function bColor(b){
@@ -1539,19 +1544,19 @@ function renderDetail(fname, d){
 
   document.getElementById('detail').innerHTML = html;
 
-  if(curMap){ curMap.remove(); curMap = null; }
-  curMap = L.map('map',{center:[36,138],zoom:4,preferCanvas:true});
+  if(map){ map.remove(); map = null; }
+  map = L.map('map',{center:[36,138],zoom:4,preferCanvas:true});
   __DARK_TILE__
   __GEOJSON_JS__
 
-  var etasGroup = L.layerGroup().addTo(curMap);
+  var etasGroup = L.layerGroup().addTo(map);
   buildEtasCells(d.etas||{}).forEach(function(c){
     L.rectangle([[c.lat,c.lon],[c.lat+GRID_SIZE,c.lon+GRID_SIZE]],
       {color:null,weight:0,fill:true,fillColor:c.color,fillOpacity:0.65})
      .bindTooltip('Level '+c.lv+' / score='+c.score.toFixed(4)).addTo(etasGroup);
   });
 
-  var bvGroup = L.layerGroup().addTo(curMap);
+  var bvGroup = L.layerGroup().addTo(map);
   buildBvalueCells(d.bvalue||{}).forEach(function(c){
     L.rectangle([[c.lat,c.lon],[c.lat+1.0,c.lon+1.0]],
       {color:null,weight:0,fill:true,fillColor:c.color,fillOpacity:0.6})
@@ -1566,8 +1571,8 @@ function renderDetail(fname, d){
 function toggleLayer(key, btn){
   btn.classList.toggle('on');
   var g = curGroups[key];
-  if(!g || !curMap) return;
-  if(curMap.hasLayer(g)) curMap.removeLayer(g); else g.addTo(curMap);
+  if(!g || !map) return;
+  if(map.hasLayer(g)) map.removeLayer(g); else g.addTo(map);
 }
 </script></body></html>"""
     html = html.replace("__GRID_SIZE__", str(GRID_SIZE))
