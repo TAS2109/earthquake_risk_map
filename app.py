@@ -103,11 +103,11 @@ def fetch_quakes_p2p():
     """
     P2P地震情報 /history?codes=551 を複数ページ取得し、
     有感・無感を問わず震源情報のある地震をすべて収集する。
-    最大 500 件 (5ページ × 100件) を取得して直近 30 日分を返す。
+    最大 1000 件 (10ページ × 100件) を取得して直近 30 日分を返す。
     """
     BASE_URL = "https://api.p2pquake.net/v2/history"
     HEADERS  = {"User-Agent": "SeismoApp/5.0"}
-    PAGES    = 5        # 1ページ100件 → 最大500件
+    PAGES    = 10       # 1ページ100件 → 最大1000件（増量）
     cutoff   = datetime.now(timezone.utc) - timedelta(days=30)
 
     quakes = []
@@ -183,7 +183,7 @@ def fetch_quakes_p2p_jma():
     # /jma エンドポイントは 10 リクエスト/分。安全マージンを取って 6.5 秒間隔にする
     # (= 1分あたり約9リクエストでレート制限に抵触しないようにする)
     REQUEST_INTERVAL_SEC = 6.5
-    MAX_PAGES_PER_TYPE    = 8   # 1タイプあたり最大8ページ(800件)で打ち切り、暴走を防ぐ
+    MAX_PAGES_PER_TYPE    = 15  # 1タイプあたり最大15ページ(1500件)に増量
 
     quakes = []
     seen_ids = set()
@@ -322,7 +322,7 @@ def fetch_quakes_usgs():
     start = (now - timedelta(days=90)).strftime("%Y-%m-%d")
     url = (f"https://earthquake.usgs.gov/fdsnws/event/1/query"
            f"?format=geojson&starttime={start}&minlatitude=24&maxlatitude=46"
-           f"&minlongitude=122&maxlongitude=146&minmagnitude=0.0&orderby=time&limit=2000")
+           f"&minlongitude=122&maxlongitude=146&minmagnitude=0.0&orderby=time&limit=5000")
     try: data = requests.get(url, timeout=12).json()
     except Exception as e:
         print(f"[USGS] {e}"); return []
@@ -350,11 +350,11 @@ def fetch_all_quakes():
     for t in threads: t.start()
     # ★ Bug fix: p2p_jma は /jma のレート制限(10req/分)に対応するため
     # リクエスト間に約6.5秒のスリープを挟んでいる。Destination/ScaleAndDestination
-    # 各最大8ページなので、最悪ケースで約2分ほどかかる。
+    # 各最大15ページなので、最悪ケースで約2〜3分ほどかかる。
     # 旧コードは timeout=30 で join していたため、p2p_jma が時間内に完了せず
     # results["p2p_jma"] が一切セットされない（=空扱いになる）ことが多発し、
     # 無感地震が取得できていなかった。十分なタイムアウトに変更する。
-    for t in threads: t.join(timeout=150)
+    for t in threads: t.join(timeout=240)
     for name in ("p2p", "p2p_jma", "usgs", "jma"):
         if name not in results:
             print(f"[fetch_all] {name} タイムアウトで未完了のためスキップ")
