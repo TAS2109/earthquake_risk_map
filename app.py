@@ -23,11 +23,17 @@ DATA_FILE          = "data/quakes.csv"
 GRID_SIZE          = 0.1
 FETCH_INTERVAL_SEC = 600
 
+# ── スナップショット（解析結果の時系列ログ）────────────
+SNAPSHOT_DIR          = "data/snapshots"
+SNAPSHOT_INTERVAL_SEC = 3600     # 1時間ごと
+SNAPSHOT_KEEP_DAYS    = 30       # 古いスナップショットの保持期間
+
 # ── グローバルキャッシュ ──────────────────────────────
-_cache_lock   = threading.Lock()
-_cached_data  = None
-_last_update  = 0.0
-_ready_phase  = 0
+_cache_lock       = threading.Lock()
+_cached_data      = None
+_last_update      = 0.0
+_ready_phase      = 0
+_last_snapshot_ts = 0.0
 
 _amedas_cache  = {"data": None, "ts": 0.0}
 AMEDAS_CACHE_SEC = 300
@@ -427,6 +433,81 @@ def load_quakes(days=60):
                              "max_int":row[7] if len(row)>7 else ""})
             except Exception: continue
     return data
+
+
+# ══════════════════════════════════════════════════════
+# スナップショット（解析結果を1時間ごとにログして後で読み込めるようにする）
+# ══════════════════════════════════════════════════════
+def save_snapshot(cached_data):
+    """
+    現在の解析結果（ETAS格子・b値格子など）を1ファイル1スナップショットとして
+    data/snapshots/ に JSON 保存する。グリッドのキーは (gi,gj) タプルなので
+    JSON化のために "gi_gj" 文字列に変換して保存する。
+    """
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    now_utc = datetime.now(timezone.utc)
+    fname = now_utc.strftime("%Y%m%d_%H%M%S") + ".json"
+    path = os.path.join(SNAPSHOT_DIR, fname)
+    payload = {
+        "timestamp_utc": now_utc.isoformat(),
+        "updated":       cached_data.get("updated", ""),
+        "quake_count":   len(cached_data.get("all", [])),
+        "etas":          {f"{k[0]}_{k[1]}": v for k, v in cached_data.get("etas", {}).items()},
+        "bvalue":        {f"{k[0]}_{k[1]}": v for k, v in cached_data.get("bvalue", {}).items()},
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        print(f"[スナップショット] 保存: {fname} "
+              f"(地震:{payload['quake_count']}件 ETAS格子:{len(payload['etas'])} b値格子:{len(payload['bvalue'])})")
+    except Exception as e:
+        print(f"[スナップショット] 保存失敗: {e}")
+    _cleanup_old_snapshots()
+
+def _cleanup_old_snapshots(keep_days=SNAPSHOT_KEEP_DAYS):
+    """古いスナップショットファイルを削除してディスク肥大化を防ぐ。"""
+    if not os.path.isdir(SNAPSHOT_DIR):
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
+    for fname in os.listdir(SNAPSHOT_DIR):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            ts = datetime.strptime(fname[:15], "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)
+            if ts < cutoff:
+                os.remove(os.path.join(SNAPSHOT_DIR, fname))
+        except Exception:
+            continue
+
+def list_snapshots():
+    """保存済みスナップショットのファイル名を新しい順に返す。"""
+    if not os.path.isdir(SNAPSHOT_DIR):
+        return []
+    files = [f for f in os.listdir(SNAPSHOT_DIR) if f.endswith(".json")]
+    return sorted(files, reverse=True)
+
+def load_snapshot(fname):
+    """
+    指定したスナップショットファイルを読み込む。
+    grid("etas"/"bvalue")のキーは "gi_gj" 文字列から (gi,gj) タプルに復元する。
+    見つからない場合は None を返す。
+    """
+    path = os.path.join(SNAPSHOT_DIR, fname)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+
+    def _restore(grid):
+        out = {}
+        for k, v in grid.items():
+            gi, gj = k.split("_")
+            out[(int(gi), int(gj))] = v
+        return out
+
+    payload["etas"]   = _restore(payload.get("etas", {}))
+    payload["bvalue"] = _restore(payload.get("bvalue", {}))
+    return payload
 
 
 # ══════════════════════════════════════════════════════
@@ -1276,6 +1357,113 @@ MK.forEach(function(d){{
 # ══════════════════════════════════════════════════════
 # メインページ（タブシェル）
 # ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
+# TAB 7: スナップショット（1時間ごとの解析結果ログ）
+# ══════════════════════════════════════════════════════
+def render_snapshots(updated_str):
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{display:flex;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif;color:#f3f4f6}
+#list{width:260px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;overflow-y:auto}
+#hdr{padding:10px 14px;border-bottom:2px solid #1f2937;font-size:12px;color:#9ca3af;position:sticky;top:0;background:#111827}
+#hdr b{color:#f3f4f6;font-size:13px;display:block;margin-bottom:2px}
+.snap-item{padding:9px 14px;cursor:pointer;border-bottom:1px solid #1f2937;font-size:12px;color:#d1d5db}
+.snap-item:hover{background:#161b22}
+.snap-item.active{background:#162032;border-left:3px solid #3b82f6;color:#fff}
+.snap-time{font-weight:600;color:#60a5fa;font-size:12px}
+.snap-meta{font-size:10px;color:#6b7280;margin-top:2px}
+#detail{flex:1;overflow-y:auto;padding:18px 22px}
+#detail h2{font-size:15px;color:#f3f4f6;margin-bottom:4px}
+#detail .sub{font-size:11px;color:#6b7280;margin-bottom:16px}
+.stat-row{display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap}
+.stat{background:#1f2937;padding:8px 14px;border-radius:6px;font-size:12px;color:#d1d5db}
+.stat span{display:block;color:#60a5fa;font-weight:700;font-size:16px;margin-top:2px}
+table{width:100%;border-collapse:collapse;font-size:11px;margin-bottom:22px}
+th{text-align:left;padding:6px 8px;color:#6b7280;border-bottom:1px solid #374151;font-weight:600}
+td{padding:5px 8px;border-bottom:1px solid #1f2937;color:#d1d5db}
+tr:hover td{background:#161b22}
+.section-title{font-size:12px;color:#9ca3af;font-weight:700;margin:6px 0 8px;text-transform:uppercase;letter-spacing:0.5px}
+.empty{color:#4b5563;font-size:12px;padding:30px;text-align:center}
+#loading{padding:30px;text-align:center;color:#6b7280;font-size:12px}
+</style></head><body>
+<div id="list">
+  <div id="hdr"><b>スナップショット一覧</b>1時間ごとの解析結果ログ</div>
+  <div id="items"><div id="loading">読込中...</div></div>
+</div>
+<div id="detail"><div class="empty">左のリストからスナップショットを選択してください</div></div>
+<script>
+var GRID_SIZE = __GRID_SIZE__;
+var snapshots = [];
+
+function fmtTime(fname){
+  var m = fname.match(/(\\d{4})(\\d{2})(\\d{2})_(\\d{2})(\\d{2})(\\d{2})/);
+  if(!m) return fname;
+  return m[1]+'-'+m[2]+'-'+m[3]+' '+m[4]+':'+m[5]+':'+m[6]+' UTC';
+}
+
+fetch('/snapshots').then(function(r){return r.json()}).then(function(d){
+  snapshots = d.snapshots || [];
+  var wrap = document.getElementById('items');
+  if(snapshots.length===0){
+    wrap.innerHTML = '<div class="empty">まだスナップショットがありません<br>(起動後1時間ほどで作成されます)</div>';
+    return;
+  }
+  wrap.innerHTML = snapshots.map(function(f,i){
+    return '<div class="snap-item" data-i="'+i+'" onclick="selectSnap('+i+')">'+
+      '<div class="snap-time">'+fmtTime(f)+'</div>'+
+      '<div class="snap-meta">'+f+'</div></div>';
+  }).join('');
+  selectSnap(0);
+}).catch(function(e){
+  document.getElementById('items').innerHTML = '<div class="empty">読込失敗</div>';
+});
+
+function selectSnap(i){
+  document.querySelectorAll('.snap-item').forEach(function(el){el.classList.toggle('active', el.dataset.i==i)});
+  var fname = snapshots[i];
+  document.getElementById('detail').innerHTML = '<div id="loading">読込中...</div>';
+  fetch('/snapshots/'+fname).then(function(r){return r.json()}).then(function(d){
+    renderDetail(fname, d);
+  }).catch(function(e){
+    document.getElementById('detail').innerHTML = '<div class="empty">読込失敗</div>';
+  });
+}
+
+function renderDetail(fname, d){
+  var etasEntries = Object.entries(d.etas||{}).map(function(kv){
+    var parts = kv[0].split('_');
+    return {lat:(parseInt(parts[0])*GRID_SIZE).toFixed(2), lon:(parseInt(parts[1])*GRID_SIZE).toFixed(2), score:kv[1]};
+  }).sort(function(a,b){return b.score-a.score}).slice(0,15);
+
+  var bvEntries = Object.entries(d.bvalue||{}).map(function(kv){
+    var parts = kv[0].split('_');
+    return {lat:(parseInt(parts[0])*1.0).toFixed(1), lon:(parseInt(parts[1])*1.0).toFixed(1),
+             b:kv[1].b, n:kv[1].n, mean_m:kv[1].mean_m};
+  }).sort(function(a,b){return b.n-a.n}).slice(0,15);
+
+  var html = '<h2>'+fmtTime(fname)+'</h2>'+
+    '<div class="sub">'+fname+' ／ 保存時点の更新表示: '+(d.updated||'-')+'</div>'+
+    '<div class="stat-row">'+
+      '<div class="stat">地震件数<span>'+d.quake_count+'</span></div>'+
+      '<div class="stat">ETAS格子数<span>'+Object.keys(d.etas||{}).length+'</span></div>'+
+      '<div class="stat">b値格子数<span>'+Object.keys(d.bvalue||{}).length+'</span></div>'+
+    '</div>'+
+    '<div class="section-title">ETASスコア上位グリッド (上位15件)</div>'+
+    (etasEntries.length? ('<table><tr><th>緯度</th><th>経度</th><th>ETASスコア</th></tr>'+
+      etasEntries.map(function(e){return '<tr><td>'+e.lat+'</td><td>'+e.lon+'</td><td>'+e.score.toFixed(4)+'</td></tr>'}).join('')
+      +'</table>') : '<div class="empty">データなし</div>')+
+    '<div class="section-title">b値グリッド 地震数上位15件</div>'+
+    (bvEntries.length? ('<table><tr><th>緯度</th><th>経度</th><th>b値</th><th>地震数</th><th>平均M</th></tr>'+
+      bvEntries.map(function(e){return '<tr><td>'+e.lat+'</td><td>'+e.lon+'</td><td>'+e.b+'</td><td>'+e.n+'</td><td>'+e.mean_m+'</td></tr>'}).join('')
+      +'</table>') : '<div class="empty">データなし</div>');
+
+  document.getElementById('detail').innerHTML = html;
+}
+</script></body></html>"""
+    return html.replace("__GRID_SIZE__", str(GRID_SIZE))
+
+
 SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
@@ -1360,6 +1548,13 @@ SHELL_HTML = """<!DOCTYPE html>
       <span class="badge">AMeDAS</span>
     </button>
 
+    <div class="sep"></div>
+    <div class="group-title">ログ</div>
+    <button class="tab-btn" onclick="sw(6)">
+      <span class="icon">🗂</span><span class="label">スナップショット</span>
+      <span class="badge">1h</span>
+    </button>
+
     <div class="version">ETAS残差研究プロジェクト</div>
   </div>
   <div id="main">
@@ -1369,10 +1564,11 @@ SHELL_HTML = """<!DOCTYPE html>
     <iframe id="f3" src=""></iframe>
     <iframe id="f4" src=""></iframe>
     <iframe id="f5" src=""></iframe>
+    <iframe id="f6" src=""></iframe>
   </div>
   <script>
-    var URLS=['history','etas','bvalue','tec','gnss','pressure'];
-    var loaded=[true,false,false,false,false,false];
+    var URLS=['history','etas','bvalue','tec','gnss','pressure','snapshots'];
+    var loaded=[true,false,false,false,false,false,false];
     function sw(idx){
       document.querySelectorAll('.tab-btn').forEach(function(b,i){b.classList.toggle('active',i===idx)});
       document.querySelectorAll('iframe').forEach(function(f,i){f.classList.toggle('active',i===idx)});
@@ -1399,7 +1595,7 @@ height:100vh;font-family:sans-serif;flex-direction:column;gap:16px}
 # バックグラウンド更新
 # ══════════════════════════════════════════════════════
 def _update_data():
-    global _cached_data, _last_update, _ready_phase
+    global _cached_data, _last_update, _ready_phase, _last_snapshot_ts
     first_run = True  # ★ Bug fix: whileループの外に移動（ループ内にあると毎回Trueにリセットされていた）
     while True:
         try:
@@ -1427,6 +1623,12 @@ def _update_data():
                 _last_update = time.time(); _ready_phase = 2
             print(f"[BG] 完了 地震:{len(quakes)}件 ETAS格子:{len(grid_scores)} b値格子:{len(bvalue_grid)}")
             first_run = False
+
+            # ★ 1時間ごとに解析結果のスナップショットをログ保存する
+            now_ts = time.time()
+            if now_ts - _last_snapshot_ts >= SNAPSHOT_INTERVAL_SEC:
+                save_snapshot(_cached_data)
+                _last_snapshot_ts = now_ts
 
         except Exception as e:
             import traceback; print(f"[BG] エラー: {e}"); traceback.print_exc()
@@ -1464,6 +1666,7 @@ def tab(name):
     elif name == "tec":      html = render_tec(upd)
     elif name == "gnss":     html = render_gnss(upd)
     elif name == "pressure": html = render_pressure(upd)
+    elif name == "snapshots": html = render_snapshots(upd)
     else: return Response("Not found", status=404)
     return Response(html, mimetype="text/html")
 
@@ -1472,6 +1675,23 @@ def status():
     with _cache_lock:
         return {"phase":_ready_phase,"last_update":_last_update,
                 "quakes":len(_cached_data["all"]) if _cached_data else 0}
+
+@app.route("/snapshots")
+def snapshots():
+    """保存済みスナップショットのファイル名一覧（新しい順）をJSONで返す。"""
+    return {"snapshots": list_snapshots()}
+
+@app.route("/snapshots/<fname>")
+def snapshot_detail(fname):
+    """指定したスナップショットの内容をJSONで返す（gi_gj文字列キーのまま）。"""
+    data = load_snapshot(fname)
+    if data is None:
+        return Response("Not found", status=404)
+    # タプルキーはJSON化できないため "gi_gj" 文字列のまま返す
+    out = dict(data)
+    out["etas"]   = {f"{k[0]}_{k[1]}": v for k, v in data["etas"].items()}
+    out["bvalue"] = {f"{k[0]}_{k[1]}": v for k, v in data["bvalue"].items()}
+    return out
 
 if __name__ == "__main__":
     threading.Thread(target=_update_data, daemon=True).start()
