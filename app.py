@@ -1362,10 +1362,11 @@ MK.forEach(function(d){{
 # ══════════════════════════════════════════════════════
 def render_snapshots(updated_str):
     html = """<!DOCTYPE html><html><head><meta charset="utf-8">
+__LEAFLET_CDN__
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{display:flex;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif;color:#f3f4f6}
-#list{width:260px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;overflow-y:auto}
+#list{width:250px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;overflow-y:auto}
 #hdr{padding:10px 14px;border-bottom:2px solid #1f2937;font-size:12px;color:#9ca3af;position:sticky;top:0;background:#111827}
 #hdr b{color:#f3f4f6;font-size:13px;display:block;margin-bottom:2px}
 .snap-item{padding:9px 14px;cursor:pointer;border-bottom:1px solid #1f2937;font-size:12px;color:#d1d5db}
@@ -1373,12 +1374,20 @@ body{display:flex;height:100vh;background:#0f172a;overflow:hidden;font-family:"H
 .snap-item.active{background:#162032;border-left:3px solid #3b82f6;color:#fff}
 .snap-time{font-weight:600;color:#60a5fa;font-size:12px}
 .snap-meta{font-size:10px;color:#6b7280;margin-top:2px}
-#detail{flex:1;overflow-y:auto;padding:18px 22px}
-#detail h2{font-size:15px;color:#f3f4f6;margin-bottom:4px}
-#detail .sub{font-size:11px;color:#6b7280;margin-bottom:16px}
-.stat-row{display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap}
-.stat{background:#1f2937;padding:8px 14px;border-radius:6px;font-size:12px;color:#d1d5db}
-.stat span{display:block;color:#60a5fa;font-weight:700;font-size:16px;margin-top:2px}
+#detail{flex:1;overflow-y:auto;display:flex;flex-direction:column}
+#detailTop{padding:14px 18px 10px;flex-shrink:0}
+#detailTop h2{font-size:15px;color:#f3f4f6;margin-bottom:4px}
+#detailTop .sub{font-size:11px;color:#6b7280;margin-bottom:12px}
+.stat-row{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.stat{background:#1f2937;padding:7px 12px;border-radius:6px;font-size:11px;color:#d1d5db}
+.stat span{display:block;color:#60a5fa;font-weight:700;font-size:15px;margin-top:2px}
+.tog{padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;border:none;border-radius:5px;background:#1f2937;color:#9ca3af;margin-right:6px}
+.tog.on{background:#2563eb;color:#fff}
+#mapWrap{position:relative;height:440px;flex-shrink:0;border-top:1px solid #1f2937;border-bottom:1px solid #1f2937}
+#map{width:100%;height:100%}
+#lg{position:absolute;bottom:14px;left:14px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:10px 12px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.9;color:#f3f4f6}
+#tablesWrap{padding:16px 18px 26px}
 table{width:100%;border-collapse:collapse;font-size:11px;margin-bottom:22px}
 th{text-align:left;padding:6px 8px;color:#6b7280;border-bottom:1px solid #374151;font-weight:600}
 td{padding:5px 8px;border-bottom:1px solid #1f2937;color:#d1d5db}
@@ -1391,15 +1400,60 @@ tr:hover td{background:#161b22}
   <div id="hdr"><b>スナップショット一覧</b>1時間ごとの解析結果ログ</div>
   <div id="items"><div id="loading">読込中...</div></div>
 </div>
-<div id="detail"><div class="empty">左のリストからスナップショットを選択してください</div></div>
+<div id="detail"><div class="empty" style="margin:auto">左のリストからスナップショットを選択してください</div></div>
 <script>
 var GRID_SIZE = __GRID_SIZE__;
+var ETAS_COLOR = {5:'#1a0033',4:'#8000ff',3:'#ff0000',2:'#ff8800',1:'#66ccff'};
 var snapshots = [];
+var curMap = null;
+var curGroups = {};
 
 function fmtTime(fname){
   var m = fname.match(/(\\d{4})(\\d{2})(\\d{2})_(\\d{2})(\\d{2})(\\d{2})/);
   if(!m) return fname;
   return m[1]+'-'+m[2]+'-'+m[3]+' '+m[4]+':'+m[5]+':'+m[6]+' UTC';
+}
+
+function bColor(b){
+  var ratio = Math.max(0, Math.min(1, (b-0.5)/1.5));
+  var r = Math.round(220*(1-ratio)), g = Math.round(60+100*ratio), bl = Math.round(220*ratio);
+  function h(v){var s=v.toString(16); return s.length<2?'0'+s:s}
+  return '#'+h(r)+h(g)+h(bl);
+}
+
+function percentileThresholds(sortedAsc, p){
+  if(sortedAsc.length===0) return 0;
+  var idx = Math.min(sortedAsc.length-1, Math.max(0, Math.round(p/100*(sortedAsc.length-1))));
+  return sortedAsc[idx];
+}
+
+function buildEtasCells(etasObj){
+  var entries = Object.entries(etasObj);
+  if(entries.length===0) return [];
+  var logVals = entries.map(function(kv){return Math.log(kv[1]+1)}).sort(function(a,b){return a-b});
+  var th5=percentileThresholds(logVals,99.8), th4=percentileThresholds(logVals,98.5),
+      th3=percentileThresholds(logVals,95.0), th2=percentileThresholds(logVals,85.0),
+      th1=percentileThresholds(logVals,50.0);
+  var cells = [];
+  entries.forEach(function(kv){
+    var parts = kv[0].split('_');
+    var score = kv[1];
+    var s = Math.log(score+1);
+    var lv;
+    if(s>=th5) lv=5; else if(s>=th4) lv=4; else if(s>=th3) lv=3;
+    else if(s>=th2) lv=2; else if(s>=th1) lv=1; else return;
+    cells.push({lat:parseInt(parts[0])*GRID_SIZE, lon:parseInt(parts[1])*GRID_SIZE,
+                color:ETAS_COLOR[lv], lv:lv, score:score});
+  });
+  return cells;
+}
+
+function buildBvalueCells(bvObj){
+  return Object.entries(bvObj).map(function(kv){
+    var parts = kv[0].split('_'); var info = kv[1];
+    return {lat:parseInt(parts[0])*1.0, lon:parseInt(parts[1])*1.0,
+            color:bColor(info.b), b:info.b, n:info.n, mean_m:info.mean_m};
+  });
 }
 
 fetch('/snapshots').then(function(r){return r.json()}).then(function(d){
@@ -1431,6 +1485,9 @@ function selectSnap(i){
 }
 
 function renderDetail(fname, d){
+  var etasCount = Object.keys(d.etas||{}).length;
+  var bvCount = Object.keys(d.bvalue||{}).length;
+
   var etasEntries = Object.entries(d.etas||{}).map(function(kv){
     var parts = kv[0].split('_');
     return {lat:(parseInt(parts[0])*GRID_SIZE).toFixed(2), lon:(parseInt(parts[1])*GRID_SIZE).toFixed(2), score:kv[1]};
@@ -1442,27 +1499,82 @@ function renderDetail(fname, d){
              b:kv[1].b, n:kv[1].n, mean_m:kv[1].mean_m};
   }).sort(function(a,b){return b.n-a.n}).slice(0,15);
 
-  var html = '<h2>'+fmtTime(fname)+'</h2>'+
-    '<div class="sub">'+fname+' ／ 保存時点の更新表示: '+(d.updated||'-')+'</div>'+
-    '<div class="stat-row">'+
-      '<div class="stat">地震件数<span>'+d.quake_count+'</span></div>'+
-      '<div class="stat">ETAS格子数<span>'+Object.keys(d.etas||{}).length+'</span></div>'+
-      '<div class="stat">b値格子数<span>'+Object.keys(d.bvalue||{}).length+'</span></div>'+
+  var html =
+    '<div id="detailTop">'+
+      '<h2>'+fmtTime(fname)+'</h2>'+
+      '<div class="sub">'+fname+' ／ 保存時点の更新表示: '+(d.updated||'-')+'</div>'+
+      '<div class="stat-row">'+
+        '<div class="stat">地震件数<span>'+d.quake_count+'</span></div>'+
+        '<div class="stat">ETAS格子数<span>'+etasCount+'</span></div>'+
+        '<div class="stat">b値格子数<span>'+bvCount+'</span></div>'+
+      '</div>'+
+      '<div>'+
+        '<button class="tog on" id="togEtas" onclick="toggleLayer(\\'etas\\',this)">ETASグリッド</button>'+
+        '<button class="tog on" id="togBv" onclick="toggleLayer(\\'bvalue\\',this)">b値グリッド</button>'+
+      '</div>'+
     '</div>'+
-    '<div class="section-title">ETASスコア上位グリッド (上位15件)</div>'+
-    (etasEntries.length? ('<table><tr><th>緯度</th><th>経度</th><th>ETASスコア</th></tr>'+
-      etasEntries.map(function(e){return '<tr><td>'+e.lat+'</td><td>'+e.lon+'</td><td>'+e.score.toFixed(4)+'</td></tr>'}).join('')
-      +'</table>') : '<div class="empty">データなし</div>')+
-    '<div class="section-title">b値グリッド 地震数上位15件</div>'+
-    (bvEntries.length? ('<table><tr><th>緯度</th><th>経度</th><th>b値</th><th>地震数</th><th>平均M</th></tr>'+
-      bvEntries.map(function(e){return '<tr><td>'+e.lat+'</td><td>'+e.lon+'</td><td>'+e.b+'</td><td>'+e.n+'</td><td>'+e.mean_m+'</td></tr>'}).join('')
-      +'</table>') : '<div class="empty">データなし</div>');
+    '<div id="mapWrap"><div id="map"></div>'+
+      '<div id="lg">'+
+        '<b>ETAS</b><br>'+
+        '<span style="color:#1a0033">■</span> Lv5&nbsp; <span style="color:#8000ff">■</span> Lv4&nbsp; '+
+        '<span style="color:#ff0000">■</span> Lv3&nbsp; <span style="color:#ff8800">■</span> Lv2&nbsp; '+
+        '<span style="color:#66ccff">■</span> Lv1<br>'+
+        '<hr style="border-color:#374151;margin:5px 0">'+
+        '<b>b値</b><br>'+
+        '<div style="width:110px;height:8px;border-radius:3px;background:linear-gradient(to right,#dc3c3c,#60a0dc);margin:4px 0 2px"></div>'+
+        '<div style="display:flex;justify-content:space-between;width:110px;font-size:9px;color:#9ca3af">'+
+          '<span>低(0.5)</span><span>高(2.0)</span></div>'+
+      '</div>'+
+    '</div>'+
+    '<div id="tablesWrap">'+
+      '<div class="section-title">ETASスコア上位グリッド (上位15件)</div>'+
+      (etasEntries.length? ('<table><tr><th>緯度</th><th>経度</th><th>ETASスコア</th></tr>'+
+        etasEntries.map(function(e){return '<tr><td>'+e.lat+'</td><td>'+e.lon+'</td><td>'+e.score.toFixed(4)+'</td></tr>'}).join('')
+        +'</table>') : '<div class="empty">データなし</div>')+
+      '<div class="section-title">b値グリッド 地震数上位15件</div>'+
+      (bvEntries.length? ('<table><tr><th>緯度</th><th>経度</th><th>b値</th><th>地震数</th><th>平均M</th></tr>'+
+        bvEntries.map(function(e){return '<tr><td>'+e.lat+'</td><td>'+e.lon+'</td><td>'+e.b+'</td><td>'+e.n+'</td><td>'+e.mean_m+'</td></tr>'}).join('')
+        +'</table>') : '<div class="empty">データなし</div>')+
+    '</div>';
 
   document.getElementById('detail').innerHTML = html;
+
+  if(curMap){ curMap.remove(); curMap = null; }
+  curMap = L.map('map',{center:[36,138],zoom:4,preferCanvas:true});
+  __DARK_TILE__
+  __GEOJSON_JS__
+
+  var etasGroup = L.layerGroup().addTo(curMap);
+  buildEtasCells(d.etas||{}).forEach(function(c){
+    L.rectangle([[c.lat,c.lon],[c.lat+GRID_SIZE,c.lon+GRID_SIZE]],
+      {color:null,weight:0,fill:true,fillColor:c.color,fillOpacity:0.65})
+     .bindTooltip('Level '+c.lv+' / score='+c.score.toFixed(4)).addTo(etasGroup);
+  });
+
+  var bvGroup = L.layerGroup().addTo(curMap);
+  buildBvalueCells(d.bvalue||{}).forEach(function(c){
+    L.rectangle([[c.lat,c.lon],[c.lat+1.0,c.lon+1.0]],
+      {color:null,weight:0,fill:true,fillColor:c.color,fillOpacity:0.6})
+     .bindTooltip('b='+c.b+' / N='+c.n+' / M̄='+c.mean_m).addTo(bvGroup);
+  });
+
+  curGroups = {etas:etasGroup, bvalue:bvGroup};
+  document.getElementById('togEtas').onclick = function(){toggleLayer('etas', this)};
+  document.getElementById('togBv').onclick = function(){toggleLayer('bvalue', this)};
+}
+
+function toggleLayer(key, btn){
+  btn.classList.toggle('on');
+  var g = curGroups[key];
+  if(!g || !curMap) return;
+  if(curMap.hasLayer(g)) curMap.removeLayer(g); else g.addTo(curMap);
 }
 </script></body></html>"""
-    return html.replace("__GRID_SIZE__", str(GRID_SIZE))
-
+    html = html.replace("__GRID_SIZE__", str(GRID_SIZE))
+    html = html.replace("__LEAFLET_CDN__", LEAFLET_CDN)
+    html = html.replace("__DARK_TILE__", DARK_TILE)
+    html = html.replace("__GEOJSON_JS__", GEOJSON_JS)
+    return html
 
 SHELL_HTML = """<!DOCTYPE html>
 <html>
