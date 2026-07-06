@@ -25,15 +25,15 @@ FETCH_INTERVAL_SEC = 600
 
 # ── スナップショット（解析結果の時系列ログ）────────────
 SNAPSHOT_DIR          = "data/snapshots"
-SNAPSHOT_INTERVAL_SEC = 3600     # 1時間ごと
 SNAPSHOT_KEEP_DAYS    = 30       # 古いスナップショットの保持期間
+JST                   = timezone(timedelta(hours=9))
 
 # ── グローバルキャッシュ ──────────────────────────────
-_cache_lock       = threading.Lock()
-_cached_data      = None
-_last_update      = 0.0
-_ready_phase      = 0
-_last_snapshot_ts = 0.0
+_cache_lock        = threading.Lock()
+_cached_data       = None
+_last_update       = 0.0
+_ready_phase       = 0
+_last_snapshot_key = None   # 直前に保存を試みたJST時間帯キー("YYYYMMDD_HH")
 
 _amedas_cache  = {"data": None, "ts": 0.0}
 AMEDAS_CACHE_SEC = 300
@@ -438,18 +438,34 @@ def load_quakes(days=60):
 # ══════════════════════════════════════════════════════
 # スナップショット（解析結果を1時間ごとにログして後で読み込めるようにする）
 # ══════════════════════════════════════════════════════
-def save_snapshot(cached_data):
+def _snapshot_key(now_jst=None):
+    """現在時刻が属するJST時間帯のキー("YYYYMMDD_HH")を返す。"""
+    now_jst = now_jst or datetime.now(JST)
+    return now_jst.strftime("%Y%m%d_%H")
+
+def _snapshot_path(key):
+    return os.path.join(SNAPSHOT_DIR, key + ".json")
+
+def snapshot_exists(key):
+    """指定したJST時間帯のスナップショットが既にディスクに存在するか。
+    （メモリ上のカウンタに頼らず、プロセス再起動をまたいでも重複保存を防ぐため）"""
+    return os.path.exists(_snapshot_path(key))
+
+def save_snapshot(cached_data, key=None):
     """
     現在の解析結果（ETAS格子・b値格子など）を1ファイル1スナップショットとして
     data/snapshots/ に JSON 保存する。グリッドのキーは (gi,gj) タプルなので
     JSON化のために "gi_gj" 文字列に変換して保存する。
+    ファイル名はJSTの時間帯キー("YYYYMMDD_HH")とし、同じ時間帯は1回しか保存しない
+    （ディスク上の存在チェックによる冪等性 = Renderのスリープ/再起動をまたいでも安全）。
     """
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-    now_utc = datetime.now(timezone.utc)
-    fname = now_utc.strftime("%Y%m%d_%H%M%S") + ".json"
-    path = os.path.join(SNAPSHOT_DIR, fname)
+    now_jst = datetime.now(JST)
+    key = key or _snapshot_key(now_jst)
+    path = _snapshot_path(key)
     payload = {
-        "timestamp_utc": now_utc.isoformat(),
+        "timestamp_jst": now_jst.isoformat(),
+        "hour_key":      key,
         "updated":       cached_data.get("updated", ""),
         "quake_count":   len(cached_data.get("all", [])),
         "etas":          {f"{k[0]}_{k[1]}": v for k, v in cached_data.get("etas", {}).items()},
@@ -458,26 +474,36 @@ def save_snapshot(cached_data):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
-        print(f"[スナップショット] 保存: {fname} "
+        print(f"[スナップショット] 保存: {key}.json "
               f"(地震:{payload['quake_count']}件 ETAS格子:{len(payload['etas'])} b値格子:{len(payload['bvalue'])})")
     except Exception as e:
         print(f"[スナップショット] 保存失敗: {e}")
     _cleanup_old_snapshots()
 
 def _cleanup_old_snapshots(keep_days=SNAPSHOT_KEEP_DAYS):
-    """古いスナップショットファイルを削除してディスク肥大化を防ぐ。"""
+    """古いスナップショットファイルを削除してディスク肥大化を防ぐ。
+    新形式("YYYYMMDD_HH.json")・旧形式("YYYYMMDD_HHMMSS.json")の両方に対応。"""
     if not os.path.isdir(SNAPSHOT_DIR):
         return
     cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
     for fname in os.listdir(SNAPSHOT_DIR):
         if not fname.endswith(".json"):
             continue
-        try:
-            ts = datetime.strptime(fname[:15], "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)
-            if ts < cutoff:
-                os.remove(os.path.join(SNAPSHOT_DIR, fname))
-        except Exception:
+        stem = fname[:-5]
+        ts = None
+        for fmt in ("%Y%m%d_%H%M%S", "%Y%m%d_%H"):
+            try:
+                ts = datetime.strptime(stem, fmt).replace(tzinfo=timezone.utc)
+                break
+            except ValueError:
+                continue
+        if ts is None:
             continue
+        if ts < cutoff:
+            try:
+                os.remove(os.path.join(SNAPSHOT_DIR, fname))
+            except Exception:
+                continue
 
 def list_snapshots():
     """保存済みスナップショットのファイル名を新しい順に返す。"""
@@ -1712,7 +1738,7 @@ height:100vh;font-family:sans-serif;flex-direction:column;gap:16px}
 # バックグラウンド更新
 # ══════════════════════════════════════════════════════
 def _update_data():
-    global _cached_data, _last_update, _ready_phase, _last_snapshot_ts
+    global _cached_data, _last_update, _ready_phase, _last_snapshot_key
     first_run = True  # ★ Bug fix: whileループの外に移動（ループ内にあると毎回Trueにリセットされていた）
     while True:
         try:
@@ -1741,11 +1767,15 @@ def _update_data():
             print(f"[BG] 完了 地震:{len(quakes)}件 ETAS格子:{len(grid_scores)} b値格子:{len(bvalue_grid)}")
             first_run = False
 
-            # ★ 1時間ごとに解析結果のスナップショットをログ保存する
-            now_ts = time.time()
-            if now_ts - _last_snapshot_ts >= SNAPSHOT_INTERVAL_SEC:
-                save_snapshot(_cached_data)
-                _last_snapshot_ts = now_ts
+            # ★ JST時間帯(HH:00〜)ごとに解析結果のスナップショットをログ保存する。
+            # メモリ上のカウンタではなく「その時間帯のファイルが既に存在するか」で
+            # 判定するため、Renderのスリープ/プロセス再起動をまたいでも
+            # 二重保存や取りこぼしにならない。
+            current_key = _snapshot_key()
+            if current_key != _last_snapshot_key:
+                if not snapshot_exists(current_key):
+                    save_snapshot(_cached_data, key=current_key)
+                _last_snapshot_key = current_key
 
         except Exception as e:
             import traceback; print(f"[BG] エラー: {e}"); traceback.print_exc()
