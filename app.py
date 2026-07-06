@@ -58,7 +58,7 @@ DARK_TILE = "L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}
 GEOJSON_JS = """
     fetch('https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson')
       .then(r=>r.json())
-      .then(d=>L.geoJSON(d,{style:{fillOpacity:0,color:'#555',weight:1}}).addTo(map));"""
+      .then(d=>L.geoJSON(d,{interactive:false,style:{fillOpacity:0,color:'#555',weight:1}}).addTo(map));"""
 
 
 # ══════════════════════════════════════════════════════
