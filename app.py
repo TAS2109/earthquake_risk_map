@@ -826,7 +826,7 @@ thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bo
 #lpClose{{flex-shrink:0;width:22px;height:22px;border:none;border-radius:5px;background:#374151;color:#d1d5db;
     cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center}}
 #lpClose:hover{{background:#4b5563;color:#fff}}
-#lpReopen{{position:absolute;top:70px;left:0;z-index:200;width:34px;height:78px;border:none;
+#lpReopen{{position:absolute;top:70px;left:0;z-index:5000;width:34px;height:78px;border:none;
     border-radius:0 8px 8px 0;background:#1f2937;color:#9ca3af;cursor:pointer;font-size:12px;
     display:none;flex-direction:column;align-items:center;justify-content:center;gap:6px;
     box-shadow:2px 0 8px rgba(0,0,0,.4)}}
@@ -1484,10 +1484,10 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
 #hdr b{{color:#f3f4f6;font-size:14px}}
 .tog{{padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;border:none;border-radius:5px;background:#1f2937;color:#9ca3af}}
 .tog.on{{background:#2563eb;color:#fff}}
-#map{{flex:1}}
+#mp{{flex:1;overflow:hidden;position:relative}}
+#map{{width:100%;height:100%}}
 #lg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
     padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.9;color:#f3f4f6;max-width:260px}}
-#mp{{flex:1;position:relative}}
 #loadState{{position:absolute;top:14px;right:56px;z-index:1000;background:rgba(17,24,39,.92);
     padding:6px 12px;border-radius:6px;font-size:11px;color:#9ca3af}}
 </style></head><body>
