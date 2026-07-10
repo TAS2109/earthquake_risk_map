@@ -6,13 +6,15 @@
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
   2. ETASマップ   - 地震発生確率 + ETAS残差（研究用）
   3. b値マップ    - グリッドごとのGutenberg-Richter b値
-  4. TEC          - 電離圏全電子数 (NICT SCIDAS リンク)
-  5. GNSS         - 地殻変動 (GEONET リンク + 変位プレースホルダー)
-  6. 海面気圧     - アメダス海面気圧マップ
+  4. 活断層・プレート境界 - 都市圏活断層図(GSI) + プレート境界(PB2002)
+  5. TEC          - 電離圏全電子数 (NICT SCIDAS リンク)
+  6. GNSS         - 地殻変動 (GEONET リンク + 変位プレースホルダー)
+  7. 海面気圧     - アメダス海面気圧マップ
+  8. スナップショット - 1時間ごとの解析結果ログ
 """
 
-from flask import Flask, Response
-import requests, csv, os, math, re, json, threading, time
+from flask import Flask, Response, send_file
+import requests, csv, os, math, re, json, threading, time, zipfile, io
 from datetime import datetime, timezone, timedelta
 import numpy as np
 
@@ -559,6 +561,23 @@ def load_snapshot(fname):
     payload["bvalue"] = _restore(payload.get("bvalue", {}))
     return payload
 
+def build_snapshots_zip():
+    """
+    data/snapshots/ 配下の全スナップショットJSONファイルをまとめて
+    メモリ上でZIP化し、BytesIOバッファを返す。1件もない場合は None。
+    """
+    if not os.path.isdir(SNAPSHOT_DIR):
+        return None
+    files = sorted(f for f in os.listdir(SNAPSHOT_DIR) if f.endswith(".json"))
+    if not files:
+        return None
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname in files:
+            zf.write(os.path.join(SNAPSHOT_DIR, fname), arcname=fname)
+    buf.seek(0)
+    return buf
+
 
 # ══════════════════════════════════════════════════════
 # ETAS 解析
@@ -807,17 +826,23 @@ thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bo
 #lpClose{{flex-shrink:0;width:22px;height:22px;border:none;border-radius:5px;background:#374151;color:#d1d5db;
     cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center}}
 #lpClose:hover{{background:#4b5563;color:#fff}}
-#lpReopen{{position:absolute;top:14px;left:0;z-index:200;width:26px;height:34px;border:none;
-    border-radius:0 6px 6px 0;background:#1f2937;color:#9ca3af;cursor:pointer;font-size:13px;display:none}}
-#lpReopen:hover{{background:#374151;color:#fff}}
-#lpReopen.show{{display:block}}
+#lpReopen{{position:absolute;top:70px;left:0;z-index:200;width:34px;height:78px;border:none;
+    border-radius:0 8px 8px 0;background:#1f2937;color:#9ca3af;cursor:pointer;font-size:12px;
+    display:none;flex-direction:column;align-items:center;justify-content:center;gap:6px;
+    box-shadow:2px 0 8px rgba(0,0,0,.4)}}
+#lpReopen:hover{{background:#2563eb;color:#fff}}
+#lpReopen.show{{display:flex}}
+#lpReopen .arrow{{font-size:15px;line-height:1}}
+#lpReopen .vlabel{{writing-mode:vertical-rl;letter-spacing:1px;font-size:10px;font-weight:600}}
 </style></head><body>
-<button id="lpReopen" onclick="toggleHistoryPanel()">▶</button>
+<button id="lpReopen" onclick="toggleHistoryPanel()" title="地震一覧を開く">
+  <span class="arrow">▶</span><span class="vlabel">地震一覧</span>
+</button>
 <div id="lp">
   <div id="lh">
     <div id="lhTop">
       <h2>統合地震履歴（直近31日: {total}件 / 有感:{felt_n}件）</h2>
-      <button id="lpClose" onclick="toggleHistoryPanel()" title="パネルを閉じる">✕</button>
+      <button id="lpClose" onclick="toggleHistoryPanel()" title="地震一覧を閉じる">✕</button>
     </div>
     <p>更新: {updated_str}</p>
   </div>
@@ -826,6 +851,7 @@ thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bo
     <button class="fb" onclick="filter('felt',this)">有感のみ</button>
     <button class="fb" onclick="filter('unfelt',this)">無感のみ</button>
     <button class="fb" onclick="filter('jma',this)">JMA</button>
+    <button class="fb" onclick="filter('p2p',this)">P2P(無感含む)</button>
     <button class="fb" onclick="filter('usgs',this)">USGS</button>
   </div>
   <div id="ls"><table>
@@ -844,7 +870,8 @@ thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bo
   </div>
 </div>
 <script>
-var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
+var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true,zoomControl:false}});
+L.control.zoom({{position:'topright'}}).addTo(map);
 {DARK_TILE}
 {GEOJSON_JS}
 var MK={markers_js};
@@ -862,7 +889,7 @@ function focusQ(idx,lat,lon){{
 }}
 
 var allRows=Array.from(document.querySelectorAll('.qrow'));
-var MODE_MAP={{'all':function(r){{return true}},'felt':function(r){{return r.querySelector('.c4 span').style.background!='rgb(71, 85, 105)'}},'unfelt':function(r){{return r.querySelector('.c4 span').style.background==='rgb(71, 85, 105)'}},'jma':function(r){{return r.querySelector('.c2:last-child span').textContent==='JMA'}},'usgs':function(r){{return r.querySelector('.c2:last-child span').textContent==='USGS'}}}};
+var MODE_MAP={{'all':function(r){{return true}},'felt':function(r){{return r.querySelector('.c4 span').style.background!='rgb(71, 85, 105)'}},'unfelt':function(r){{return r.querySelector('.c4 span').style.background==='rgb(71, 85, 105)'}},'jma':function(r){{return r.querySelector('.c2:last-child span').textContent==='JMA'}},'p2p':function(r){{return r.querySelector('.c2:last-child span').textContent==='P2P'}},'usgs':function(r){{return r.querySelector('.c2:last-child span').textContent==='USGS'}}}};
 
 function filter(mode,btn){{
   document.querySelectorAll('.fb').forEach(function(b){{b.classList.remove('on')}});
@@ -1441,6 +1468,96 @@ MK.forEach(function(d){{
 
 
 # ══════════════════════════════════════════════════════
+# TAB: 活断層・プレート境界マップ
+# ══════════════════════════════════════════════════════
+PLATE_BOUNDARY_URL = "https://raw.githubusercontent.com/fraxen/tectonicplates/master/GeoJSON/PB2002_boundaries.json"
+GSI_ACTIVE_FAULT_TILE = "https://cyberjapandata.gsi.go.jp/xyz/afm/{z}/{x}/{y}.png"
+
+def render_faultmap(updated_str):
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+{LEAFLET_CDN}
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
+#hdr{{padding:8px 16px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;
+       display:flex;align-items:center;gap:10px;font-size:12px;color:#9ca3af;flex-wrap:wrap}}
+#hdr b{{color:#f3f4f6;font-size:14px}}
+.tog{{padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;border:none;border-radius:5px;background:#1f2937;color:#9ca3af}}
+.tog.on{{background:#2563eb;color:#fff}}
+#map{{flex:1}}
+#lg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.9;color:#f3f4f6;max-width:260px}}
+#mp{{flex:1;position:relative}}
+#loadState{{position:absolute;top:14px;right:56px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:6px 12px;border-radius:6px;font-size:11px;color:#9ca3af}}
+</style></head><body>
+<div id="hdr">
+  <b>活断層・プレート境界マップ</b>
+  <button class="tog on" id="togFault" onclick="toggleFault(this)">活断層(都市圏活断層図)</button>
+  <button class="tog on" id="togPlate" onclick="togglePlate(this)">プレート境界</button>
+  <div style="margin-left:auto;color:#6b7280">更新: {updated_str}</div>
+</div>
+<div id="mp">
+  <div id="map"></div>
+  <div id="loadState">プレート境界データ読込中...</div>
+  <div id="lg">
+    <b>凡例</b><br>
+    <span style="color:#ff8800">■</span> 都市圏活断層図（国土地理院タイル）<br>
+    <span style="color:#ff3b3b">━</span> 収束型境界(SUB/CRB)<br>
+    <span style="color:#3b82f6">━</span> 発散型境界(OSR)<br>
+    <span style="color:#facc15">━</span> トランスフォーム/その他<br>
+    <hr style="border-color:#374151;margin:5px 0">
+    <small>出典: 国土地理院 都市圏活断層図タイル<br>
+    プレート境界: Bird (2003) / fraxen/tectonicplates (Peter Bird, PB2002)</small>
+  </div>
+</div>
+<script>
+var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true,zoomControl:false}});
+L.control.zoom({{position:'topright'}}).addTo(map);
+{DARK_TILE}
+{GEOJSON_JS}
+
+var faultLayer = L.tileLayer('{GSI_ACTIVE_FAULT_TILE}',
+  {{attribution:'&copy;国土地理院', maxZoom:17, opacity:0.9}}).addTo(map);
+
+var plateLayer = null;
+function plateColor(props){{
+  var t = String((props && props.Type) || '').toUpperCase();
+  if(t.indexOf('SUB')>=0 || t.indexOf('CRB')>=0) return '#ff3b3b';
+  if(t.indexOf('OSR')>=0) return '#3b82f6';
+  return '#facc15';
+}}
+
+fetch('{PLATE_BOUNDARY_URL}')
+  .then(function(r){{return r.json()}})
+  .then(function(d){{
+    plateLayer = L.geoJSON(d, {{
+      style:function(feature){{return {{color:plateColor(feature.properties), weight:2, opacity:0.9}}}},
+      onEachFeature:function(feature, layer){{
+        var p = feature.properties || {{}};
+        var label = (p.PlateA && p.PlateB) ? (p.PlateA+' / '+p.PlateB) : (p.Name || 'プレート境界');
+        layer.bindTooltip(label);
+      }}
+    }}).addTo(map);
+    document.getElementById('loadState').style.display='none';
+  }})
+  .catch(function(e){{
+    document.getElementById('loadState').textContent='プレート境界データの取得に失敗しました';
+  }});
+
+function toggleFault(btn){{
+  btn.classList.toggle('on');
+  if(map.hasLayer(faultLayer)) map.removeLayer(faultLayer); else faultLayer.addTo(map);
+}}
+function togglePlate(btn){{
+  btn.classList.toggle('on');
+  if(!plateLayer) return;
+  if(map.hasLayer(plateLayer)) map.removeLayer(plateLayer); else plateLayer.addTo(map);
+}}
+</script></body></html>"""
+
+
+# ══════════════════════════════════════════════════════
 # メインページ（タブシェル）
 # ══════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════
@@ -1460,6 +1577,10 @@ body{display:flex;height:100vh;background:#0f172a;overflow:hidden;font-family:"H
 .snap-item.active{background:#162032;border-left:3px solid #3b82f6;color:#fff}
 .snap-time{font-weight:600;color:#60a5fa;font-size:12px}
 .snap-meta{font-size:10px;color:#6b7280;margin-top:2px}
+#dlZip{display:block;width:calc(100% - 28px);margin:8px 14px 4px;padding:7px 0;text-align:center;
+    font-size:11px;font-weight:600;color:#93c5fd;background:#1e3a5f;border:1px solid #2563eb;
+    border-radius:6px;cursor:pointer;text-decoration:none}
+#dlZip:hover{background:#2563eb;color:#fff}
 #detail{flex:1;overflow-y:auto;display:flex;flex-direction:column}
 #detailTop{padding:14px 18px 10px;flex-shrink:0}
 #detailTop h2{font-size:15px;color:#f3f4f6;margin-bottom:4px}
@@ -1484,6 +1605,7 @@ tr:hover td{background:#161b22}
 </style></head><body>
 <div id="list">
   <div id="hdr"><b>スナップショット一覧</b>1時間ごとの解析結果ログ</div>
+  <a id="dlZip" href="/snapshots/download">📦 全件をZIPでダウンロード</a>
   <div id="items"><div id="loading">読込中...</div></div>
 </div>
 <div id="detail"><div class="empty" style="margin:auto">左のリストからスナップショットを選択してください</div></div>
@@ -1552,6 +1674,7 @@ fetch('/snapshots').then(function(r){return r.json()}).then(function(d){
   var wrap = document.getElementById('items');
   if(snapshots.length===0){
     wrap.innerHTML = '<div class="empty">まだスナップショットがありません<br>(起動後1時間ほどで作成されます)</div>';
+    document.getElementById('dlZip').style.display = 'none';
     return;
   }
   wrap.innerHTML = snapshots.map(function(f,i){
@@ -1732,28 +1855,32 @@ SHELL_HTML = """<!DOCTYPE html>
       <span class="label">b値マップ</span>
       <span class="badge">P4</span>
     </button>
+    <button class="tab-btn" onclick="sw(3)">
+      <span class="label">活断層・プレート境界</span>
+      <span class="badge">地質</span>
+    </button>
 
     <div class="sep"></div>
     <div class="group-title">地球物理データ</div>
-    <button class="tab-btn" onclick="sw(3)">
+    <button class="tab-btn" onclick="sw(4)">
       <span class="label">TEC</span>
       <span class="badge">P5+</span>
     </button>
-    <button class="tab-btn" onclick="sw(4)">
+    <button class="tab-btn" onclick="sw(5)">
       <span class="label">GNSS変位</span>
       <span class="badge">P5</span>
     </button>
 
     <div class="sep"></div>
     <div class="group-title">気象</div>
-    <button class="tab-btn" onclick="sw(5)">
+    <button class="tab-btn" onclick="sw(6)">
       <span class="label">海面気圧</span>
       <span class="badge">AMeDAS</span>
     </button>
 
     <div class="sep"></div>
     <div class="group-title">ログ</div>
-    <button class="tab-btn" onclick="sw(6)">
+    <button class="tab-btn" onclick="sw(7)">
       <span class="label">スナップショット</span>
       <span class="badge">1h</span>
     </button>
@@ -1768,10 +1895,11 @@ SHELL_HTML = """<!DOCTYPE html>
     <iframe id="f4" src=""></iframe>
     <iframe id="f5" src=""></iframe>
     <iframe id="f6" src=""></iframe>
+    <iframe id="f7" src=""></iframe>
   </div>
   <script>
-    var URLS=['history','etas','bvalue','tec','gnss','pressure','snapshots'];
-    var loaded=[true,false,false,false,false,false,false];
+    var URLS=['history','etas','bvalue','faultmap','tec','gnss','pressure','snapshots'];
+    var loaded=[true,false,false,false,false,false,false,false];
     function sw(idx){
       document.querySelectorAll('.tab-btn').forEach(function(b,i){b.classList.toggle('active',i===idx)});
       document.querySelectorAll('iframe').forEach(function(f,i){f.classList.toggle('active',i===idx)});
@@ -1870,6 +1998,7 @@ def tab(name):
     if   name == "history":  html = render_quake_history(data["all"], upd)
     elif name == "etas":     html = render_etas(data["etas"], data["all"], upd)
     elif name == "bvalue":   html = render_bvalue(data["bvalue"], data["all"], upd)
+    elif name == "faultmap": html = render_faultmap(upd)
     elif name == "tec":      html = render_tec(upd)
     elif name == "gnss":     html = render_gnss(upd)
     elif name == "pressure": html = render_pressure(upd)
@@ -1887,6 +2016,16 @@ def status():
 def snapshots():
     """保存済みスナップショットのファイル名一覧（新しい順）をJSONで返す。"""
     return {"snapshots": list_snapshots()}
+
+@app.route("/snapshots/download")
+def snapshots_download():
+    """保存済みスナップショット全件をZIPにまとめてダウンロードさせる。"""
+    buf = build_snapshots_zip()
+    if buf is None:
+        return Response("スナップショットがまだありません", status=404)
+    ts = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                      download_name=f"snapshots_{ts}.zip")
 
 @app.route("/snapshots/<fname>")
 def snapshot_detail(fname):
