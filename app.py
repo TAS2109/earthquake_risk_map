@@ -23,6 +23,27 @@ DATA_FILE          = "data/quakes.csv"
 GRID_SIZE          = 0.1
 FETCH_INTERVAL_SEC = 600
 
+# ── ETAS/b値の計算対象範囲（逆L字型）────────────────────
+# 単純な緯度経度の矩形では「先島諸島〜台湾」と「千島海溝」の両方を含めつつ
+# 「中国大陸・日本海北部」を除外することができないため、3つの矩形の
+# 論理和(OR)でL字型の範囲を作る。
+#   (lat_min, lat_max, lon_min, lon_max)
+ETAS_REGION_BOXES = [
+    (22.0, 27.0, 121.0, 129.0),   # 先島諸島・沖縄・台湾近海
+    (27.0, 38.0, 129.0, 148.0),   # 九州〜本州中部（太平洋側・日本海側とも）
+    (38.0, 51.0, 136.0, 156.0),   # 東北北部〜北海道〜千島海溝・北方領土
+]
+# 外部APIへの問い合わせ用（矩形1回で済ませるための外接矩形。実際の絞り込みは
+# in_etas_region() で行う）
+ETAS_FETCH_BBOX = (22.0, 51.0, 121.0, 156.0)  # (lat_min, lat_max, lon_min, lon_max)
+
+def in_etas_region(lat, lon):
+    """指定した緯度経度がETAS計算対象のL字型範囲内かどうかを返す。"""
+    for lat_min, lat_max, lon_min, lon_max in ETAS_REGION_BOXES:
+        if lat_min <= lat <= lat_max and lon_min <= lon <= lon_max:
+            return True
+    return False
+
 # ── スナップショット（解析結果の時系列ログ）────────────
 SNAPSHOT_DIR          = "data/snapshots"
 SNAPSHOT_KEEP_DAYS    = 30       # 古いスナップショットの保持期間
@@ -320,9 +341,10 @@ def fetch_quakes_jma_bosai():
 def fetch_quakes_usgs():
     now = datetime.now(timezone.utc)
     start = (now - timedelta(days=90)).strftime("%Y-%m-%d")
+    lat_min, lat_max, lon_min, lon_max = ETAS_FETCH_BBOX
     url = (f"https://earthquake.usgs.gov/fdsnws/event/1/query"
-           f"?format=geojson&starttime={start}&minlatitude=24&maxlatitude=46"
-           f"&minlongitude=122&maxlongitude=146&minmagnitude=0.0&orderby=time&limit=5000")
+           f"?format=geojson&starttime={start}&minlatitude={lat_min}&maxlatitude={lat_max}"
+           f"&minlongitude={lon_min}&maxlongitude={lon_max}&minmagnitude=0.0&orderby=time&limit=5000")
     try: data = requests.get(url, timeout=12).json()
     except Exception as e:
         print(f"[USGS] {e}"); return []
@@ -330,8 +352,10 @@ def fetch_quakes_usgs():
     for feat in data.get("features",[]):
         try:
             props = feat["properties"]; coords = feat["geometry"]["coordinates"]
+            lat, lon = float(coords[1]), float(coords[0])
+            if not in_etas_region(lat, lon): continue
             t = datetime.fromtimestamp(props["time"]/1000, tz=timezone.utc)
-            quakes.append({"time":t.isoformat(),"lat":float(coords[1]),"lon":float(coords[0]),
+            quakes.append({"time":t.isoformat(),"lat":lat,"lon":lon,
                            "mag":float(props["mag"]),"depth":float(coords[2]),"source":"usgs",
                            "place":props.get("place",""),"max_int":""})
         except Exception: continue
@@ -574,7 +598,13 @@ def analyze_etas(quakes):
         sc = spatial_scale[ei]; q_val = EP.Q
         weight = contributions[ei] / (dist2 + sc**2) ** q_val  # dist2 は2D、ブロードキャスト
         ni = gi[ei] + DI; nj = gj[ei] + DJ
-        mask = (ni>=240)&(ni<=460)&(nj>=1220)&(nj<=1460)
+        # 計算範囲: 逆L字型（先島諸島・沖縄・台湾近海 ＋ 九州〜北海道・千島海溝）
+        # 中国大陸・日本海北部（ロシア・朝鮮半島側）は除外。範囲の定義は
+        # ETAS_REGION_BOXES / in_etas_region() を参照。
+        lat_g = ni * GRID_SIZE; lon_g = nj * GRID_SIZE
+        mask = np.zeros(ni.shape, dtype=bool)
+        for lat_min, lat_max, lon_min, lon_max in ETAS_REGION_BOXES:
+            mask |= (lat_g>=lat_min)&(lat_g<=lat_max)&(lon_g>=lon_min)&(lon_g<=lon_max)
         ni_m = ni[mask]; nj_m = nj[mask]; w_m = weight[mask]
         for k in range(len(ni_m)):
             agg_dict[(int(ni_m[k]), int(nj_m[k]))] += float(w_m[k])
@@ -655,14 +685,34 @@ def _fmt_time_jst(time_str):
         return dt.astimezone(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M")
     except Exception: return time_str
 
+_MAG_COLOR_STOPS = [
+    (2.0, (148, 163, 184)),  # 灰 M2未満
+    (3.0, (74, 222, 128)),   # 緑 M3
+    (4.0, (250, 204, 21)),   # 黄 M4
+    (5.0, (251, 146, 60)),   # 橙 M5
+    (6.0, (239, 68, 68)),    # 赤 M6
+    (7.0, (220, 38, 38)),    # 濃赤 M7
+    (8.0, (255, 0, 255)),    # マゼンタ M8以上
+]
+
 def _mag_color(mag):
-    if   mag >= 8.0: return "#ff00ff"
-    elif mag >= 7.0: return "#dc2626"
-    elif mag >= 6.0: return "#ef4444"
-    elif mag >= 5.0: return "#fb923c"
-    elif mag >= 4.0: return "#facc15"
-    elif mag >= 3.0: return "#4ade80"
-    else:            return "#94a3b8"
+    """マグニチュードに応じた色を連続グラデーションで返す（区分けではなく線形補間）。"""
+    stops = _MAG_COLOR_STOPS
+    if mag <= stops[0][0]:
+        r, g, b = stops[0][1]
+    elif mag >= stops[-1][0]:
+        r, g, b = stops[-1][1]
+    else:
+        for (m0, c0), (m1, c1) in zip(stops, stops[1:]):
+            if m0 <= mag <= m1:
+                t = (mag - m0) / (m1 - m0)
+                r = c0[0] + (c1[0] - c0[0]) * t
+                g = c0[1] + (c1[1] - c0[1]) * t
+                b = c0[2] + (c1[2] - c0[2]) * t
+                break
+        else:
+            r, g, b = stops[-1][1]
+    return f"#{int(round(r)):02x}{int(round(g)):02x}{int(round(b)):02x}"
 
 WIND_DIR_16 = ["北","北北東","北東","東北東","東","東南東","南東","南南東",
                "南","南南西","南西","西南西","西","西北西","北西","北北西"]
@@ -740,20 +790,35 @@ body{{display:flex;height:100vh;background:#0f172a;color:#fff;font-family:"Helve
 #ls{{flex:1;overflow-y:auto}}
 table{{width:100%;border-collapse:collapse}}
 thead tr{{background:#1f2937;position:sticky;top:0;z-index:10}}
-thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bottom:1px solid #374151}}
+thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bottom:1px solid #374151;white-space:nowrap}}
 .qrow:hover{{background:#1e2d40}}
 .c1{{padding:5px 7px;font-weight:600;color:#f3f4f6;font-size:12px}}
-.c2{{padding:5px 4px;color:#9ca3af;font-size:11px}}
-.c3{{padding:5px 4px;text-align:center;font-weight:700;font-size:12px}}
-.c4{{padding:5px 4px;text-align:center}}
+.c2{{padding:5px 4px;color:#9ca3af;font-size:11px;white-space:nowrap}}
+.c3{{padding:5px 4px;text-align:center;font-weight:700;font-size:12px;white-space:nowrap}}
+.c4{{padding:5px 4px;text-align:center;white-space:nowrap}}
+.c4 span{{white-space:nowrap}}
 #mp{{flex:1;overflow:hidden;position:relative}}#map{{width:100%;height:100%}}
 #mglg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
     padding:10px 13px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.8;color:#f3f4f6}}
 #mglg b{{font-size:12px}}
+#lp{{position:relative;transition:margin-left 0.2s}}
+#lp.closed{{margin-left:-380px}}
+#lhTop{{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}}
+#lpClose{{flex-shrink:0;width:22px;height:22px;border:none;border-radius:5px;background:#374151;color:#d1d5db;
+    cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center}}
+#lpClose:hover{{background:#4b5563;color:#fff}}
+#lpReopen{{position:absolute;top:14px;left:0;z-index:200;width:26px;height:34px;border:none;
+    border-radius:0 6px 6px 0;background:#1f2937;color:#9ca3af;cursor:pointer;font-size:13px;display:none}}
+#lpReopen:hover{{background:#374151;color:#fff}}
+#lpReopen.show{{display:block}}
 </style></head><body>
+<button id="lpReopen" onclick="toggleHistoryPanel()">▶</button>
 <div id="lp">
   <div id="lh">
-    <h2>統合地震履歴（直近31日: {total}件 / 有感:{felt_n}件）</h2>
+    <div id="lhTop">
+      <h2>統合地震履歴（直近31日: {total}件 / 有感:{felt_n}件）</h2>
+      <button id="lpClose" onclick="toggleHistoryPanel()" title="パネルを閉じる">✕</button>
+    </div>
     <p>更新: {updated_str}</p>
   </div>
   <div id="fbar">
@@ -771,13 +836,11 @@ thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bo
 <div id="mp"><div id="map"></div>
   <div id="mglg">
     <b>マップの円色（マグニチュード）</b><br>
-    <span style="color:#ff00ff">●</span> M8.0以上&nbsp;
-    <span style="color:#dc2626">●</span> M7.0+&nbsp;
-    <span style="color:#ef4444">●</span> M6.0+<br>
-    <span style="color:#fb923c">●</span> M5.0+&nbsp;
-    <span style="color:#facc15">●</span> M4.0+&nbsp;
-    <span style="color:#4ade80">●</span> M3.0+&nbsp;
-    <span style="color:#94a3b8">●</span> M3.0未満
+    <div style="width:160px;height:10px;border-radius:3px;margin:5px 0 2px;
+      background:linear-gradient(to right,#94a3b8,#4ade80,#facc15,#fb923c,#ef4444,#dc2626,#ff00ff)"></div>
+    <div style="display:flex;justify-content:space-between;width:160px;font-size:10px;color:#9ca3af">
+      <span>M2以下</span><span>M8以上</span>
+    </div>
   </div>
 </div>
 <script>
@@ -806,6 +869,14 @@ function filter(mode,btn){{
   btn.classList.add('on');
   var fn=MODE_MAP[mode];
   allRows.forEach(function(r){{r.style.display=fn(r)?'':'none'}});
+}}
+
+function toggleHistoryPanel(){{
+  var lp=document.getElementById('lp');
+  var reopen=document.getElementById('lpReopen');
+  lp.classList.toggle('closed');
+  reopen.classList.toggle('show', lp.classList.contains('closed'));
+  setTimeout(function(){{map.invalidateSize()}}, 220);
 }}
 </script></body></html>"""
 
@@ -862,13 +933,11 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
 #map{{flex:1}}
 #lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
     padding:11px 14px;border-radius:8px;border:1px solid #8800cc;font-size:12px;line-height:2;color:#f3f4f6}}
-#info{{position:fixed;top:60px;right:10px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:10px 14px;border-radius:8px;border:1px solid #374151;font-size:11px;color:#9ca3af;max-width:200px}}
 </style></head><body>
 <div id="tb">
   <span>表示レイヤー:</span>
   <button class="tog on" id="togEtas" onclick="toggleLayer('etas',this)">ETASグリッド</button>
-  <button class="tog on" id="togRecent" onclick="toggleLayer('recent',this)">直近72h地震</button>
+  <button class="tog" id="togRecent" onclick="toggleLayer('recent',this)">直近72h地震</button>
   <span style="margin-left:auto;color:#6b7280;font-size:11px">更新: {updated_str}</span>
 </div>
 <div id="map"></div>
@@ -881,12 +950,6 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
   <span style="color:#66ccff">■</span> Lv1 (上位50%)<br>
   <hr style="border-color:#374151;margin:5px 0">
   <small>JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)+src_count.get('p2p_jma',0)} USGS:{src_count.get('usgs',0)}<br>計{len(quakes)}件</small>
-</div>
-<div id="info">
-  <b style="color:#60a5fa">研究メモ</b><br>
-  ETASモデルは過去60日の地震から算出。<br>
-  b値・GNSS比較のベースラインとして使用。<br>
-  残差 = 実測 − ETAS予測 (Phase2で実装予定)
 </div>
 <script>
 var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
@@ -903,10 +966,17 @@ CELLS.forEach(function(c){{
 }});
 
 var RECENT={recent_js};
-var recentGroup=L.layerGroup().addTo(map);
+var recentGroup=L.layerGroup();
 RECENT.forEach(function(d){{
-  L.circleMarker([d.lat,d.lon],{{radius:d.r,color:'#fff',fillColor:'#fff',fillOpacity:0.9,weight:1.5}})
-   .bindTooltip(d.tip).addTo(recentGroup);
+  var size=Math.max(16, d.r*2.4);
+  var icon=L.divIcon({{
+    className:'',
+    html:'<div style="width:'+size+'px;height:'+size+'px;display:flex;align-items:center;justify-content:center;'
+        +'background:rgba(220,38,38,0.25);border:2px solid #facc15;border-radius:4px;'
+        +'color:#ef4444;font-weight:900;font-size:'+Math.round(size*0.6)+'px;line-height:1">&#10005;</div>',
+    iconSize:[size,size], iconAnchor:[size/2,size/2]
+  }});
+  L.marker([d.lat,d.lon],{{icon:icon}}).bindTooltip(d.tip).addTo(recentGroup);
 }});
 
 var groups={{'etas':etasGroup,'recent':recentGroup}};
@@ -925,8 +995,10 @@ def render_bvalue(bvalue_grid, quakes, updated_str):
     # b値カラースケール: 低b値(赤)→高b値(青)
     # 低b値は大地震の前兆として注目される
     def b_color(b):
-        # b値の典型的な範囲は 0.5 〜 2.0
-        ratio = max(0.0, min(1.0, (b - 0.5) / 1.5))
+        # 実際の観測データはb値0.5〜2.0の全域を使うことが少なく、
+        # 大半が0.6〜1.4付近に集中するため、この範囲でグラデーションを付ける
+        # （従来の0.5〜2.0だと色の差がほとんど出ず、地域差が見えにくかった）
+        ratio = max(0.0, min(1.0, (b - 0.6) / 0.8))
         r = int(220 * (1 - ratio))
         g = int(60 + 100 * ratio)
         bl = int(220 * ratio)
@@ -936,7 +1008,7 @@ def render_bvalue(bvalue_grid, quakes, updated_str):
     for (gi, gj), info in bvalue_grid.items():
         b = info["b"]; n = info["n"]; mean_m = info["mean_m"]
         lat = gi * 1.0; lon = gj * 1.0
-        if not (24<=lat<=46 and 122<=lon<=146): continue
+        if not in_etas_region(lat, lon): continue
         cells.append({
             "lat": lat, "lon": lon,
             "color": b_color(b), "b": b, "n": n, "mean_m": mean_m
@@ -970,8 +1042,6 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
 #map{{flex:1}}
 #lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
     padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:2;color:#f3f4f6}}
-#info{{position:fixed;top:60px;right:10px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:10px 14px;border-radius:8px;border:1px solid #374151;font-size:11px;color:#9ca3af;max-width:210px}}
 </style></head><body>
 <div id="hdr">
   <b>b値マップ (Gutenberg-Richter則)</b>
@@ -988,20 +1058,10 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
   <div style="width:130px;height:10px;border-radius:3px;
     background:linear-gradient(to right,#dc3c3c,#60a0dc);margin:5px 0 2px"></div>
   <div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af">
-    <span>低 (0.5)</span><span>高 (2.0)</span>
+    <span>低 (0.6)</span><span>高 (1.4)</span>
   </div>
   <hr style="border-color:#374151;margin:5px 0">
   <small>低b値地域 = 大地震の可能性<br>Mc = 2.0 / 最小{10}件/グリッド<br>グリッドサイズ: 0.5°</small>
-</div>
-<div id="info">
-  <b style="color:#60a5fa">研究メモ</b><br>
-  Gutenberg-Richter則:<br>
-  log N = a − bM<br><br>
-  最尤推定:<br>
-  b = log₁₀(e) / (M̄ − Mc)<br><br>
-  ETAS異常地域と比較して<br>
-  b値低下の相関を調べる。<br>
-  (Phase4)
 </div>
 <script>
 var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
@@ -1065,10 +1125,10 @@ body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-s
       <img src="{nict_url}" class="tec-img" alt="NICT TEC Map"
            onerror="this.style.display='none';document.getElementById('img-err').style.display='block'">
       <div id="img-err" style="display:none;padding:12px;background:#1f2937;border-radius:6px;margin-top:8px;font-size:12px;color:#9ca3af">
-        ⚠ 画像の直接読み込みができません（CORSポリシー）。<br>下のリンクから直接確認してください。
+        画像の直接読み込みができません（CORSポリシー）。<br>下のリンクから直接確認してください。
       </div>
       <a href="https://aer-nc-web.nict.go.jp/iono/GEONET/" target="_blank" class="link-btn">
-        🌐 NICT GEONET TECページを開く
+        NICT GEONET TECページを開く
       </a>
     </div>
     <div class="card">
@@ -1076,13 +1136,13 @@ body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-s
       <p>TECデータを提供する主要な機関・ツール</p>
       <div style="margin-top:8px">
         <a href="https://scidas.nict.go.jp/" target="_blank" class="link-btn" style="margin-bottom:6px">
-          📡 NICT SCIDAS（宇宙天気情報）
+          NICT SCIDAS（宇宙天気情報）
         </a>
         <a href="https://www.gsi.go.jp/denshi/denshi.html" target="_blank" class="link-btn" style="background:linear-gradient(135deg,#065f46,#047857);margin-bottom:6px">
-          🛰 国土地理院 電子基準点 TEC
+          国土地理院 電子基準点 TEC
         </a>
         <a href="https://ionex.jpl.nasa.gov/" target="_blank" class="link-btn" style="background:linear-gradient(135deg,#7f1d1d,#b91c1c)">
-          🚀 JPL Global Ionosphere Maps (GIM)
+          JPL Global Ionosphere Maps (GIM)
         </a>
       </div>
     </div>
@@ -1090,7 +1150,7 @@ body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-s
       <h3>現在の取得状況</h3>
       <p style="margin-bottom:8px">
         <span class="badge">状態</span>
-        <span style="color:#fbbf24;font-weight:700">⚠ 準備中</span> — NICT APIへの直接アクセスは今後実装予定。
+        <span style="color:#fbbf24;font-weight:700">準備中</span> — NICT APIへの直接アクセスは今後実装予定。
       </p>
       <p>TECの時系列データ自動取得については、NICTのIONEX形式データ（ftp://ftp.nict.go.jp/）からの自動ダウンロードを予定しています。</p>
     </div>
@@ -1189,13 +1249,13 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;color:#
     <div class="sec">
       <h3>データソース</h3>
       <a href="https://terras.gsi.go.jp/" target="_blank" class="link-btn">
-        🛰 国土地理院 TERRAS
+        国土地理院 TERRAS
       </a>
       <a href="https://www.gsi.go.jp/kanshi/gnss_crust.html" target="_blank" class="link-btn" style="background:linear-gradient(135deg,#065f46,#047857)">
-        📊 GEONET 地殻変動情報
+        GEONET 地殻変動情報
       </a>
       <a href="https://mekira.gsi.go.jp/" target="_blank" class="link-btn" style="background:linear-gradient(135deg,#78350f,#b45309)">
-        📡 MEKIRA（地殻変動モニタ）
+        MEKIRA（地殻変動モニタ）
       </a>
     </div>
     <div class="sec">
@@ -1661,40 +1721,40 @@ SHELL_HTML = """<!DOCTYPE html>
 
     <div class="group-title">地震データ</div>
     <button class="tab-btn active" onclick="sw(0)">
-      <span class="icon">🗺</span><span class="label">地震履歴</span>
+      <span class="label">地震履歴</span>
       <span class="badge">有感+無感</span>
     </button>
     <button class="tab-btn" onclick="sw(1)">
-      <span class="icon">📊</span><span class="label">ETASマップ</span>
+      <span class="label">ETASマップ</span>
       <span class="badge">P1</span>
     </button>
     <button class="tab-btn" onclick="sw(2)">
-      <span class="icon">📉</span><span class="label">b値マップ</span>
+      <span class="label">b値マップ</span>
       <span class="badge">P4</span>
     </button>
 
     <div class="sep"></div>
     <div class="group-title">地球物理データ</div>
     <button class="tab-btn" onclick="sw(3)">
-      <span class="icon">🌐</span><span class="label">TEC</span>
+      <span class="label">TEC</span>
       <span class="badge">P5+</span>
     </button>
     <button class="tab-btn" onclick="sw(4)">
-      <span class="icon">🛰</span><span class="label">GNSS変位</span>
+      <span class="label">GNSS変位</span>
       <span class="badge">P5</span>
     </button>
 
     <div class="sep"></div>
     <div class="group-title">気象</div>
     <button class="tab-btn" onclick="sw(5)">
-      <span class="icon">🌀</span><span class="label">海面気圧</span>
+      <span class="label">海面気圧</span>
       <span class="badge">AMeDAS</span>
     </button>
 
     <div class="sep"></div>
     <div class="group-title">ログ</div>
     <button class="tab-btn" onclick="sw(6)">
-      <span class="icon">🗂</span><span class="label">スナップショット</span>
+      <span class="label">スナップショット</span>
       <span class="badge">1h</span>
     </button>
 
