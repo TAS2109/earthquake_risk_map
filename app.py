@@ -13,8 +13,8 @@
   8. スナップショット - 1時間ごとの解析結果ログ
 """
 
-from flask import Flask, Response, send_file
-import requests, csv, os, math, re, json, threading, time, zipfile, io
+from flask import Flask, Response, send_file, request
+import requests, csv, os, math, re, json, threading, time, zipfile, io, bisect
 from datetime import datetime, timezone, timedelta
 import numpy as np
 
@@ -24,6 +24,7 @@ app = Flask(__name__)
 DATA_FILE          = "data/quakes.csv"
 GRID_SIZE          = 0.1
 FETCH_INTERVAL_SEC = 600
+BVALUE_GRID_SIZE   = 1.5   # b値マップのグリッドサイズ（旧1.0°より少し大きく）
 
 # ── ETAS/b値の計算対象範囲（逆L字型）────────────────────
 # 単純な緯度経度の矩形では「先島諸島〜台湾」と「千島海溝」の両方を含めつつ
@@ -561,18 +562,29 @@ def load_snapshot(fname):
     payload["bvalue"] = _restore(payload.get("bvalue", {}))
     return payload
 
-def build_snapshots_zip():
+def build_snapshots_zip(max_files=None):
     """
-    data/snapshots/ 配下の全スナップショットJSONファイルをまとめて
+    data/snapshots/ 配下のスナップショットJSONファイルをまとめて
     メモリ上でZIP化し、BytesIOバッファを返す。1件もない場合は None。
+
+    max_files を指定すると新しい方から その件数だけに絞る。
+    ★ Render無料プランはメモリ・CPUが限られるため、保持件数が多い
+    （30日間×毎時 = 最大720件）場合に全件を一度にZIP化しようとすると
+    メモリ不足やリクエストタイムアウトで失敗することがある。
+    そのため既定では直近分のみに絞り、全件が欲しい場合は
+    ?all=1 を明示的に指定してもらう方式にした。
     """
     if not os.path.isdir(SNAPSHOT_DIR):
         return None
-    files = sorted(f for f in os.listdir(SNAPSHOT_DIR) if f.endswith(".json"))
+    files = sorted((f for f in os.listdir(SNAPSHOT_DIR) if f.endswith(".json")), reverse=True)
     if not files:
         return None
+    if max_files is not None:
+        files = files[:max_files]
+    files = sorted(files)  # zip内は時系列順にしておく
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    # compresslevel を下げてCPU負荷を抑える（JSONはテキストなのでlevel=1でも十分縮む）
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
         for fname in files:
             zf.write(os.path.join(SNAPSHOT_DIR, fname), arcname=fname)
     buf.seek(0)
@@ -645,16 +657,11 @@ def _percentile_thresholds(values_arr):
 # ══════════════════════════════════════════════════════
 # b値解析 (Gutenberg-Richter)
 # ══════════════════════════════════════════════════════
-def compute_bvalue_grid(quakes, grid_size=1.0, mc=1.0, min_count=5):
+def compute_bvalue_grid(quakes, grid_size=BVALUE_GRID_SIZE, mc=1.0, min_count=5):
     """
     グリッドごとにb値を計算する。
     b = log10(e) / (mean(M) - Mc)  (最尤推定)
-
-    ★ Bug fix: 元のデフォルト (grid_size=0.5°, mc=2.0, min_count=10) では、
-    60日分の地震データであっても 0.5°グリッド（約55km四方）の中にM2.0以上の
-    地震が10件以上集まることが日本周辺でもほとんど無く、b値マップが常に
-    空になっていた。grid_sizeを2.0°に広げ、mc/min_countも実データ量に
-    見合う値に緩和した。
+    グリッドサイズは BVALUE_GRID_SIZE (現在1.5°) を既定値として使用する。
     """
     from collections import defaultdict
     bins = defaultdict(list)
@@ -1021,28 +1028,40 @@ function toggleLayer(key,btn){{
 def render_bvalue(bvalue_grid, quakes, updated_str):
     # b値カラースケール: 低b値(赤)→高b値(青)
     # 低b値は大地震の前兆として注目される
-    def b_color(b):
-        # 実際の観測データはb値0.5〜2.0の全域を使うことが少なく、
-        # 大半が0.6〜1.4付近に集中するため、この範囲でグラデーションを付ける
-        # （従来の0.5〜2.0だと色の差がほとんど出ず、地域差が見えにくかった）
-        ratio = max(0.0, min(1.0, (b - 0.6) / 0.8))
+    #
+    # ★ 固定の数値レンジ(例: 0.6〜1.4)で色を決めると、その期間のデータの
+    # 分布次第で赤・青のどちらかに大きく偏ってしまう。「赤っぽい場所」と
+    # 「青っぽい場所」が常に同じくらいの割合になるよう、絶対値ではなく
+    # 相対順位(パーセンタイル)で色を決める（＝分布の中央値が常に色の中間になる）。
+    gs = BVALUE_GRID_SIZE
+
+    cells_raw = []
+    for (gi, gj), info in bvalue_grid.items():
+        b = info["b"]; n = info["n"]; mean_m = info["mean_m"]
+        lat = gi * gs; lon = gj * gs
+        if not in_etas_region(lat, lon): continue
+        cells_raw.append({"lat": lat, "lon": lon, "b": b, "n": n, "mean_m": mean_m})
+
+    b_sorted = sorted(c["b"] for c in cells_raw)
+    def percentile_rank(b):
+        if len(b_sorted) <= 1: return 0.5
+        lo = bisect.bisect_left(b_sorted, b)
+        hi = bisect.bisect_right(b_sorted, b)
+        mid_rank = (lo + hi - 1) / 2
+        return mid_rank / (len(b_sorted) - 1)
+
+    def b_color(ratio):
         r = int(220 * (1 - ratio))
         g = int(60 + 100 * ratio)
         bl = int(220 * ratio)
         return f"#{r:02x}{g:02x}{bl:02x}"
 
     cells = []
-    for (gi, gj), info in bvalue_grid.items():
-        b = info["b"]; n = info["n"]; mean_m = info["mean_m"]
-        lat = gi * 1.0; lon = gj * 1.0
-        if not in_etas_region(lat, lon): continue
-        cells.append({
-            "lat": lat, "lon": lon,
-            "color": b_color(b), "b": b, "n": n, "mean_m": mean_m
-        })
+    for c in cells_raw:
+        ratio = percentile_rank(c["b"])
+        cells.append({**c, "color": b_color(ratio)})
 
     cells_js = json.dumps(cells)
-    gs = 1.0  # b値計算のグリッドサイズ
 
     # 統計サマリー
     if bvalue_grid:
@@ -1085,10 +1104,11 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
   <div style="width:130px;height:10px;border-radius:3px;
     background:linear-gradient(to right,#dc3c3c,#60a0dc);margin:5px 0 2px"></div>
   <div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af">
-    <span>低 (0.6)</span><span>高 (1.4)</span>
+    <span>低 ({b_min})</span><span>高 ({b_max})</span>
   </div>
   <hr style="border-color:#374151;margin:5px 0">
-  <small>低b値地域 = 大地震の可能性<br>Mc = 2.0 / 最小{10}件/グリッド<br>グリッドサイズ: 0.5°</small>
+  <small>低b値地域(赤) = 大地震の可能性<br>色は数値の相対順位（中央値で赤/青が半々）で決定<br>
+  Mc = 1.0 / 最小5件/グリッド<br>グリッドサイズ: {BVALUE_GRID_SIZE}°</small>
 </div>
 <script>
 var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
@@ -1471,7 +1491,56 @@ MK.forEach(function(d){{
 # TAB: 活断層・プレート境界マップ
 # ══════════════════════════════════════════════════════
 PLATE_BOUNDARY_URL = "https://raw.githubusercontent.com/fraxen/tectonicplates/master/GeoJSON/PB2002_boundaries.json"
-GSI_ACTIVE_FAULT_TILE = "https://cyberjapandata.gsi.go.jp/xyz/afm/{z}/{x}/{y}.png"
+# GEM Global Active Faults Database（ベクター線データ、LineString/MultiLineString）
+# 全世界で約12MBあるため、サーバー側で日本周辺だけに絞ってから配信する。
+ACTIVE_FAULTS_URL = "https://raw.githubusercontent.com/cossatot/gem-global-active-faults/master/geojson/gem_active_faults.geojson"
+# 日本周辺の外接矩形（先島諸島〜千島列島を余裕をもってカバー）
+FAULTS_BBOX = (20.0, 52.0, 120.0, 157.0)  # (lat_min, lat_max, lon_min, lon_max)
+
+_fault_cache = {"data": None, "fetched_at": None}
+_FAULT_CACHE_TTL_SEC = 24 * 3600  # 活断層データは滅多に変わらないので1日キャッシュ
+
+def get_japan_active_faults():
+    """GEM Global Active Faultsを取得し、日本周辺のみにフィルタしたGeoJSONを返す（メモリキャッシュ付き）。"""
+    now = time.time()
+    if (_fault_cache["data"] is not None and _fault_cache["fetched_at"] is not None
+            and now - _fault_cache["fetched_at"] < _FAULT_CACHE_TTL_SEC):
+        return _fault_cache["data"]
+    try:
+        resp = requests.get(ACTIVE_FAULTS_URL, timeout=30)
+        gj = resp.json()
+    except Exception as e:
+        print(f"[ActiveFaults] 取得失敗: {e}")
+        return _fault_cache["data"] or {"type": "FeatureCollection", "features": []}
+
+    lat_min, lat_max, lon_min, lon_max = FAULTS_BBOX
+    feats = []
+    for feat in gj.get("features", []):
+        geom = feat.get("geometry") or {}
+        gtype = geom.get("type")
+        coords = geom.get("coordinates", [])
+        if gtype == "LineString":
+            flat = coords
+        elif gtype == "MultiLineString":
+            flat = [pt for line in coords for pt in line]
+        else:
+            continue
+        if any(lat_min <= pt[1] <= lat_max and lon_min <= pt[0] <= lon_max for pt in flat):
+            props = feat.get("properties") or {}
+            feats.append({
+                "type": "Feature",
+                "properties": {"name": props.get("name", ""), "slip_type": props.get("slip_type", "")},
+                "geometry": geom,
+            })
+    result = {"type": "FeatureCollection", "features": feats}
+    _fault_cache["data"] = result
+    _fault_cache["fetched_at"] = now
+    print(f"[ActiveFaults] 日本周辺 {len(feats)}件に絞り込み完了")
+    return result
+
+@app.route("/data/active_faults.geojson")
+def active_faults_geojson():
+    return get_japan_active_faults()
 
 def render_faultmap(updated_str):
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -1493,21 +1562,21 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
 </style></head><body>
 <div id="hdr">
   <b>活断層・プレート境界マップ</b>
-  <button class="tog on" id="togFault" onclick="toggleFault(this)">活断層(都市圏活断層図)</button>
+  <button class="tog on" id="togFault" onclick="toggleFault(this)">活断層</button>
   <button class="tog on" id="togPlate" onclick="togglePlate(this)">プレート境界</button>
   <div style="margin-left:auto;color:#6b7280">更新: {updated_str}</div>
 </div>
 <div id="mp">
   <div id="map"></div>
-  <div id="loadState">プレート境界データ読込中...</div>
+  <div id="loadState">データ読込中...</div>
   <div id="lg">
     <b>凡例</b><br>
-    <span style="color:#ff8800">■</span> 都市圏活断層図（国土地理院タイル）<br>
+    <span style="color:#ff8800">━</span> 活断層(GEM Global Active Faults)<br>
     <span style="color:#ff3b3b">━</span> 収束型境界(SUB/CRB)<br>
     <span style="color:#3b82f6">━</span> 発散型境界(OSR)<br>
     <span style="color:#facc15">━</span> トランスフォーム/その他<br>
     <hr style="border-color:#374151;margin:5px 0">
-    <small>出典: 国土地理院 都市圏活断層図タイル<br>
+    <small>出典: GEM Global Active Faults Database（Styron &amp; Pagani, 2020）<br>
     プレート境界: Bird (2003) / fraxen/tectonicplates (Peter Bird, PB2002)</small>
   </div>
 </div>
@@ -1517,10 +1586,30 @@ L.control.zoom({{position:'topright'}}).addTo(map);
 {DARK_TILE}
 {GEOJSON_JS}
 
-var faultLayer = L.tileLayer('{GSI_ACTIVE_FAULT_TILE}',
-  {{attribution:'&copy;国土地理院', maxZoom:17, opacity:0.9}}).addTo(map);
-
+var faultLayer = null;
 var plateLayer = null;
+var loadCount = 0;
+function loadDone(){{
+  loadCount++;
+  if(loadCount>=2) document.getElementById('loadState').style.display='none';
+}}
+
+fetch('/data/active_faults.geojson')
+  .then(function(r){{return r.json()}})
+  .then(function(d){{
+    faultLayer = L.geoJSON(d, {{
+      style:function(){{return {{color:'#ff8800', weight:2, opacity:0.85}}}},
+      onEachFeature:function(feature, layer){{
+        var p = feature.properties || {{}};
+        layer.bindTooltip(p.name || '活断層');
+      }}
+    }}).addTo(map);
+    loadDone();
+  }})
+  .catch(function(e){{
+    document.getElementById('loadState').textContent='活断層データの取得に失敗しました';
+  }});
+
 function plateColor(props){{
   var t = String((props && props.Type) || '').toUpperCase();
   if(t.indexOf('SUB')>=0 || t.indexOf('CRB')>=0) return '#ff3b3b';
@@ -1539,7 +1628,7 @@ fetch('{PLATE_BOUNDARY_URL}')
         layer.bindTooltip(label);
       }}
     }}).addTo(map);
-    document.getElementById('loadState').style.display='none';
+    loadDone();
   }})
   .catch(function(e){{
     document.getElementById('loadState').textContent='プレート境界データの取得に失敗しました';
@@ -1547,6 +1636,7 @@ fetch('{PLATE_BOUNDARY_URL}')
 
 function toggleFault(btn){{
   btn.classList.toggle('on');
+  if(!faultLayer) return;
   if(map.hasLayer(faultLayer)) map.removeLayer(faultLayer); else faultLayer.addTo(map);
 }}
 function togglePlate(btn){{
@@ -1581,6 +1671,10 @@ body{display:flex;height:100vh;background:#0f172a;overflow:hidden;font-family:"H
     font-size:11px;font-weight:600;color:#93c5fd;background:#1e3a5f;border:1px solid #2563eb;
     border-radius:6px;cursor:pointer;text-decoration:none}
 #dlZip:hover{background:#2563eb;color:#fff}
+#dlZipAll{display:block;width:calc(100% - 28px);margin:0 14px 8px;padding:5px 0;text-align:center;
+    font-size:10px;font-weight:600;color:#9ca3af;background:transparent;border:1px solid #374151;
+    border-radius:6px;cursor:pointer;text-decoration:none}
+#dlZipAll:hover{background:#1f2937;color:#d1d5db}
 #detail{flex:1;overflow-y:auto;display:flex;flex-direction:column}
 #detailTop{padding:14px 18px 10px;flex-shrink:0}
 #detailTop h2{font-size:15px;color:#f3f4f6;margin-bottom:4px}
@@ -1605,12 +1699,14 @@ tr:hover td{background:#161b22}
 </style></head><body>
 <div id="list">
   <div id="hdr"><b>スナップショット一覧</b>1時間ごとの解析結果ログ</div>
-  <a id="dlZip" href="/snapshots/download">📦 全件をZIPでダウンロード</a>
+  <a id="dlZip" href="/snapshots/download">全件をZIPでダウンロード（直近7日分）</a>
+  <a id="dlZipAll" href="/snapshots/download?all=1">全期間をまとめてダウンロード</a>
   <div id="items"><div id="loading">読込中...</div></div>
 </div>
 <div id="detail"><div class="empty" style="margin:auto">左のリストからスナップショットを選択してください</div></div>
 <script>
 var GRID_SIZE = __GRID_SIZE__;
+var BVALUE_GRID_SIZE = __BVALUE_GRID_SIZE__;
 var ETAS_COLOR = {5:'#1a0033',4:'#8000ff',3:'#ff0000',2:'#ff8800',1:'#66ccff'};
 var snapshots = [];
 var map = null;
@@ -1627,8 +1723,7 @@ function fmtTime(fname){
          pad(jst.getUTCHours())+':'+pad(jst.getUTCMinutes())+':'+pad(jst.getUTCSeconds())+' JST';
 }
 
-function bColor(b){
-  var ratio = Math.max(0, Math.min(1, (b-0.5)/1.5));
+function bColor(ratio){
   var r = Math.round(220*(1-ratio)), g = Math.round(60+100*ratio), bl = Math.round(220*ratio);
   function h(v){var s=v.toString(16); return s.length<2?'0'+s:s}
   return '#'+h(r)+h(g)+h(bl);
@@ -1662,10 +1757,24 @@ function buildEtasCells(etasObj){
 }
 
 function buildBvalueCells(bvObj){
-  return Object.entries(bvObj).map(function(kv){
+  var entries = Object.entries(bvObj);
+  var bSorted = entries.map(function(kv){return kv[1].b}).sort(function(a,b){return a-b});
+  function percentileRank(b){
+    if(bSorted.length<=1) return 0.5;
+    // 二分探索で順位(0〜1)を求める
+    var lo=0, hi=bSorted.length;
+    while(lo<hi){var mid=(lo+hi)>>1; if(bSorted[mid]<b) lo=mid+1; else hi=mid;}
+    var left=lo;
+    lo=0; hi=bSorted.length;
+    while(lo<hi){var mid=(lo+hi)>>1; if(bSorted[mid]<=b) lo=mid+1; else hi=mid;}
+    var right=lo;
+    var midRank = (left+right-1)/2;
+    return midRank/(bSorted.length-1);
+  }
+  return entries.map(function(kv){
     var parts = kv[0].split('_'); var info = kv[1];
-    return {lat:parseInt(parts[0])*1.0, lon:parseInt(parts[1])*1.0,
-            color:bColor(info.b), b:info.b, n:info.n, mean_m:info.mean_m};
+    return {lat:parseInt(parts[0])*BVALUE_GRID_SIZE, lon:parseInt(parts[1])*BVALUE_GRID_SIZE,
+            color:bColor(percentileRank(info.b)), b:info.b, n:info.n, mean_m:info.mean_m};
   });
 }
 
@@ -1675,6 +1784,7 @@ fetch('/snapshots').then(function(r){return r.json()}).then(function(d){
   if(snapshots.length===0){
     wrap.innerHTML = '<div class="empty">まだスナップショットがありません<br>(起動後1時間ほどで作成されます)</div>';
     document.getElementById('dlZip').style.display = 'none';
+    document.getElementById('dlZipAll').style.display = 'none';
     return;
   }
   wrap.innerHTML = snapshots.map(function(f,i){
@@ -1767,7 +1877,7 @@ function renderDetail(fname, d){
 
   var bvGroup = L.layerGroup().addTo(map);
   buildBvalueCells(d.bvalue||{}).forEach(function(c){
-    L.rectangle([[c.lat,c.lon],[c.lat+1.0,c.lon+1.0]],
+    L.rectangle([[c.lat,c.lon],[c.lat+BVALUE_GRID_SIZE,c.lon+BVALUE_GRID_SIZE]],
       {color:null,weight:0,fill:true,fillColor:c.color,fillOpacity:0.6})
      .bindTooltip('b='+c.b+' / N='+c.n+' / M̄='+c.mean_m).addTo(bvGroup);
   });
@@ -1785,6 +1895,7 @@ function toggleLayer(key, btn){
 }
 </script></body></html>"""
     html = html.replace("__GRID_SIZE__", str(GRID_SIZE))
+    html = html.replace("__BVALUE_GRID_SIZE__", str(BVALUE_GRID_SIZE))
     html = html.replace("__LEAFLET_CDN__", LEAFLET_CDN)
     html = html.replace("__DARK_TILE__", DARK_TILE)
     html = html.replace("__GEOJSON_JS__", GEOJSON_JS)
@@ -2019,13 +2130,25 @@ def snapshots():
 
 @app.route("/snapshots/download")
 def snapshots_download():
-    """保存済みスナップショット全件をZIPにまとめてダウンロードさせる。"""
-    buf = build_snapshots_zip()
+    """
+    保存済みスナップショットをZIPにまとめてダウンロードさせる。
+    既定では直近7日分（毎時想定で最大168件）のみに絞る。
+    ?all=1 を付けると保持している全件（最大30日分）をまとめる
+    （件数が多いとRender無料プランではメモリ/時間切れになりやすいので注意）。
+    """
+    want_all = request.args.get("all") == "1"
+    max_files = None if want_all else 168
+    try:
+        buf = build_snapshots_zip(max_files=max_files)
+    except Exception as e:
+        print(f"[snapshots_download] ZIP作成失敗: {e}")
+        return Response(f"ZIP作成中にエラーが発生しました: {e}", status=500)
     if buf is None:
         return Response("スナップショットがまだありません", status=404)
     ts = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
+    suffix = "all" if want_all else "recent7d"
     return send_file(buf, mimetype="application/zip", as_attachment=True,
-                      download_name=f"snapshots_{ts}.zip")
+                      download_name=f"snapshots_{suffix}_{ts}.zip")
 
 @app.route("/snapshots/<fname>")
 def snapshot_detail(fname):
