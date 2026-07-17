@@ -7,10 +7,11 @@
   2. ETASマップ   - 地震発生確率 + ETAS残差（研究用）
   3. b値マップ    - グリッドごとのGutenberg-Richter b値
   4. 活断層・プレート境界 - 都市圏活断層図(GSI) + プレート境界(PB2002)
-  5. TEC          - 電離圏全電子数 (NICT SCIDAS リンク)
-  6. GNSS         - 地殻変動 (GEONET リンク + 変位プレースホルダー)
-  7. 海面気圧     - アメダス海面気圧マップ
-  8. スナップショット - 1時間ごとの解析結果ログ
+  5. 統合リスクマップ(β) - ETAS/b値/活断層/プレート境界/気圧を統合した相対リスク指数
+  6. TEC          - 電離圏全電子数 (NICT SCIDAS リンク)
+  7. GNSS         - 地殻変動 (GEONET リンク + 変位プレースホルダー)
+  8. 海面気圧     - アメダス海面気圧マップ
+  9. スナップショット - 1時間ごとの解析結果ログ
 """
 
 from flask import Flask, Response, send_file, request
@@ -1648,6 +1649,454 @@ function togglePlate(btn){{
 
 
 # ══════════════════════════════════════════════════════
+# 統合リスクマップ（β）
+# ETAS・b値・活断層近接度・プレート境界近接度・気圧偏差を統合し、
+# 地域ごとの「相対的な」地震リスク指数を算出する。
+# 発生確率を予測するものではなく、あくまで複数指標の相対順位を
+# 重み付け合成した比較指標である点に注意。
+# ══════════════════════════════════════════════════════
+RISK_GRID_SIZE = 0.5   # 統合リスクマップの共通格子（ETAS/b値より粗い格子に集約する）
+
+# 各データソースの既定の重み（合計1.0。未選択/データ欠損のセルは
+# 選択されている項目だけで自動的に再正規化される）
+RISK_DEFAULT_WEIGHTS = {
+    "etas":     0.35,
+    "bvalue":   0.25,
+    "fault":    0.20,
+    "plate":    0.15,
+    "pressure": 0.05,
+}
+RISK_LABELS = {"etas": "ETAS", "bvalue": "b値", "fault": "活断層",
+               "plate": "プレート境界", "pressure": "気圧"}
+
+def _build_risk_cells():
+    """L字型のETAS計算対象範囲を RISK_GRID_SIZE 格子で分割し、
+    セル中心 (lat, lon) を (gi, gj) キー付き辞書で返す（モジュール読込時に1度だけ構築）。"""
+    cells = {}
+    lat_min_all = min(b[0] for b in ETAS_REGION_BOXES)
+    lat_max_all = max(b[1] for b in ETAS_REGION_BOXES)
+    lon_min_all = min(b[2] for b in ETAS_REGION_BOXES)
+    lon_max_all = max(b[3] for b in ETAS_REGION_BOXES)
+    gi0 = int(math.floor(lat_min_all / RISK_GRID_SIZE))
+    gi1 = int(math.ceil(lat_max_all / RISK_GRID_SIZE))
+    gj0 = int(math.floor(lon_min_all / RISK_GRID_SIZE))
+    gj1 = int(math.ceil(lon_max_all / RISK_GRID_SIZE))
+    for gi in range(gi0, gi1 + 1):
+        lat_c = (gi + 0.5) * RISK_GRID_SIZE
+        for gj in range(gj0, gj1 + 1):
+            lon_c = (gj + 0.5) * RISK_GRID_SIZE
+            if in_etas_region(lat_c, lon_c):
+                cells[(gi, gj)] = (lat_c, lon_c)
+    return cells
+
+_RISK_CELLS = _build_risk_cells()
+
+# ── プレート境界GeoJSON（サーバー側キャッシュ。活断層近接度と同様の方式）──
+PLATE_CACHE_TTL_SEC = 24 * 3600
+_plate_cache = {"data": None, "fetched_at": None}
+
+def get_plate_boundaries():
+    """プレート境界GeoJSON(PB2002)を取得する。活断層マップタブではブラウザから
+    直接fetchしているが、統合リスクマップの近接度計算にはサーバー側でも必要なため
+    同様のキャッシュ機構を用意する。"""
+    now = time.time()
+    if (_plate_cache["data"] is not None and _plate_cache["fetched_at"] is not None
+            and now - _plate_cache["fetched_at"] < PLATE_CACHE_TTL_SEC):
+        return _plate_cache["data"]
+    try:
+        gj = requests.get(PLATE_BOUNDARY_URL, timeout=20).json()
+    except Exception as e:
+        print(f"[PlateBoundary] 取得失敗: {e}")
+        return _plate_cache["data"] or {"type": "FeatureCollection", "features": []}
+    _plate_cache["data"] = gj
+    _plate_cache["fetched_at"] = now
+    return gj
+
+def _flatten_line_points(geojson, bbox=None):
+    """LineString/MultiLineStringのGeoJSONから頂点座標を (lat, lon) のリストに変換する。"""
+    pts = []
+    for feat in geojson.get("features", []):
+        geom = feat.get("geometry") or {}
+        gtype = geom.get("type")
+        coords = geom.get("coordinates", [])
+        if gtype == "LineString":
+            lines = [coords]
+        elif gtype == "MultiLineString":
+            lines = coords
+        else:
+            continue
+        for line in lines:
+            for pt in line:
+                lon, lat = pt[0], pt[1]
+                if bbox:
+                    lat_min, lat_max, lon_min, lon_max = bbox
+                    if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
+                        continue
+                pts.append((lat, lon))
+    return pts
+
+def _min_dist_km_grid(points_latlon, chunk=2500):
+    """_RISK_CELLS の各セル中心から、与えられた点群への最短距離(km、平面近似)を計算する。
+    点群数が多い場合でもメモリを抑えるためチャンク処理する。"""
+    if not points_latlon:
+        return {}
+    cell_keys = list(_RISK_CELLS.keys())
+    cell_latlon = np.array([_RISK_CELLS[k] for k in cell_keys])
+    cos_lat = np.cos(np.radians(cell_latlon[:, 0]))
+    pts = np.array(points_latlon)
+    min_dist = np.full(len(cell_keys), np.inf)
+    for start in range(0, len(pts), chunk):
+        batch = pts[start:start + chunk]
+        dlat = (cell_latlon[:, 0:1] - batch[:, 0][None, :]) * 111.0
+        dlon = (cell_latlon[:, 1:2] - batch[:, 1][None, :]) * 111.0 * cos_lat[:, None]
+        dist = np.sqrt(dlat ** 2 + dlon ** 2)
+        min_dist = np.minimum(min_dist, dist.min(axis=1))
+    return {cell_keys[i]: float(min_dist[i]) for i in range(len(cell_keys))}
+
+_fault_proximity_cache = {"grid": None, "computed_for": None}
+_plate_proximity_cache = {"grid": None, "computed_for": None}
+
+def get_fault_proximity_grid():
+    """各リスク格子セルから最寄りの活断層までの距離(km)。
+    活断層データのキャッシュが更新された時だけ再計算する（距離計算は比較的重いため）。"""
+    global _fault_proximity_cache
+    fault_data = get_japan_active_faults()
+    fetched_at = _fault_cache.get("fetched_at")
+    if (_fault_proximity_cache["grid"] is not None
+            and _fault_proximity_cache["computed_for"] == fetched_at):
+        return _fault_proximity_cache["grid"]
+    pts = _flatten_line_points(fault_data)
+    grid = _min_dist_km_grid(pts)
+    _fault_proximity_cache = {"grid": grid, "computed_for": fetched_at}
+    print(f"[統合リスク] 活断層近接度 {len(grid)}セル計算完了")
+    return grid
+
+def get_plate_proximity_grid():
+    """各リスク格子セルから最寄りのプレート境界までの距離(km)。"""
+    global _plate_proximity_cache
+    plate_data = get_plate_boundaries()
+    fetched_at = _plate_cache.get("fetched_at")
+    if (_plate_proximity_cache["grid"] is not None
+            and _plate_proximity_cache["computed_for"] == fetched_at):
+        return _plate_proximity_cache["grid"]
+    pts = _flatten_line_points(plate_data, bbox=FAULTS_BBOX)
+    grid = _min_dist_km_grid(pts)
+    _plate_proximity_cache = {"grid": grid, "computed_for": fetched_at}
+    print(f"[統合リスク] プレート境界近接度 {len(grid)}セル計算完了")
+    return grid
+
+def _risk_etas_raw(etas_grid_scores):
+    """ETASの細かい格子(GRID_SIZE)を統合リスク格子(RISK_GRID_SIZE)に集約(合算)する。"""
+    from collections import defaultdict
+    raw = defaultdict(float)
+    for (fgi, fgj), score in etas_grid_scores.items():
+        lat = fgi * GRID_SIZE; lon = fgj * GRID_SIZE
+        gi = int(math.floor(lat / RISK_GRID_SIZE)); gj = int(math.floor(lon / RISK_GRID_SIZE))
+        if (gi, gj) in _RISK_CELLS:
+            raw[(gi, gj)] += score
+    return dict(raw)
+
+def _risk_bvalue_raw(bvalue_grid):
+    """b値格子(BVALUE_GRID_SIZE、より粗い)を統合リスク格子に割り当てる。"""
+    raw = {}
+    for (bgi, bgj), info in bvalue_grid.items():
+        lat0 = bgi * BVALUE_GRID_SIZE; lon0 = bgj * BVALUE_GRID_SIZE
+        gi0 = int(math.floor(lat0 / RISK_GRID_SIZE))
+        gi1 = int(math.floor((lat0 + BVALUE_GRID_SIZE) / RISK_GRID_SIZE))
+        gj0 = int(math.floor(lon0 / RISK_GRID_SIZE))
+        gj1 = int(math.floor((lon0 + BVALUE_GRID_SIZE) / RISK_GRID_SIZE))
+        for gi in range(gi0, gi1 + 1):
+            for gj in range(gj0, gj1 + 1):
+                if (gi, gj) in _RISK_CELLS:
+                    if (gi, gj) in raw:
+                        raw[(gi, gj)] = (raw[(gi, gj)] + info["b"]) / 2
+                    else:
+                        raw[(gi, gj)] = info["b"]
+    return raw
+
+def _risk_pressure_raw():
+    """AMeDAS海面気圧の「地域平均からの偏差」を最寄り観測点からセルへ割り当てる。"""
+    global _amedas_cache
+    now = time.time()
+    if _amedas_cache["data"] and now - _amedas_cache["ts"] < AMEDAS_CACHE_SEC:
+        cached = _amedas_cache["data"]
+        table, obs_data = cached["table"], cached["obs"]
+    else:
+        table = _fetch_amedas_table(); obs_data, time_label = _fetch_amedas_latest()
+        _amedas_cache = {"data": {"table": table, "obs": obs_data, "label": time_label}, "ts": now}
+
+    def _gv(obs, key):
+        raw = obs.get(key)
+        return raw[0] if isinstance(raw, list) and len(raw) > 0 and raw[0] is not None else None
+
+    pts, vals = [], []
+    for sid, obs in obs_data.items():
+        info = table.get(sid)
+        if not info: continue
+        pres = _gv(obs, "normalPressure")
+        if pres is None: continue
+        pts.append((info["lat"], info["lon"])); vals.append(pres)
+    if not pts:
+        return {}
+    mean_p = float(np.mean(vals))
+    cell_keys = list(_RISK_CELLS.keys())
+    cell_latlon = np.array([_RISK_CELLS[k] for k in cell_keys])
+    pts_arr = np.array(pts); vals_arr = np.array(vals)
+    cos_lat = np.cos(np.radians(cell_latlon[:, 0]))
+    dlat = (cell_latlon[:, 0:1] - pts_arr[:, 0][None, :]) * 111.0
+    dlon = (cell_latlon[:, 1:2] - pts_arr[:, 1][None, :]) * 111.0 * cos_lat[:, None]
+    dist = np.sqrt(dlat ** 2 + dlon ** 2)
+    nearest_idx = np.argmin(dist, axis=1)
+    dev = np.abs(vals_arr[nearest_idx] - mean_p)
+    return {cell_keys[i]: float(dev[i]) for i in range(len(cell_keys))}
+
+def _percentile_rank_map(raw_map, invert=False):
+    """セルごとのraw値を、他セルとの相対順位(0〜1、大きいほど1)に変換する。
+    invert=Trueならraw値が小さいほど1に近くなる（b値・断層/プレート距離用）。"""
+    if not raw_map:
+        return {}
+    keys = list(raw_map.keys())
+    vals = np.array([raw_map[k] for k in keys], dtype=float)
+    order = vals.argsort()
+    ranks = np.empty(len(vals))
+    ranks[order] = np.arange(len(vals))
+    ranks = ranks / (len(vals) - 1) if len(vals) > 1 else np.array([0.5] * len(vals))
+    if invert:
+        ranks = 1.0 - ranks
+    return {keys[i]: float(ranks[i]) for i in range(len(keys))}
+
+def compute_risk_grid(etas_grid_scores, bvalue_grid):
+    """統合リスクマップ用に、各データソースのセルごとの正規化スコア(0〜1)と
+    元データ値をまとめたセル一覧を返す。重み付け合成はフロントエンド(JS)側で行い、
+    チェックボックスの選択変更に即座に反映できるようにする。"""
+    etas_raw     = _risk_etas_raw(etas_grid_scores)
+    bvalue_raw   = _risk_bvalue_raw(bvalue_grid)
+    fault_raw    = get_fault_proximity_grid()
+    plate_raw    = get_plate_proximity_grid()
+    pressure_raw = _risk_pressure_raw()
+
+    etas_rank     = _percentile_rank_map(etas_raw, invert=False)
+    bvalue_rank   = _percentile_rank_map(bvalue_raw, invert=True)    # 低b値 = 高リスク
+    fault_rank    = _percentile_rank_map(fault_raw, invert=True)     # 近い = 高リスク
+    plate_rank    = _percentile_rank_map(plate_raw, invert=True)     # 近い = 高リスク
+    pressure_rank = _percentile_rank_map(pressure_raw, invert=False)
+
+    cells = []
+    for key, (lat, lon) in _RISK_CELLS.items():
+        comp = {}
+        if key in etas_rank:
+            comp["etas"] = {"s": round(etas_rank[key], 4), "r": round(etas_raw[key], 4)}
+        if key in bvalue_rank:
+            comp["bvalue"] = {"s": round(bvalue_rank[key], 4), "r": round(bvalue_raw[key], 3)}
+        if key in fault_rank:
+            comp["fault"] = {"s": round(fault_rank[key], 4), "r": round(fault_raw[key], 1)}
+        if key in plate_rank:
+            comp["plate"] = {"s": round(plate_rank[key], 4), "r": round(plate_raw[key], 1)}
+        if key in pressure_rank:
+            comp["pressure"] = {"s": round(pressure_rank[key], 4), "r": round(pressure_raw[key], 2)}
+        if comp:
+            cells.append({"lat": round(lat, 3), "lon": round(lon, 3), "c": comp})
+    return cells
+
+def render_riskmap(risk_cells, updated_str):
+    cells_js = json.dumps(risk_cells, ensure_ascii=False)
+    weights_js = json.dumps(RISK_DEFAULT_WEIGHTS)
+    labels_js = json.dumps(RISK_LABELS, ensure_ascii=False)
+    gs = RISK_GRID_SIZE
+    n_cells = len(risk_cells)
+    w = RISK_DEFAULT_WEIGHTS
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+{LEAFLET_CDN}
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{display:flex;height:100vh;background:#0f172a;color:#fff;font-family:"Helvetica Neue",Arial,sans-serif;overflow:hidden}}
+#panel{{width:300px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;overflow-y:auto;padding:14px}}
+#panel h2{{font-size:14px;color:#f3f4f6;margin-bottom:4px}}
+#panel p.sub{{font-size:11px;color:#6b7280;margin-bottom:12px;line-height:1.6}}
+.sec{{margin-bottom:16px}}
+.sec h3{{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid #1f2937;padding-bottom:4px}}
+.preset-row{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:4px}}
+.preset-btn{{flex:1 1 calc(50% - 6px);padding:6px 4px;font-size:11px;font-weight:600;cursor:pointer;
+    border:1px solid #374151;border-radius:6px;background:#1f2937;color:#9ca3af;text-align:center}}
+.preset-btn:hover{{background:#374151;color:#f3f4f6}}
+.preset-btn.on{{background:linear-gradient(135deg,#2563eb,#7c3aed);color:#fff;border-color:transparent}}
+.chk-row{{display:flex;align-items:center;gap:8px;padding:6px 4px;border-radius:5px;font-size:12px}}
+.chk-row:hover{{background:#161b22}}
+.chk-row.disabled{{opacity:0.45}}
+.chk-row input{{width:15px;height:15px;flex-shrink:0}}
+.chk-row .clabel{{flex:1;color:#e5e7eb}}
+.chk-row .cweight{{font-size:10px;color:#6b7280}}
+.chk-row .cbadge{{font-size:9px;padding:1px 5px;border-radius:3px;background:#374151;color:#9ca3af}}
+#cellCount{{font-size:11px;color:#9ca3af;margin-top:10px}}
+#cellCount span{{color:#60a5fa;font-weight:700}}
+.note{{font-size:10.5px;color:#6b7280;line-height:1.7;margin-top:10px}}
+#mp{{flex:1;overflow:hidden;position:relative}}
+#map{{width:100%;height:100%}}
+#lg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:10px 13px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.9;color:#f3f4f6}}
+#hdr{{position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:1000;
+    background:rgba(17,24,39,.92);padding:6px 16px;border-radius:6px;font-size:11px;color:#9ca3af}}
+.pop-title{{font-weight:700;font-size:13px;margin-bottom:4px}}
+.pop-row{{display:flex;justify-content:space-between;gap:10px;font-size:11px;padding:2px 0;border-bottom:1px dashed #374151}}
+</style></head><body>
+<div id="panel">
+  <h2>統合リスクマップ <span style="font-size:10px;color:#fbbf24">β</span></h2>
+  <p class="sub">複数の地震関連データを統合した相対的な地震リスク指数です。地震の発生確率ではなく、地域ごとのリスクの高低を比較するための指標です。</p>
+
+  <div class="sec">
+    <h3>プリセット</h3>
+    <div class="preset-row">
+      <button class="preset-btn on" data-preset="standard" onclick="applyPreset('standard')">標準</button>
+      <button class="preset-btn" data-preset="all" onclick="applyPreset('all')">全データ</button>
+      <button class="preset-btn" data-preset="geo" onclick="applyPreset('geo')">地質</button>
+      <button class="preset-btn" data-preset="crust" onclick="applyPreset('crust')">地殻変動</button>
+      <button class="preset-btn" data-preset="custom" onclick="applyPreset('custom')">カスタム</button>
+    </div>
+  </div>
+
+  <div class="sec">
+    <h3>使用データ（チェックで選択）</h3>
+    <div class="chk-row"><input type="checkbox" id="chk_etas" checked onchange="onToggle('etas')">
+      <span class="clabel">ETAS（地震活動度）</span><span class="cweight">w={w['etas']}</span></div>
+    <div class="chk-row"><input type="checkbox" id="chk_bvalue" checked onchange="onToggle('bvalue')">
+      <span class="clabel">b値（Gutenberg-Richter）</span><span class="cweight">w={w['bvalue']}</span></div>
+    <div class="chk-row"><input type="checkbox" id="chk_fault" checked onchange="onToggle('fault')">
+      <span class="clabel">活断層近接度</span><span class="cweight">w={w['fault']}</span></div>
+    <div class="chk-row"><input type="checkbox" id="chk_plate" checked onchange="onToggle('plate')">
+      <span class="clabel">プレート境界近接度</span><span class="cweight">w={w['plate']}</span></div>
+    <div class="chk-row"><input type="checkbox" id="chk_pressure" onchange="onToggle('pressure')">
+      <span class="clabel">気圧偏差</span><span class="cweight">w={w['pressure']}</span></div>
+    <div class="chk-row disabled"><input type="checkbox" disabled>
+      <span class="clabel">TEC（電離圏）</span><span class="cbadge">近日公開</span></div>
+    <div class="chk-row disabled"><input type="checkbox" disabled>
+      <span class="clabel">GNSS（地殻変動）</span><span class="cbadge">近日公開</span></div>
+  </div>
+
+  <div id="cellCount">表示中のセル数: <span id="cellN">0</span> / {n_cells}</div>
+  <div class="note">
+    重みは選択されたデータのみを使い自動的に再正規化されます。<br>
+    セルをクリックすると統合リスク指数と各データの寄与度（内訳）を表示します。<br>
+    「地殻変動」プリセットは、GNSS実装までの暫定的な代理指標としてプレート境界近接度を使用しています。
+  </div>
+</div>
+<div id="mp">
+  <div id="map"></div>
+  <div id="hdr">更新: {updated_str}</div>
+  <div id="lg">
+    <b>統合リスクレベル</b><br>
+    <span style="color:#7f1d1d">■</span> Lv5（最高）<br>
+    <span style="color:#dc2626">■</span> Lv4<br>
+    <span style="color:#f97316">■</span> Lv3<br>
+    <span style="color:#facc15">■</span> Lv2<br>
+    <span style="color:#4ade80">■</span> Lv1（最低）<br>
+    <hr style="border-color:#374151;margin:5px 0">
+    <small>選択データの相対順位を重み付け合成した指数<br>（発生確率を意味するものではありません）</small>
+  </div>
+</div>
+<script>
+var CELLS = {cells_js};
+var WEIGHTS = {weights_js};
+var LABELS = {labels_js};
+var GS = {gs};
+var RISK_COLOR = {{5:'#7f1d1d',4:'#dc2626',3:'#f97316',2:'#facc15',1:'#4ade80'}};
+var KEYS = ['etas','bvalue','fault','plate','pressure'];
+
+var PRESETS = {{
+  standard: {{etas:true, bvalue:true, fault:true, plate:true, pressure:false}},
+  all:      {{etas:true, bvalue:true, fault:true, plate:true, pressure:true}},
+  geo:      {{etas:false,bvalue:false,fault:true, plate:true, pressure:false}},
+  crust:    {{etas:false,bvalue:false,fault:false,plate:true, pressure:false}}
+}};
+var selected = Object.assign({{}}, PRESETS.standard);
+
+var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
+{DARK_TILE}
+{GEOJSON_JS}
+
+var rectLayer = null;
+var popup = L.popup();
+
+function applyCheckboxesFromSelected(){{
+  KEYS.forEach(function(k){{ document.getElementById('chk_'+k).checked = !!selected[k]; }});
+}}
+function setActivePreset(name){{
+  document.querySelectorAll('.preset-btn').forEach(function(b){{
+    b.classList.toggle('on', b.dataset.preset===name);
+  }});
+}}
+function applyPreset(name){{
+  if(name !== 'custom'){{
+    selected = Object.assign({{}}, PRESETS[name]);
+    applyCheckboxesFromSelected();
+  }}
+  setActivePreset(name);
+  redraw();
+}}
+function onToggle(key){{
+  selected[key] = document.getElementById('chk_'+key).checked;
+  setActivePreset('custom');
+  redraw();
+}}
+
+function computeComposite(cell){{
+  var wsum=0, ssum=0, used=[];
+  KEYS.forEach(function(k){{
+    if(selected[k] && cell.c[k]){{
+      var wk = WEIGHTS[k];
+      wsum += wk; ssum += wk*cell.c[k].s; used.push(k);
+    }}
+  }});
+  if(wsum<=0) return null;
+  return {{score: ssum/wsum, used: used, wsum: wsum}};
+}}
+function levelOf(score){{
+  if(score>=0.8) return 5;
+  if(score>=0.6) return 4;
+  if(score>=0.4) return 3;
+  if(score>=0.2) return 2;
+  return 1;
+}}
+
+function showDetail(cell, comp, lv){{
+  var rows = comp.used.map(function(k){{
+    var d = cell.c[k];
+    var nw = WEIGHTS[k]/comp.wsum;
+    var contrib = nw*d.s;
+    return '<div class="pop-row"><span>'+LABELS[k]+'</span>'+
+      '<span>score='+d.s.toFixed(2)+' raw='+d.r+' / 寄与='+contrib.toFixed(3)+'</span></div>';
+  }}).join('');
+  var html = '<div class="pop-title">統合リスク指数: '+comp.score.toFixed(3)+' (Lv'+lv+')</div>'+
+    '<div style="font-size:10px;color:#9ca3af;margin-bottom:6px">緯度'+cell.lat.toFixed(2)+' / 経度'+cell.lon.toFixed(2)+'</div>'+
+    rows +
+    '<div style="font-size:9px;color:#6b7280;margin-top:6px">score=相対順位(0-1) raw=元データ値(ETAS指数/b値/距離km/気圧偏差hPa) 寄与=重み正規化後の寄与度</div>';
+  popup.setLatLng([cell.lat, cell.lon]).setContent(html).openOn(map);
+}}
+
+function redraw(){{
+  if(rectLayer) map.removeLayer(rectLayer);
+  rectLayer = L.layerGroup().addTo(map);
+  var shown = 0;
+  CELLS.forEach(function(cell){{
+    var comp = computeComposite(cell);
+    if(!comp) return;
+    shown++;
+    var lv = levelOf(comp.score);
+    var rect = L.rectangle(
+      [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
+      {{color:null, weight:0, fill:true, fillColor:RISK_COLOR[lv], fillOpacity:0.6}}
+    );
+    rect.on('click', function(){{ showDetail(cell, comp, lv); }});
+    rect.addTo(rectLayer);
+  }});
+  document.getElementById('cellN').textContent = shown;
+}}
+
+redraw();
+</script></body></html>"""
+
+
+# ══════════════════════════════════════════════════════
 # メインページ（タブシェル）
 # ══════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════
@@ -1970,28 +2419,32 @@ SHELL_HTML = """<!DOCTYPE html>
       <span class="label">活断層・プレート境界</span>
       <span class="badge">地質</span>
     </button>
+    <button class="tab-btn" onclick="sw(4)">
+      <span class="label">統合リスクマップ</span>
+      <span class="badge">β</span>
+    </button>
 
     <div class="sep"></div>
     <div class="group-title">地球物理データ</div>
-    <button class="tab-btn" onclick="sw(4)">
+    <button class="tab-btn" onclick="sw(5)">
       <span class="label">TEC</span>
       <span class="badge">P5+</span>
     </button>
-    <button class="tab-btn" onclick="sw(5)">
+    <button class="tab-btn" onclick="sw(6)">
       <span class="label">GNSS変位</span>
       <span class="badge">P5</span>
     </button>
 
     <div class="sep"></div>
     <div class="group-title">気象</div>
-    <button class="tab-btn" onclick="sw(6)">
+    <button class="tab-btn" onclick="sw(7)">
       <span class="label">海面気圧</span>
       <span class="badge">AMeDAS</span>
     </button>
 
     <div class="sep"></div>
     <div class="group-title">ログ</div>
-    <button class="tab-btn" onclick="sw(7)">
+    <button class="tab-btn" onclick="sw(8)">
       <span class="label">スナップショット</span>
       <span class="badge">1h</span>
     </button>
@@ -2007,10 +2460,11 @@ SHELL_HTML = """<!DOCTYPE html>
     <iframe id="f5" src=""></iframe>
     <iframe id="f6" src=""></iframe>
     <iframe id="f7" src=""></iframe>
+    <iframe id="f8" src=""></iframe>
   </div>
   <script>
-    var URLS=['history','etas','bvalue','faultmap','tec','gnss','pressure','snapshots'];
-    var loaded=[true,false,false,false,false,false,false,false];
+    var URLS=['history','etas','bvalue','faultmap','riskmap','tec','gnss','pressure','snapshots'];
+    var loaded=[true,false,false,false,false,false,false,false,false];
     function sw(idx){
       document.querySelectorAll('.tab-btn').forEach(function(b,i){b.classList.toggle('active',i===idx)});
       document.querySelectorAll('iframe').forEach(function(f,i){f.classList.toggle('active',i===idx)});
@@ -2110,6 +2564,9 @@ def tab(name):
     elif name == "etas":     html = render_etas(data["etas"], data["all"], upd)
     elif name == "bvalue":   html = render_bvalue(data["bvalue"], data["all"], upd)
     elif name == "faultmap": html = render_faultmap(upd)
+    elif name == "riskmap":
+        risk_cells = compute_risk_grid(data["etas"], data["bvalue"])
+        html = render_riskmap(risk_cells, upd)
     elif name == "tec":      html = render_tec(upd)
     elif name == "gnss":     html = render_gnss(upd)
     elif name == "pressure": html = render_pressure(upd)
