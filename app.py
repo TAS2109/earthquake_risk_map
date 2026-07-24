@@ -1288,21 +1288,276 @@ CELLS.forEach(function(c){{
 # ══════════════════════════════════════════════════════
 # TAB 4: TEC（電離圏全電子数）
 # ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
+# TEC 実データ取得（NICT準リアルタイムTECマップの色逆変換／実験的）
+# ══════════════════════════════════════════════════════
+# 方針:
+#   NICTはTEC数値を返すAPIを公開していないため、公開されている10分間隔の
+#   準リアルタイムTECマップ(PNG画像)を取得し、画像内のカラーバー（凡例）から
+#   「ピクセル色 → TEC値(TECU)」のルックアップテーブル(LUT)を作成、
+#   マップ本体の各ピクセルを最近傍色マッチングで数値に逆変換する。
+#   画像圧縮・アンチエイリアシング・海岸線オーバーレイなどにより誤差が出るため、
+#   あくまで「傾向を見るための近似値」として扱うこと（学術的な精度は無い）。
+#
+# ★★★ 要キャリブレーション ★★★
+#   下記の座標・値域は実際のNICT画像を目視確認した上で設定する必要がある。
+#   1) calibrate_tec.py を一度実行して tec_raw.png / tec_grid.png を保存する
+#   2) 地図本体が画像のどのピクセル範囲(x0,y0)-(x1,y1)にあり、それが
+#      どの緯度経度範囲(lat0,lon0)-(lat1,lon1)に対応するかを読み取る
+#   3) カラーバー（凡例）が画像のどのピクセル範囲にあり、両端が何TECUに
+#      対応するかを読み取る
+#   4) 下のTEC_CALIBRATIONを埋める。未設定(None)のままだとTEC実データ取得は
+#      スキップされ、フォールバックの画像埋め込み表示のみになる。
+#
+# ── 画像URLについて ──
+# NICT QR_GEONETのTECマップ画像はファイル名に生成時刻が入っており、固定URLでは
+# 参照できない（例: .../AMAP/2026/205/05_30_0724_2026_Amap.jpg
+#   = 2026年通日205日(7/24)の 05:30 生成分, "AMAP"=TEC(全電子数)本体マップ）。
+# 10分間隔で生成されるが、①タイムゾーンがUTCかJSTか、②実際の公開までの遅延(分)が
+# 不明なため、直近の「その場で組み立てたURL」を新しい方から順に何個か試して、
+# 200が返ってきたものを採用する方式にする。一度成功した(タイムゾーン,遅延)は
+# 次回以降の最有力候補として先頭に回すことで、通常は1〜2回のリクエストで済む。
+TEC_URL_TEMPLATE = ("https://aer-nc-web.nict.go.jp/GPS/QR_GEONET/AMAP/"
+                     "{year}/{doy:03d}/{hh}_{mm}_{month:02d}{day:02d}_{year}_Amap.jpg")
+TEC_URL_STEP_MIN      = 10   # 生成間隔
+TEC_URL_LOOKBACK_MIN  = 90   # どこまで過去に遡って候補を試すか
+_tec_url_pref = {"tz": "jst", "lag_min": 0}   # 直近成功した組み合わせ（起動時はJST・遅延0から）
+
+#   ★ 2026/07/24 実測キャリブレーション済み ★
+#   ユーザーが実際にNICT画像(AMAP)を保存したスクリーンショット(368x368px)を元に、
+#   緯度経度目盛りラベル・カラーバー目盛りラベルのピクセル位置を回帰分析して算出。
+#   ただしそのスクリーンショットはEXIFにGhostscript/MuPDF系のICCプロファイルが
+#   付与されており、requests.get()で直接取得する生JPEGとは解像度が異なる可能性が
+#   高いため、ピクセル座標は絶対値ではなく「画像サイズに対する比率(0〜1)」で
+#   保持し、_build_tec_lut()/_decode_tec_grid() 内で実際に取得した画像の
+#   width/heightに掛けて絶対ピクセルへ変換する（多少の解像度差があっても崩れない）。
+#   ズレが大きい場合は、実際にRender/ローカルで取得された tec_raw.png を確認し、
+#   下記の *_frac 値を微調整すること。
+TEC_CALIBRATION = {
+    "map_px_box_frac":    (0.2554, 0.2065, 0.7446, 0.8777),  # (x0,y0,x1,y1) 比率。地図本体領域
+    "map_latlon_box":     (44.0, 128.0, 24.0, 144.0),  # (lat0, lon0, lat1, lon1)
+                                  #   lat0=画像上端(北)の緯度, lat1=画像下端(南)の緯度
+    "legend_px_box_frac": (0.8478, 0.0978, 0.8696, 0.4973),  # (x0,y0,x1,y1) 比率。カラーバー領域
+    "legend_orientation": "vertical",  # "vertical"(縦棒。上端がlegend_value_range[0]) か "horizontal"
+    "legend_value_range": (50.0, 0.0),  # (上端/左端の値, 下端/右端の値)
+    "bg_color_max_dist":  18.0,  # LUTとの色距離がこれ以上なら「凡例外」として除外(背景/海岸線/文字)
+}
+
+def _frac_box_to_px(frac_box, w, h):
+    """(x0,y0,x1,y1)の比率(0〜1)を、実際の画像サイズ(w,h)に応じた絶対ピクセルへ変換する。"""
+    x0f, y0f, x1f, y1f = frac_box
+    return (x0f * w, y0f * h, x1f * w, y1f * h)
+
+TEC_FETCH_INTERVAL_SEC = 600      # 元データが10分間隔のため合わせる
+TEC_HISTORY_MAX        = 6 * 24   # 直近24時間分(10分間隔換算)を基準値計算に保持
+
+_tec_lock    = threading.Lock()
+_tec_cache   = {"grid": None, "ts": 0.0, "updated": None}
+_tec_history = []   # [(epoch_sec, {(gi,gj): value, ...}), ...] 古い→新しい順
+
+def _tec_calibrated():
+    c = TEC_CALIBRATION
+    return all(c.get(k) is not None for k in
+               ("map_px_box_frac", "map_latlon_box", "legend_px_box_frac", "legend_value_range"))
+
+def _tec_build_url(dt):
+    doy = dt.timetuple().tm_yday
+    return TEC_URL_TEMPLATE.format(year=dt.year, doy=doy, hh=f"{dt.hour:02d}",
+                                    mm=f"{dt.minute:02d}", month=dt.month, day=dt.day)
+
+def _tec_candidate_list():
+    """(tz, lag_min, url) の候補リストを、前回成功した組み合わせを最優先にして返す。"""
+    now_utc = datetime.now(timezone.utc)
+    now_jst = now_utc.astimezone(JST)
+    step = TEC_URL_STEP_MIN
+    lags = list(range(0, TEC_URL_LOOKBACK_MIN + 1, step))
+
+    def _rounded(base):
+        m = (base.minute // step) * step
+        return base.replace(minute=m, second=0, microsecond=0)
+
+    bases = {"jst": _rounded(now_jst), "utc": _rounded(now_utc)}
+    pref_tz, pref_lag = _tec_url_pref["tz"], _tec_url_pref["lag_min"]
+
+    ordered = []
+    # 前回成功した組み合わせを最優先
+    if pref_lag in lags:
+        ordered.append((pref_tz, pref_lag))
+    for tz in (pref_tz, "jst" if pref_tz == "utc" else "utc"):
+        for lag in lags:
+            if (tz, lag) not in ordered:
+                ordered.append((tz, lag))
+
+    out = []
+    for tz, lag in ordered:
+        dt = bases[tz] - timedelta(minutes=lag)
+        out.append((tz, lag, _tec_build_url(dt)))
+    return out
+
+def _fetch_tec_image():
+    """NICT準リアルタイムTECマップ(AMAP)のJPEGを、時刻候補を順に試して取得する。失敗時はNone。"""
+    global _tec_url_pref
+    try:
+        from PIL import Image
+    except ImportError:
+        print("[TEC] Pillowが未インストールです（pip install Pillow --break-system-packages）")
+        return None
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SeismoApp/5.0; research use)"}
+    for tz, lag, url in _tec_candidate_list():
+        try:
+            resp = requests.get(url, timeout=10, headers=headers)
+            if resp.status_code == 200 and resp.content:
+                _tec_url_pref = {"tz": tz, "lag_min": lag}
+                print(f"[TEC] 画像取得成功: {url}")
+                return Image.open(io.BytesIO(resp.content)).convert("RGB")
+        except Exception:
+            continue
+    print("[TEC] 候補URLすべて404/失敗でした（TEC_URL_TEMPLATEやAMAP以外の"
+          "命名パターンに変わっている可能性があります）")
+    return None
+
+def _build_tec_lut(img):
+    """カラーバー領域を等間隔サンプリングして (R,G,B)→TEC値 のLUTを作る。"""
+    arr = np.asarray(img)
+    h, w = arr.shape[0], arr.shape[1]
+    x0, y0, x1, y1 = _frac_box_to_px(TEC_CALIBRATION["legend_px_box_frac"], w, h)
+    v_start, v_end = TEC_CALIBRATION["legend_value_range"]
+    n_samples = 64
+    lut_colors, lut_values = [], []
+    for i in range(n_samples):
+        t = i / (n_samples - 1)
+        if TEC_CALIBRATION["legend_orientation"] == "vertical":
+            py = int(round(y0 + t * (y1 - y0))); px = int(round((x0 + x1) / 2))
+        else:
+            px = int(round(x0 + t * (x1 - x0))); py = int(round((y0 + y1) / 2))
+        px = min(max(px, 0), w - 1)
+        py = min(max(py, 0), h - 1)
+        lut_colors.append(arr[py, px].astype(float))
+        lut_values.append(v_start + t * (v_end - v_start))
+    return np.array(lut_colors), np.array(lut_values)
+
+def _decode_pixels(pixels, lut_colors, lut_values, max_dist):
+    """pixels: (N,3)。各ピクセルをLUTの最近傍色にマッチングしてTEC値を返す。
+    色距離がmax_dist以上のピクセルはNaN（背景/海岸線/文字などとして除外）。"""
+    diff = pixels[:, None, :] - lut_colors[None, :, :]
+    dist = np.sqrt((diff ** 2).sum(axis=2))
+    nearest = dist.argmin(axis=1)
+    min_dist = dist[np.arange(len(pixels)), nearest]
+    values = lut_values[nearest]
+    return np.where(min_dist < max_dist, values, np.nan)
+
+def _decode_tec_grid(img):
+    """画像全体をRISK_CELLSの各セルに割り当てて中央値TEC値を計算する。"""
+    lut_colors, lut_values = _build_tec_lut(img)
+    arr = np.asarray(img).astype(float)
+    h, w = arr.shape[0], arr.shape[1]
+    mx0, my0, mx1, my1 = _frac_box_to_px(TEC_CALIBRATION["map_px_box_frac"], w, h)
+    lat0, lon0, lat1, lon1 = TEC_CALIBRATION["map_latlon_box"]
+    max_dist = TEC_CALIBRATION["bg_color_max_dist"]
+
+    def _px(lat, lon):
+        xf = (lon - lon0) / (lon1 - lon0)
+        yf = (lat - lat0) / (lat1 - lat0)
+        return (mx0 + xf * (mx1 - mx0), my0 + yf * (my1 - my0))
+
+    grid = {}
+    for (gi, gj), (lat_c, lon_c) in _RISK_CELLS.items():
+        if not (min(lat0, lat1) <= lat_c <= max(lat0, lat1) and
+                min(lon0, lon1) <= lon_c <= max(lon0, lon1)):
+            continue
+        half = RISK_GRID_SIZE / 2
+        xs, ys = [], []
+        for lat in (lat_c - half, lat_c + half):
+            for lon in (lon_c - half, lon_c + half):
+                px, py = _px(lat, lon)
+                xs.append(px); ys.append(py)
+        x_lo, x_hi = int(max(min(xs), 0)), int(min(max(xs), arr.shape[1] - 1))
+        y_lo, y_hi = int(max(min(ys), 0)), int(min(max(ys), arr.shape[0] - 1))
+        if x_hi <= x_lo or y_hi <= y_lo:
+            continue
+        block = arr[y_lo:y_hi + 1, x_lo:x_hi + 1].reshape(-1, 3)
+        if block.shape[0] == 0:
+            continue
+        vals = _decode_pixels(block, lut_colors, lut_values, max_dist)
+        vals = vals[~np.isnan(vals)]
+        if vals.size == 0:
+            continue
+        grid[(gi, gj)] = float(np.median(vals))
+    return grid
+
+def update_tec_cache():
+    """TEC画像を取得・デコードしてキャッシュを更新する。バックグラウンドループから呼ぶ。"""
+    global _tec_cache, _tec_history
+    if not _tec_calibrated():
+        print("[TEC] 未キャリブレーションのためスキップ（TEC_CALIBRATIONを設定してください）")
+        return
+    img = _fetch_tec_image()
+    if img is None:
+        return
+    grid = _decode_tec_grid(img)
+    if not grid:
+        print("[TEC] デコード結果が空でした（キャリブレーション値を確認してください）")
+        return
+    now = time.time()
+    with _tec_lock:
+        _tec_cache = {"grid": grid, "ts": now,
+                      "updated": datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")}
+        _tec_history.append((now, grid))
+        cutoff = now - TEC_HISTORY_MAX * TEC_FETCH_INTERVAL_SEC
+        _tec_history = [(t, g) for t, g in _tec_history if t >= cutoff]
+    print(f"[TEC] 更新完了 セル数:{len(grid)}")
+
+def _risk_tec_raw():
+    """各セルについて「現在のTEC値 − 直近履歴の平均値」の絶対偏差を返す。
+    急激な増減を電離圏擾乱の目安として扱うが、学術的に確立した指標ではない点に注意。"""
+    with _tec_lock:
+        cur = _tec_cache["grid"]
+        hist = list(_tec_history)
+    if not cur or len(hist) < 3:
+        return {}
+    baseline = {}
+    for _, g in hist[:-1]:
+        for k, v in g.items():
+            baseline.setdefault(k, []).append(v)
+    raw = {}
+    for k, v in cur.items():
+        if k in baseline and len(baseline[k]) >= 2:
+            raw[k] = abs(v - float(np.mean(baseline[k])))
+    return raw
+
+
 def render_tec(updated_str):
-    # NICT SCIDASの最新TECマップをiframe埋め込み
-    # 注: 直接埋め込めない場合はリンクとサムネイル表示に切り替え
     nict_url = "https://aer-nc-web.nict.go.jp/iono/GEONET/latest_map.png"
     now_jst = datetime.now(timezone(timedelta(hours=9)))
     date_str = now_jst.strftime("%Y年%m月%d日 %H:%M JST")
 
+    with _tec_lock:
+        grid = _tec_cache["grid"]
+        tec_updated = _tec_cache["updated"]
+
+    if not grid:
+        # 未キャリブレーション/未取得時は、従来どおり画像埋め込み＋リンク集のフォールバック表示
+        status_html = ('<span style="color:#fbbf24;font-weight:700">未取得</span> — '
+                        'TEC_CALIBRATION が未設定か、直近の取得に失敗しています。'
+                        '下の画像・リンクを参考値としてご利用ください。')
+        cells_js = "[]"
+    else:
+        status_html = (f'<span style="color:#34d399;font-weight:700">取得中（実験的・色逆変換）</span> '
+                        f'— セル数:{len(grid)} / 元画像更新: {tec_updated or "不明"}')
+        cells = [{"lat": round(_RISK_CELLS[k][0], 3), "lon": round(_RISK_CELLS[k][1], 3),
+                  "v": round(v, 2)} for k, v in grid.items()]
+        cells_js = json.dumps(cells, ensure_ascii=False)
+
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+{LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-serif;height:100vh;display:flex;flex-direction:column}}
+body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}}
 #hdr{{padding:12px 20px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0}}
 #hdr h2{{font-size:15px;font-weight:700;color:#f3f4f6;margin-bottom:4px}}
 #hdr p{{font-size:11px;color:#6b7280}}
 #body{{flex:1;display:flex;gap:0;overflow:hidden}}
+#map{{flex:1;min-width:0}}
 #left{{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:20px;overflow-y:auto}}
 #right{{width:280px;flex-shrink:0;background:#111827;border-left:2px solid #1f2937;padding:16px;overflow-y:auto}}
 .card{{background:#1f2937;border:1px solid #374151;border-radius:10px;padding:16px;margin-bottom:12px;width:100%;max-width:700px}}
@@ -1317,48 +1572,25 @@ body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-s
         background:#1e3a5f;color:#93c5fd;margin-right:4px;margin-bottom:4px}}
 #right h3{{font-size:13px;font-weight:700;color:#f3f4f6;margin-bottom:10px;border-bottom:1px solid #374151;padding-bottom:6px}}
 .note{{font-size:12px;color:#9ca3af;line-height:1.8;margin-bottom:12px}}
-.phase{{background:#1f2937;border-left:3px solid #7c3aed;padding:8px 10px;border-radius:0 6px 6px 0;margin-bottom:8px;font-size:11px;color:#d1d5db}}
 </style></head><body>
 <div id="hdr">
   <h2>TEC（電離圏全電子数）モニタリング</h2>
-  <p>NICT GEONET TEC / {date_str} / 更新: {updated_str}</p>
+  <p>NICT GEONET TEC / {date_str} / 更新: {updated_str} / 取得状況: {status_html}</p>
 </div>
 <div id="body">
-  <div id="left">
+  {"<div id='map'></div>" if grid else ""}
+  <div id="left" style="{'display:none' if grid else ''}">
     <div class="card">
-      <h3>NICT 最新 TEC マップ（GEONET）</h3>
-      <p>NICTが提供するGEONETベースのTECマップです。地震前後の電離圏擾乱をモニタリングします。</p>
+      <h3>NICT 最新 TEC マップ（GEONET・フォールバック表示）</h3>
+      <p>実データ（色逆変換）が未取得のため、参考として画像を埋め込んでいます。</p>
       <img src="{nict_url}" class="tec-img" alt="NICT TEC Map"
            onerror="this.style.display='none';document.getElementById('img-err').style.display='block'">
       <div id="img-err" style="display:none;padding:12px;background:#1f2937;border-radius:6px;margin-top:8px;font-size:12px;color:#9ca3af">
-        画像の直接読み込みができません（CORSポリシー）。<br>下のリンクから直接確認してください。
+        画像の直接読み込みができません（CORSポリシー）。下のリンクから直接確認してください。
       </div>
       <a href="https://aer-nc-web.nict.go.jp/iono/GEONET/" target="_blank" class="link-btn">
         NICT GEONET TECページを開く
       </a>
-    </div>
-    <div class="card">
-      <h3>その他のデータソース</h3>
-      <p>TECデータを提供する主要な機関・ツール</p>
-      <div style="margin-top:8px">
-        <a href="https://scidas.nict.go.jp/" target="_blank" class="link-btn" style="margin-bottom:6px">
-          NICT SCIDAS（宇宙天気情報）
-        </a>
-        <a href="https://www.gsi.go.jp/denshi/denshi.html" target="_blank" class="link-btn" style="background:linear-gradient(135deg,#065f46,#047857);margin-bottom:6px">
-          国土地理院 電子基準点 TEC
-        </a>
-        <a href="https://ionex.jpl.nasa.gov/" target="_blank" class="link-btn" style="background:linear-gradient(135deg,#7f1d1d,#b91c1c)">
-          JPL Global Ionosphere Maps (GIM)
-        </a>
-      </div>
-    </div>
-    <div class="card">
-      <h3>現在の取得状況</h3>
-      <p style="margin-bottom:8px">
-        <span class="badge">状態</span>
-        <span style="color:#fbbf24;font-weight:700">準備中</span> — NICT APIへの直接アクセスは今後実装予定。
-      </p>
-      <p>TECの時系列データ自動取得については、NICTのIONEX形式データ（ftp://ftp.nict.go.jp/）からの自動ダウンロードを予定しています。</p>
     </div>
   </div>
   <div id="right">
@@ -1370,8 +1602,45 @@ body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-s
       <b style="color:#fbbf24">学術的には未確立</b>。<br>
       1 TECU = 10¹⁶ el/m²
     </div>
+    <h3>この数値について</h3>
+    <div class="note">
+      NICTはTEC数値APIを公開していないため、<br>
+      公開画像のカラーバーを解析して<br>
+      色→TECUに逆変換した<b style="color:#fbbf24">近似値</b>です。<br>
+      統合リスクマップでは、直近履歴平均からの<br>
+      偏差（急な増減）をリスク成分として使用しています。
+    </div>
   </div>
 </div>
+<script>
+var cells = {cells_js};
+if (cells.length > 0) {{
+  var map = L.map('map', {{center:[36,138], zoom:5, preferCanvas:true}});
+  {DARK_TILE}
+  {GEOJSON_JS}
+  var vals = cells.map(c => c.v);
+  var vmin = Math.min.apply(null, vals), vmax = Math.max.apply(null, vals);
+  function colorFor(v) {{
+    var t = vmax > vmin ? (v - vmin) / (vmax - vmin) : 0.5;
+    var r = Math.round(255 * t), b = Math.round(255 * (1 - t));
+    return 'rgb(' + r + ',80,' + b + ')';
+  }}
+  var half = {RISK_GRID_SIZE} / 2;
+  cells.forEach(function(c) {{
+    L.rectangle([[c.lat - half, c.lon - half], [c.lat + half, c.lon + half]], {{
+      color: colorFor(c.v), weight: 0, fillColor: colorFor(c.v), fillOpacity: 0.55
+    }}).bindTooltip('TEC(近似): ' + c.v + ' TECU').addTo(map);
+  }});
+  var legend = L.control({{position:'bottomleft'}});
+  legend.onAdd = function() {{
+    var d = L.DomUtil.create('div');
+    d.style.cssText = 'background:rgba(17,24,39,.92);padding:10px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;color:#f3f4f6;line-height:1.8';
+    d.innerHTML = '<b>TEC（色逆変換・近似値）</b><br>低 <span style="color:#6699ff">■</span> 〜 高 <span style="color:#ff6666">■</span><br><small>範囲: ' + vmin.toFixed(1) + ' 〜 ' + vmax.toFixed(1) + ' TECU相当</small>';
+    return d;
+  }};
+  legend.addTo(map);
+}}
+</script>
 </body></html>"""
 
 
@@ -1863,14 +2132,15 @@ RISK_GRID_SIZE = 0.5   # 統合リスクマップの共通格子（ETAS/b値よ�
 # 各データソースの既定の重み（合計1.0。未選択/データ欠損のセルは
 # 選択されている項目だけで自動的に再正規化される）
 RISK_DEFAULT_WEIGHTS = {
-    "etas":     0.60,
+    "etas":     0.55,
     "bvalue":   0.15,
     "fault":    0.10,
-    "plate":    0.10,
+    "plate":    0.05,
     "pressure": 0.05,
+    "tec":      0.10,
 }
 RISK_LABELS = {"etas": "ETAS", "bvalue": "b値", "fault": "活断層",
-               "plate": "プレート境界", "pressure": "気圧"}
+               "plate": "プレート境界", "pressure": "気圧", "tec": "TEC(電離圏・実験的)"}
 
 def _build_risk_cells():
     """L字型のETAS計算対象範囲を RISK_GRID_SIZE 格子で分割し、
@@ -2077,12 +2347,14 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid):
     fault_raw    = get_fault_proximity_grid()
     plate_raw    = get_plate_proximity_grid()
     pressure_raw = _risk_pressure_raw()
+    tec_raw      = _risk_tec_raw()
 
     etas_rank     = _percentile_rank_map(etas_raw, invert=False)
     bvalue_rank   = _percentile_rank_map(bvalue_raw, invert=True)    # 低b値 = 高リスク
     fault_rank    = _percentile_rank_map(fault_raw, invert=True)     # 近い = 高リスク
     plate_rank    = _percentile_rank_map(plate_raw, invert=True)     # 近い = 高リスク
     pressure_rank = _percentile_rank_map(pressure_raw, invert=False)
+    tec_rank      = _percentile_rank_map(tec_raw, invert=False)      # 偏差が大きい = 高リスク
 
     cells = []
     for key, (lat, lon) in _RISK_CELLS.items():
@@ -2097,6 +2369,8 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid):
             comp["plate"] = {"s": round(plate_rank[key], 4), "r": round(plate_raw[key], 1)}
         if key in pressure_rank:
             comp["pressure"] = {"s": round(pressure_rank[key], 4), "r": round(pressure_raw[key], 2)}
+        if key in tec_rank:
+            comp["tec"] = {"s": round(tec_rank[key], 4), "r": round(tec_raw[key], 2)}
         if comp:
             cells.append({"lat": round(lat, 3), "lon": round(lon, 3), "c": comp})
     return cells
@@ -3089,6 +3363,12 @@ def _update_data():
                 _cached_data = {"all":quakes,"etas":grid_scores,"bvalue":bvalue_grid,"updated":updated_str}
                 _last_update = time.time(); _ready_phase = 2
             print(f"[BG] 完了 地震:{len(quakes)}件 ETAS格子:{len(grid_scores)} b値格子:{len(bvalue_grid)}")
+
+            try:
+                update_tec_cache()
+            except Exception as e:
+                print(f"[TEC] 更新中にエラー: {e}")
+
             first_run = False
 
             # ★ JST時間帯(HH:00〜)ごとに解析結果のスナップショットをログ保存する。
