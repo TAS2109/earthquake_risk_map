@@ -1476,15 +1476,46 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
   <hr style="border-color:#374151;margin:5px 0">
   <small>出典: 気象庁アメダス<br>正規圧力（海面気圧）<br>{updated_str}</small>
 </div>
+<style>
+/* ★ Bug fix: 観測点の気圧値ラベル。ズームアウト時は密集して見づらいため、
+   一定のズームレベル以上でのみ表示する（updateValueLabels()で制御）。*/
+.pres-val-label{{background:rgba(17,24,39,.85);border:1px solid #374151;color:#f3f4f6;
+  font-size:11px;font-weight:600;padding:1px 4px;border-radius:3px;white-space:nowrap;
+  box-shadow:none}}
+.pres-val-label::before{{display:none}}
+</style>
 <script>
 var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
 {DARK_TILE}
 {GEOJSON_JS}
 var MK={markers_js};
-MK.forEach(function(d){{
-  L.circleMarker([d.lat,d.lon],{{radius:4,color:d.color,fillColor:d.color,fillOpacity:1.0,weight:0.5}})
-   .bindTooltip(d.tip).bindPopup(d.pop).addTo(map);
+// ★ Bug fix: 拡大（ズームイン）した際に観測値（気圧の数値）が見えるように、
+// 各観測点に常設ツールチップで数値ラベルを付与する。ただしズームアウト時は
+// 観測点が密集して数値が重なり読めなくなるため、一定のズームレベル未満では
+// ラベルを非表示にする（ホバー時のツールチップ／クリック時のポップアップは
+// ズームレベルに関わらず従来通り利用可能）。
+var VALUE_LABEL_MIN_ZOOM = 8;
+var valueLabelMarkers = MK.map(function(d){{
+  // Leafletは1レイヤーにつきtooltipを1つしか保持できないため、
+  // 観測値ラベル（常設・ズーム連動で表示/非表示）に一本化する。
+  // 観測点名込みの詳細はクリック時のポップアップ(bindPopup)で確認できる。
+  var m = L.circleMarker([d.lat,d.lon],{{radius:4,color:d.color,fillColor:d.color,fillOpacity:1.0,weight:0.5}})
+   .bindPopup(d.pop)
+   .addTo(map);
+  m.bindTooltip(d.pres+'hPa', {{permanent:true, direction:'top', offset:[0,-6], className:'pres-val-label'}});
+  return m;
 }});
+function updateValueLabels(){{
+  var show = map.getZoom() >= VALUE_LABEL_MIN_ZOOM;
+  valueLabelMarkers.forEach(function(m){{
+    var tt = m.getTooltip();
+    if(!tt) return;
+    var el = tt.getElement();
+    if(el) el.style.display = show ? '' : 'none';
+  }});
+}}
+map.on('zoomend', updateValueLabels);
+map.whenReady(updateValueLabels);
 </script></body></html>"""
 
 
@@ -1500,6 +1531,17 @@ FAULTS_BBOX = (20.0, 52.0, 120.0, 157.0)  # (lat_min, lat_max, lon_min, lon_max)
 
 _fault_cache = {"data": None, "fetched_at": None}
 _FAULT_CACHE_TTL_SEC = 24 * 3600  # 活断層データは滅多に変わらないので1日キャッシュ
+
+# ★ Bug fix: GEM Global Active Faults Database には、日本周辺の海溝軸沿いの
+# 沈み込み帯（プレート境界そのもの）も slip_type="Subduction Thrust" 等として
+# 収録されており、これがそのまま「活断層」レイヤーに表示されると、別途PB2002由来の
+# 「プレート境界」レイヤーと内容が重複・混同してしまっていた。
+# 活断層レイヤーからはプレート境界(沈み込み帯)由来のフィーチャーを除外する。
+PLATE_BOUNDARY_SLIP_KEYWORDS = ("subduction",)
+
+def _is_plate_boundary_fault(slip_type):
+    s = (slip_type or "").strip().lower()
+    return any(kw in s for kw in PLATE_BOUNDARY_SLIP_KEYWORDS)
 
 def get_japan_active_faults():
     """GEM Global Active Faultsを取得し、日本周辺のみにフィルタしたGeoJSONを返す（メモリキャッシュ付き）。"""
@@ -1528,9 +1570,12 @@ def get_japan_active_faults():
             continue
         if any(lat_min <= pt[1] <= lat_max and lon_min <= pt[0] <= lon_max for pt in flat):
             props = feat.get("properties") or {}
+            slip_type = props.get("slip_type", "")
+            if _is_plate_boundary_fault(slip_type):
+                continue  # プレート境界(沈み込み帯)は「活断層」レイヤーから除外
             feats.append({
                 "type": "Feature",
-                "properties": {"name": props.get("name", ""), "slip_type": props.get("slip_type", "")},
+                "properties": {"name": props.get("name", ""), "slip_type": slip_type},
                 "geometry": geom,
             })
     result = {"type": "FeatureCollection", "features": feats}
@@ -1898,6 +1943,80 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid):
             cells.append({"lat": round(lat, 3), "lon": round(lon, 3), "c": comp})
     return cells
 
+
+# ── 統合リスクマップ: セル別「前日比」「推移」────────────────────
+# 総合リスクマップは毎時のスナップショット(data/snapshots/)に保存された
+# ETAS/b値格子から過去分を再計算できるが、活断層・プレート境界近接度は
+# ほとんど時間変化しない静的データのため常に「現在値」を用い、気圧偏差は
+# スナップショットに保存されていないため過去分の内訳には含めない
+# （選択項目から欠けても重み再正規化により自動的に無視される）。
+RISK_TREND_MAX_POINTS = 7 * 24  # 直近7日分（毎時想定で最大168点）に限定
+
+def _risk_component_keys_from_param(sel_param):
+    keys = [s for s in (sel_param or "").split(",") if s in RISK_LABELS]
+    return keys or ["etas", "bvalue", "fault", "plate"]
+
+def compute_risk_trend_for_cell(gi, gj, selected_keys):
+    """指定したリスク格子セル(gi,gj)について、選択中のデータソースだけを使って
+    総合リスクスコア(0〜1)の推移を計算し、[{"t": ISO時刻, "score": 0-1}, ...] を
+    時系列順（古い→新しい）で返す。あわせて「前日比」比較用のスコアも返す。"""
+    selected = set(selected_keys)
+
+    # 静的（近接度）データは全セル分を1度だけ計算して使い回す
+    fault_rank_all = plate_rank_all = {}
+    if "fault" in selected:
+        fault_rank_all = _percentile_rank_map(get_fault_proximity_grid(), invert=True)
+    if "plate" in selected:
+        plate_rank_all = _percentile_rank_map(get_plate_proximity_grid(), invert=True)
+
+    fnames = list_snapshots()  # 新しい順
+    fnames = list(reversed(fnames[:RISK_TREND_MAX_POINTS]))  # 古い→新しい、直近分のみ
+
+    points = []
+    for fname in fnames:
+        snap = load_snapshot(fname)
+        if snap is None:
+            continue
+        comp = {}
+        if "etas" in selected:
+            etas_rank = _percentile_rank_map(_risk_etas_raw(snap["etas"]), invert=False)
+            if (gi, gj) in etas_rank:
+                comp["etas"] = etas_rank[(gi, gj)]
+        if "bvalue" in selected:
+            bvalue_rank = _percentile_rank_map(_risk_bvalue_raw(snap["bvalue"]), invert=True)
+            if (gi, gj) in bvalue_rank:
+                comp["bvalue"] = bvalue_rank[(gi, gj)]
+        if (gi, gj) in fault_rank_all:
+            comp["fault"] = fault_rank_all[(gi, gj)]
+        if (gi, gj) in plate_rank_all:
+            comp["plate"] = plate_rank_all[(gi, gj)]
+        if not comp:
+            continue
+        wsum = sum(RISK_DEFAULT_WEIGHTS[k] for k in comp)
+        score = sum(RISK_DEFAULT_WEIGHTS[k] * v for k, v in comp.items()) / wsum
+        points.append({"t": snap.get("timestamp_jst", ""), "score": round(score, 4)})
+
+    prev_day_score = None
+    if len(points) >= 2:
+        try:
+            latest_dt = datetime.fromisoformat(points[-1]["t"])
+            target = latest_dt - timedelta(hours=24)
+            best, best_diff = None, None
+            for p in points[:-1]:
+                try:
+                    dt = datetime.fromisoformat(p["t"])
+                except Exception:
+                    continue
+                diff = abs(dt - target)
+                if best_diff is None or diff < best_diff:
+                    best, best_diff = p, diff
+            if best is not None and best_diff is not None and best_diff <= timedelta(hours=3):
+                prev_day_score = best["score"]
+        except Exception:
+            pass
+
+    return points, prev_day_score
+
 def render_riskmap(risk_cells, updated_str):
     cells_js = json.dumps(risk_cells, ensure_ascii=False)
     weights_js = json.dumps(RISK_DEFAULT_WEIGHTS)
@@ -1911,11 +2030,26 @@ def render_riskmap(risk_cells, updated_str):
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{display:flex;height:100vh;background:#0f172a;color:#fff;font-family:"Helvetica Neue",Arial,sans-serif;overflow:hidden}}
-#panel{{width:300px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;overflow-y:auto;padding:14px}}
-#panel h2{{font-size:14px;color:#f3f4f6;margin-bottom:4px}}
+#panel{{width:300px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;overflow-y:auto;padding:14px;
+    position:relative;transition:margin-left 0.2s}}
+#panel.closed{{margin-left:-300px}}
+#panelTop{{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:4px}}
+#panel h2{{font-size:14px;color:#f3f4f6}}
+#panelClose{{flex-shrink:0;width:22px;height:22px;border:none;border-radius:5px;background:#374151;color:#d1d5db;
+    cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center}}
+#panelClose:hover{{background:#4b5563;color:#fff}}
+#panelReopen{{position:absolute;top:70px;left:0;z-index:5000;width:34px;height:78px;border:none;
+    border-radius:0 8px 8px 0;background:#1f2937;color:#9ca3af;cursor:pointer;font-size:12px;
+    display:none;flex-direction:column;align-items:center;justify-content:center;gap:6px;
+    box-shadow:2px 0 8px rgba(0,0,0,.4)}}
+#panelReopen:hover{{background:#2563eb;color:#fff}}
+#panelReopen.show{{display:flex}}
+#panelReopen .arrow{{font-size:15px;line-height:1}}
+#panelReopen .vlabel{{writing-mode:vertical-rl;letter-spacing:1px;font-size:10px;font-weight:600}}
 #panel p.sub{{font-size:11px;color:#6b7280;margin-bottom:12px;line-height:1.6}}
 .sec{{margin-bottom:16px}}
-.sec h3{{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid #1f2937;padding-bottom:4px}}
+.sec h3{{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid #1f2937;padding-bottom:4px;
+    display:flex;align-items:center;justify-content:space-between}}
 .preset-row{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:4px}}
 .preset-btn{{flex:1 1 calc(50% - 6px);padding:6px 4px;font-size:11px;font-weight:600;cursor:pointer;
     border:1px solid #374151;border-radius:6px;background:#1f2937;color:#9ca3af;text-align:center}}
@@ -1931,17 +2065,50 @@ body{{display:flex;height:100vh;background:#0f172a;color:#fff;font-family:"Helve
 #cellCount{{font-size:11px;color:#9ca3af;margin-top:10px}}
 #cellCount span{{color:#60a5fa;font-weight:700}}
 .note{{font-size:10.5px;color:#6b7280;line-height:1.7;margin-top:10px}}
+.tbl-toggle{{border:none;background:#1f2937;color:#9ca3af;font-size:10px;font-weight:600;
+    padding:2px 8px;border-radius:4px;cursor:pointer;flex-shrink:0}}
+.tbl-toggle:hover{{background:#374151;color:#f3f4f6}}
+#rankWrap{{max-height:260px;overflow-y:auto;border:1px solid #1f2937;border-radius:6px}}
+#rankWrap.collapsed{{display:none}}
+table.rank-table{{width:100%;border-collapse:collapse;font-size:10.5px}}
+table.rank-table thead tr{{background:#1f2937;position:sticky;top:0}}
+table.rank-table th{{padding:5px 4px;color:#9ca3af;text-align:left;font-weight:600;white-space:nowrap}}
+table.rank-table td{{padding:4px;color:#e5e7eb;border-top:1px solid #1f2937;white-space:nowrap}}
+.rrow{{cursor:pointer}}
+.rrow:hover{{background:#1e2d40}}
 #mp{{flex:1;overflow:hidden;position:relative}}
 #map{{width:100%;height:100%}}
 #lg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
     padding:10px 13px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.9;color:#f3f4f6}}
 #hdr{{position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:1000;
     background:rgba(17,24,39,.92);padding:6px 16px;border-radius:6px;font-size:11px;color:#9ca3af}}
-.pop-title{{font-weight:700;font-size:13px;margin-bottom:4px}}
-.pop-row{{display:flex;justify-content:space-between;gap:10px;font-size:11px;padding:2px 0;border-bottom:1px dashed #374151}}
+/* ── セル詳細パネル（クリックで表示）: 内訳/棒グラフ/前日比/推移を
+   はっきり区切って表示し、ごちゃつかないようにする ── */
+#detailBox{{display:none;position:absolute;top:14px;right:14px;z-index:1500;width:290px;
+    background:rgba(17,24,39,.97);border:1px solid #374151;border-radius:10px;padding:12px 14px;
+    font-size:11px;color:#e5e7eb;max-height:calc(100% - 28px);overflow-y:auto}}
+#detailBox .dHead{{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}}
+#dTitle{{font-weight:700;font-size:14px;color:#f3f4f6}}
+#dClose{{flex-shrink:0;width:20px;height:20px;border:none;border-radius:5px;background:#374151;color:#d1d5db;
+    cursor:pointer;font-size:12px;line-height:1}}
+#dClose:hover{{background:#4b5563;color:#fff}}
+#dLoc{{font-size:10px;color:#6b7280;margin:2px 0 10px}}
+.dSection{{margin-top:10px;padding-top:10px;border-top:1px solid #1f2937}}
+.dSection h4{{font-size:11px;font-weight:700;color:#60a5fa;margin-bottom:6px}}
+.brk-row{{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;color:#d1d5db}}
+.brk-val{{font-weight:700;color:#f3f4f6}}
+#dPrevDay{{font-size:11.5px;margin-top:2px}}
+#dTrendState{{font-size:10px;color:#6b7280;margin-bottom:4px}}
+canvas.dChart{{display:block;width:100%}}
 </style></head><body>
+<button id="panelReopen" onclick="togglePanel()" title="設定・一覧を開く">
+  <span class="arrow">▶</span><span class="vlabel">設定・一覧</span>
+</button>
 <div id="panel">
-  <h2>統合リスクマップ <span style="font-size:10px;color:#fbbf24">β</span></h2>
+  <div id="panelTop">
+    <h2>統合リスクマップ <span style="font-size:10px;color:#fbbf24">β</span></h2>
+    <button id="panelClose" onclick="togglePanel()" title="パネルを閉じる">✕</button>
+  </div>
   <p class="sub">複数の地震関連データを統合した相対的な地震リスク指数です。地震の発生確率ではなく、地域ごとのリスクの高低を比較するための指標です。</p>
 
   <div class="sec">
@@ -1973,6 +2140,19 @@ body{{display:flex;height:100vh;background:#0f172a;color:#fff;font-family:"Helve
       <span class="clabel">GNSS（地殻変動）</span><span class="cbadge">近日公開</span></div>
   </div>
 
+  <div class="sec">
+    <h3>セル別ランキング（総合リスク順）
+      <button class="tbl-toggle" id="rankToggleBtn" onclick="toggleRankTable()">閉じる</button>
+    </h3>
+    <div id="rankWrap">
+      <table class="rank-table">
+        <thead><tr><th>#</th><th>緯度</th><th>経度</th><th>総合</th><th>Lv</th></tr></thead>
+        <tbody id="rankBody"></tbody>
+      </table>
+    </div>
+    <div style="font-size:10px;color:#6b7280;margin-top:4px">上位<span id="rankShown">0</span>件 / 表示中<span id="rankTotal">0</span>件中（行クリックで地図上を表示）</div>
+  </div>
+
   <div id="cellCount">表示中のセル数: <span id="cellN">0</span> / {n_cells}</div>
   <div class="note">
     重みは選択されたデータのみを使い自動的に再正規化されます。<br>
@@ -1992,6 +2172,32 @@ body{{display:flex;height:100vh;background:#0f172a;color:#fff;font-family:"Helve
     <span style="color:#4ade80">■</span> Lv1（最低）<br>
     <hr style="border-color:#374151;margin:5px 0">
     <small>選択データの相対順位を重み付け合成した指数<br>（発生確率を意味するものではありません）</small>
+  </div>
+  <div id="detailBox">
+    <div class="dHead">
+      <div>
+        <div id="dTitle">-</div>
+        <div id="dLoc"></div>
+      </div>
+      <button id="dClose" onclick="closeDetail()" title="閉じる">✕</button>
+    </div>
+
+    <div class="dSection">
+      <h4>内訳（寄与度）</h4>
+      <div id="dBreakdown"></div>
+      <canvas id="dBarCanvas" class="dChart" width="256" height="110"></canvas>
+    </div>
+
+    <div class="dSection">
+      <h4>前日比</h4>
+      <div id="dPrevDay">-</div>
+    </div>
+
+    <div class="dSection">
+      <h4>推移（直近・最大7日）</h4>
+      <div id="dTrendState">-</div>
+      <canvas id="dTrendCanvas" class="dChart" width="256" height="90"></canvas>
+    </div>
   </div>
 </div>
 <script>
@@ -2015,7 +2221,8 @@ var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
 {GEOJSON_JS}
 
 var rectLayer = null;
-var popup = L.popup();
+var COMP_COLOR = {{etas:'#ef4444', bvalue:'#f97316', fault:'#facc15', plate:'#38bdf8', pressure:'#a78bfa'}};
+var lastShownList = [];   // redraw()のたびに更新: [{{cell, comp, lv}}, ...]
 
 function applyCheckboxesFromSelected(){{
   KEYS.forEach(function(k){{ document.getElementById('chk_'+k).checked = !!selected[k]; }});
@@ -2058,30 +2265,182 @@ function levelOf(score){{
   return 1;
 }}
 
+// 寄与度(浮動小数)の配列を、合計が total(整数)に一致するよう最大剰余法で丸める
+function roundPartsToTotal(parts, total){{
+  var floors = parts.map(Math.floor);
+  var used = floors.reduce(function(a,b){{return a+b;}}, 0);
+  var remainder = Math.round(total - used);
+  var order = parts.map(function(p,i){{return {{i:i, frac:p-Math.floor(p)}};}})
+                   .sort(function(a,b){{return b.frac-a.frac;}});
+  var result = floors.slice();
+  for(var k=0; k<remainder && k<order.length; k++){{ result[order[k].i] += 1; }}
+  return result;
+}}
+
+// 内訳の横棒グラフ（外部ライブラリ不使用、Canvas直描画）
+function drawBarChart(canvas, labels, values, colors){{
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+  var n = labels.length;
+  if(n===0) return;
+  var maxV = Math.max(1, Math.max.apply(null, values.map(function(v){{return Math.abs(v);}})));
+  var labelW = 66, valW = 30;
+  var trackW = W - labelW - valW;
+  var rowH = H / n;
+  var barH = Math.min(14, rowH - 6);
+  ctx.font = '10px sans-serif';
+  ctx.textBaseline = 'middle';
+  for(var i=0; i<n; i++){{
+    var cy = rowH*i + rowH/2;
+    ctx.fillStyle = '#9ca3af';
+    ctx.fillText(labels[i], 0, cy);
+    ctx.fillStyle = '#1f2937';
+    ctx.fillRect(labelW, cy-barH/2, trackW, barH);
+    var w = Math.max(1, trackW * (Math.abs(values[i]) / maxV));
+    ctx.fillStyle = colors[i] || '#60a5fa';
+    ctx.fillRect(labelW, cy-barH/2, w, barH);
+    ctx.fillStyle = '#f3f4f6';
+    ctx.fillText((values[i]>=0?'+':'')+values[i], labelW+trackW+4, cy);
+  }}
+}}
+
+// 推移（時系列）の折れ線グラフ
+function drawLineChart(canvas, points){{
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+  if(!points || points.length<2){{
+    ctx.fillStyle='#6b7280'; ctx.font='11px sans-serif'; ctx.textBaseline='middle';
+    ctx.fillText('データが不足しています', 4, H/2);
+    return;
+  }}
+  var pad = 8, topPad = 14;
+  var vals = points.map(function(p){{return p.score*100;}});
+  var minV = Math.min.apply(null, vals), maxV = Math.max.apply(null, vals);
+  if(maxV-minV < 1){{ minV -= 1; maxV += 1; }}
+  ctx.strokeStyle = '#60a5fa'; ctx.lineWidth = 1.5; ctx.beginPath();
+  points.forEach(function(p,i){{
+    var x = pad + (W-2*pad) * (points.length===1 ? 0 : i/(points.length-1));
+    var y = H-pad - (H-topPad-pad) * ((p.score*100-minV)/(maxV-minV));
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }});
+  ctx.stroke();
+  ctx.fillStyle = '#9ca3af'; ctx.font = '9px sans-serif'; ctx.textBaseline = 'top';
+  ctx.fillText(Math.round(maxV), 2, 2);
+  ctx.textBaseline = 'bottom';
+  ctx.fillText(Math.round(minV), 2, H-2);
+}}
+
+function closeDetail(){{
+  document.getElementById('detailBox').style.display = 'none';
+}}
+
 function showDetail(cell, comp, lv){{
-  var rows = comp.used.map(function(k){{
+  document.getElementById('detailBox').style.display = 'block';
+  var total = Math.round(comp.score*100);
+  document.getElementById('dTitle').textContent = '総合リスク ' + total + ' (Lv' + lv + ')';
+  document.getElementById('dLoc').textContent = '緯度' + cell.lat.toFixed(2) + ' / 経度' + cell.lon.toFixed(2);
+
+  var labels = [], contribFloat = [], colors = [];
+  comp.used.forEach(function(k){{
     var d = cell.c[k];
-    var nw = WEIGHTS[k]/comp.wsum;
-    var contrib = nw*d.s;
-    return '<div class="pop-row"><span>'+LABELS[k]+'</span>'+
-      '<span>score='+d.s.toFixed(2)+' raw='+d.r+' / 寄与='+contrib.toFixed(3)+'</span></div>';
+    var nw = WEIGHTS[k] / comp.wsum;
+    labels.push(LABELS[k]);
+    contribFloat.push(nw * d.s * 100);
+    colors.push(COMP_COLOR[k] || '#60a5fa');
+  }});
+  var contribInt = roundPartsToTotal(contribFloat, total);
+
+  document.getElementById('dBreakdown').innerHTML = comp.used.map(function(k, i){{
+    return '<div class="brk-row"><span>' + LABELS[k] + '</span>' +
+      '<span class="brk-val">' + (contribInt[i]>=0?'+':'') + contribInt[i] + '</span></div>';
   }}).join('');
-  var html = '<div class="pop-title">統合リスク指数: '+comp.score.toFixed(3)+' (Lv'+lv+')</div>'+
-    '<div style="font-size:10px;color:#9ca3af;margin-bottom:6px">緯度'+cell.lat.toFixed(2)+' / 経度'+cell.lon.toFixed(2)+'</div>'+
-    rows +
-    '<div style="font-size:9px;color:#6b7280;margin-top:6px">score=相対順位(0-1) raw=元データ値(ETAS指数/b値/距離km/気圧偏差hPa) 寄与=重み正規化後の寄与度</div>';
-  popup.setLatLng([cell.lat, cell.lon]).setContent(html).openOn(map);
+  drawBarChart(document.getElementById('dBarCanvas'), labels, contribInt, colors);
+
+  // 前日比・推移は別セクションとして非同期取得（内訳の表示とはごちゃ混ぜにしない）
+  document.getElementById('dPrevDay').textContent = '取得中…';
+  document.getElementById('dTrendState').textContent = '取得中…';
+  drawLineChart(document.getElementById('dTrendCanvas'), []);
+
+  var sel = comp.used.join(',');
+  fetch('/data/risk_cell_trend?lat=' + cell.lat + '&lon=' + cell.lon + '&sel=' + encodeURIComponent(sel))
+    .then(function(r){{ return r.json(); }})
+    .then(function(res){{
+      var pts = res.points || [];
+      if(res.prev_day_score != null){{
+        var diff = total - Math.round(res.prev_day_score*100);
+        var color = diff>0 ? '#f87171' : (diff<0 ? '#4ade80' : '#9ca3af');
+        document.getElementById('dPrevDay').innerHTML =
+          '<span style="color:'+color+';font-weight:700">' + (diff>0?'+':'') + diff + '</span>' +
+          ' <span style="color:#6b7280">(24時間前比)</span>';
+      }} else {{
+        document.getElementById('dPrevDay').textContent = 'データ不足のため算出できません';
+      }}
+      if(pts.length>=2){{
+        document.getElementById('dTrendState').textContent = '直近' + pts.length + '時点の推移';
+        drawLineChart(document.getElementById('dTrendCanvas'), pts);
+      }} else {{
+        document.getElementById('dTrendState').textContent = '推移データが不足しています';
+      }}
+    }})
+    .catch(function(){{
+      document.getElementById('dPrevDay').textContent = '取得に失敗しました';
+      document.getElementById('dTrendState').textContent = '取得に失敗しました';
+    }});
+}}
+
+function renderRankTable(list){{
+  list.sort(function(a,b){{ return b.comp.score - a.comp.score; }});
+  var TOP_N = 60;
+  var top = list.slice(0, TOP_N);
+  document.getElementById('rankBody').innerHTML = top.map(function(item, idx){{
+    return '<tr class="rrow" onclick="focusCell(' + item.cell.lat + ',' + item.cell.lon + ')">' +
+      '<td>' + (idx+1) + '</td>' +
+      '<td>' + item.cell.lat.toFixed(2) + '</td>' +
+      '<td>' + item.cell.lon.toFixed(2) + '</td>' +
+      '<td style="color:' + RISK_COLOR[item.lv] + ';font-weight:700">' + Math.round(item.comp.score*100) + '</td>' +
+      '<td>Lv' + item.lv + '</td></tr>';
+  }}).join('');
+  document.getElementById('rankShown').textContent = top.length;
+  document.getElementById('rankTotal').textContent = list.length;
+}}
+
+function focusCell(lat, lon){{
+  var item = lastShownList.find(function(x){{
+    return Math.abs(x.cell.lat-lat)<1e-6 && Math.abs(x.cell.lon-lon)<1e-6;
+  }});
+  if(!item) return;
+  map.flyTo([lat, lon], Math.max(map.getZoom(), 7), {{duration:0.6}});
+  showDetail(item.cell, item.comp, item.lv);
+}}
+
+function toggleRankTable(){{
+  var wrap = document.getElementById('rankWrap');
+  var btn = document.getElementById('rankToggleBtn');
+  var collapsed = wrap.classList.toggle('collapsed');
+  btn.textContent = collapsed ? '開く' : '閉じる';
+}}
+
+function togglePanel(){{
+  var panel = document.getElementById('panel');
+  var reopen = document.getElementById('panelReopen');
+  panel.classList.toggle('closed');
+  reopen.classList.toggle('show', panel.classList.contains('closed'));
+  setTimeout(function(){{ map.invalidateSize(); }}, 220);
 }}
 
 function redraw(){{
   if(rectLayer) map.removeLayer(rectLayer);
   rectLayer = L.layerGroup().addTo(map);
   var shown = 0;
+  lastShownList = [];
   CELLS.forEach(function(cell){{
     var comp = computeComposite(cell);
     if(!comp) return;
     shown++;
     var lv = levelOf(comp.score);
+    lastShownList.push({{cell:cell, comp:comp, lv:lv}});
     var rect = L.rectangle(
       [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
       {{color:null, weight:0, fill:true, fillColor:RISK_COLOR[lv], fillOpacity:0.6}}
@@ -2090,6 +2449,7 @@ function redraw(){{
     rect.addTo(rectLayer);
   }});
   document.getElementById('cellN').textContent = shown;
+  renderRankTable(lastShownList);
 }}
 
 redraw();
@@ -2404,24 +2764,24 @@ SHELL_HTML = """<!DOCTYPE html>
 
     <div class="group-title">地震データ</div>
     <button class="tab-btn active" onclick="sw(0)">
+      <span class="label">統合リスクマップ</span>
+      <span class="badge">β</span>
+    </button>
+    <button class="tab-btn" onclick="sw(1)">
       <span class="label">地震履歴</span>
       <span class="badge">有感+無感</span>
     </button>
-    <button class="tab-btn" onclick="sw(1)">
+    <button class="tab-btn" onclick="sw(2)">
       <span class="label">ETASマップ</span>
       <span class="badge">P1</span>
     </button>
-    <button class="tab-btn" onclick="sw(2)">
+    <button class="tab-btn" onclick="sw(3)">
       <span class="label">b値マップ</span>
       <span class="badge">P4</span>
     </button>
-    <button class="tab-btn" onclick="sw(3)">
+    <button class="tab-btn" onclick="sw(4)">
       <span class="label">活断層・プレート境界</span>
       <span class="badge">地質</span>
-    </button>
-    <button class="tab-btn" onclick="sw(4)">
-      <span class="label">統合リスクマップ</span>
-      <span class="badge">β</span>
     </button>
 
     <div class="sep"></div>
@@ -2452,7 +2812,7 @@ SHELL_HTML = """<!DOCTYPE html>
     <div class="version">ETAS残差研究プロジェクト</div>
   </div>
   <div id="main">
-    <iframe id="f0" class="active" src="/tab/history"></iframe>
+    <iframe id="f0" class="active" src="/tab/riskmap"></iframe>
     <iframe id="f1" src=""></iframe>
     <iframe id="f2" src=""></iframe>
     <iframe id="f3" src=""></iframe>
@@ -2463,7 +2823,7 @@ SHELL_HTML = """<!DOCTYPE html>
     <iframe id="f8" src=""></iframe>
   </div>
   <script>
-    var URLS=['history','etas','bvalue','faultmap','riskmap','tec','gnss','pressure','snapshots'];
+    var URLS=['riskmap','history','etas','bvalue','faultmap','tec','gnss','pressure','snapshots'];
     var loaded=[true,false,false,false,false,false,false,false,false];
     function sw(idx){
       document.querySelectorAll('.tab-btn').forEach(function(b,i){b.classList.toggle('active',i===idx)});
@@ -2573,6 +2933,30 @@ def tab(name):
     elif name == "snapshots": html = render_snapshots(upd)
     else: return Response("Not found", status=404)
     return Response(html, mimetype="text/html")
+
+@app.route("/data/risk_cell_trend")
+def risk_cell_trend():
+    """
+    統合リスクマップで特定の格子セルをタップした際に、そのセルの総合リスク
+    スコアの「前日比」と「推移（直近7日・時間解像度）」を返す。
+    クエリパラメータ:
+      lat, lon : セル中心の緯度経度（フロントエンドが持つCELLSの値をそのまま渡す）
+      sel      : 現在選択中のデータソースをカンマ区切りで（例: "etas,bvalue,fault,plate"）
+    """
+    try:
+        lat = float(request.args.get("lat"))
+        lon = float(request.args.get("lon"))
+    except (TypeError, ValueError):
+        return {"error": "lat, lon must be numbers"}, 400
+
+    gi = int(math.floor(lat / RISK_GRID_SIZE))
+    gj = int(math.floor(lon / RISK_GRID_SIZE))
+    if (gi, gj) not in _RISK_CELLS:
+        return {"error": "cell out of range"}, 404
+
+    selected_keys = _risk_component_keys_from_param(request.args.get("sel"))
+    points, prev_day_score = compute_risk_trend_for_cell(gi, gj, selected_keys)
+    return {"points": points, "prev_day_score": prev_day_score}
 
 @app.route("/status")
 def status():
