@@ -11,11 +11,11 @@
   6. TEC          - 電離圏全電子数 (NICT SCIDAS リンク)
   7. GNSS         - 地殻変動 (GEONET リンク + 変位プレースホルダー)
   8. 海面気圧     - アメダス海面気圧マップ
-  9. スナップショット - 1時間ごとの解析結果ログ
+  9. アーカイブ - 1時間ごとの解析結果ログ
 """
 
 from flask import Flask, Response, send_file, request
-import requests, csv, os, math, re, json, threading, time, zipfile, io, bisect
+import requests, csv, os, math, re, json, threading, time, zipfile, io, bisect, tempfile, base64
 from datetime import datetime, timezone, timedelta
 import numpy as np
 
@@ -50,8 +50,23 @@ def in_etas_region(lat, lon):
 
 # ── スナップショット（解析結果の時系列ログ）────────────
 SNAPSHOT_DIR          = "data/snapshots"
+SNAPSHOT_TMP_DIR      = "data/snapshots/_tmp"   # ZIPダウンロード用の一時ファイル置き場
 SNAPSHOT_KEEP_DAYS    = 30       # 古いスナップショットの保持期間
 JST                   = timezone(timedelta(hours=9))
+
+# ── GitHubリポジトリへの自動バックアップ ─────────────────
+# Render無料プランはディスクが永続化されない（再デプロイ/長期スリープで消える）ため、
+# 蓄積したスナップショットをGitHubへコミットして退避できるようにする。
+# 以下の環境変数を設定すると有効になる（未設定であれば完全に無効＝任意機能）。
+#   GITHUB_BACKUP_REPO   : "owner/repo" 形式
+#   GITHUB_BACKUP_TOKEN  : 対象リポジトリへの contents 書き込み権限を持つトークン
+#   GITHUB_BACKUP_BRANCH : 省略時 "main"
+#   GITHUB_BACKUP_PATH   : リポジトリ内の保存先ディレクトリ。省略時 "snapshots"
+GITHUB_BACKUP_REPO    = os.environ.get("GITHUB_BACKUP_REPO", "").strip()
+GITHUB_BACKUP_TOKEN   = os.environ.get("GITHUB_BACKUP_TOKEN", "").strip()
+GITHUB_BACKUP_BRANCH  = os.environ.get("GITHUB_BACKUP_BRANCH", "main").strip() or "main"
+GITHUB_BACKUP_PATH    = os.environ.get("GITHUB_BACKUP_PATH", "snapshots").strip().strip("/") or "snapshots"
+GITHUB_BACKUP_ENABLED = bool(GITHUB_BACKUP_REPO and GITHUB_BACKUP_TOKEN)
 
 # ── グローバルキャッシュ ──────────────────────────────
 _cache_lock        = threading.Lock()
@@ -504,27 +519,32 @@ def save_snapshot(cached_data, key=None):
             json.dump(payload, f, ensure_ascii=False)
         print(f"[スナップショット] 保存: {key}.json "
               f"(地震:{payload['quake_count']}件 ETAS格子:{len(payload['etas'])} b値格子:{len(payload['bvalue'])})")
+        _github_backup_async(path, f"{GITHUB_BACKUP_PATH}/{key}.json", f"snapshot: {key}")
     except Exception as e:
         print(f"[スナップショット] 保存失敗: {e}")
     _cleanup_old_snapshots()
 
+def _parse_snapshot_ts(fname):
+    """スナップショットのファイル名からUTCタイムスタンプを復元する。
+    新形式("YYYYMMDD_HH.json")・旧形式("YYYYMMDD_HHMMSS.json")の両方に対応。
+    解釈できない場合は None を返す。"""
+    stem = fname[:-5] if fname.endswith(".json") else fname
+    for fmt in ("%Y%m%d_%H%M%S", "%Y%m%d_%H"):
+        try:
+            return datetime.strptime(stem, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
 def _cleanup_old_snapshots(keep_days=SNAPSHOT_KEEP_DAYS):
-    """古いスナップショットファイルを削除してディスク肥大化を防ぐ。
-    新形式("YYYYMMDD_HH.json")・旧形式("YYYYMMDD_HHMMSS.json")の両方に対応。"""
+    """古いスナップショットファイルを削除してディスク肥大化を防ぐ。"""
     if not os.path.isdir(SNAPSHOT_DIR):
         return
     cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
     for fname in os.listdir(SNAPSHOT_DIR):
         if not fname.endswith(".json"):
             continue
-        stem = fname[:-5]
-        ts = None
-        for fmt in ("%Y%m%d_%H%M%S", "%Y%m%d_%H"):
-            try:
-                ts = datetime.strptime(stem, fmt).replace(tzinfo=timezone.utc)
-                break
-            except ValueError:
-                continue
+        ts = _parse_snapshot_ts(fname)
         if ts is None:
             continue
         if ts < cutoff:
@@ -532,6 +552,125 @@ def _cleanup_old_snapshots(keep_days=SNAPSHOT_KEEP_DAYS):
                 os.remove(os.path.join(SNAPSHOT_DIR, fname))
             except Exception:
                 continue
+
+def _github_api_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_BACKUP_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+def github_backup_file(local_path, repo_relpath, commit_message):
+    """
+    ローカルファイルをGitHubリポジトリへ Contents API 経由でPUT(作成 or 更新)する。
+    既に同名ファイルがリポジトリ側にある場合は sha を取得してから上書きする。
+    GITHUB_BACKUP_REPO/TOKEN が未設定、または通信に失敗した場合は例外を投げず
+    False を返すのみ（バックアップの失敗でメインの解析処理を止めたくないため）。
+    """
+    if not GITHUB_BACKUP_ENABLED:
+        return False
+    api_url = f"https://api.github.com/repos/{GITHUB_BACKUP_REPO}/contents/{repo_relpath}"
+    try:
+        with open(local_path, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("ascii")
+        sha = None
+        r = requests.get(api_url, headers=_github_api_headers(),
+                          params={"ref": GITHUB_BACKUP_BRANCH}, timeout=15)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+        elif r.status_code not in (404,):
+            print(f"[GitHub backup] 既存ファイル確認失敗 {repo_relpath}: {r.status_code}")
+        payload = {"message": commit_message, "content": content_b64, "branch": GITHUB_BACKUP_BRANCH}
+        if sha:
+            payload["sha"] = sha
+        r = requests.put(api_url, headers=_github_api_headers(), json=payload, timeout=20)
+        if r.status_code in (200, 201):
+            return True
+        print(f"[GitHub backup] 保存失敗 {repo_relpath}: {r.status_code} {r.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"[GitHub backup] 例外 {repo_relpath}: {e}")
+        return False
+
+def _github_backup_async(local_path, repo_relpath, commit_message):
+    """GitHubへの通信でメインの解析スレッドをブロックしないよう、別スレッドで実行する。"""
+    if not GITHUB_BACKUP_ENABLED:
+        return
+    threading.Thread(
+        target=github_backup_file,
+        args=(local_path, repo_relpath, commit_message),
+        daemon=True,
+    ).start()
+
+def github_restore_snapshots():
+    """
+    起動時にGitHubリポジトリ側のスナップショットを取得し、ローカルの
+    data/snapshots/ に無いものだけを復元する。
+
+    ★ Renderの無料プランはディスクが永続化されないため、再デプロイや長時間
+    スリープ後の起動直後は data/snapshots/ が空になる。これを放置すると
+    「アーカイブ」タブに蓄積されていたデータが見た目上すべて消えてしまう。
+    そこで起動のたびにGitHub側の内容で埋め戻し、蓄積データを維持する。
+    保持期間(SNAPSHOT_KEEP_DAYS)より古いものは復元してもどうせすぐ
+    _cleanup_old_snapshots() で削除されるだけなので、復元対象から除外して
+    無駄な通信を減らしている。
+    """
+    if not GITHUB_BACKUP_ENABLED:
+        return
+    api_url = f"https://api.github.com/repos/{GITHUB_BACKUP_REPO}/contents/{GITHUB_BACKUP_PATH}"
+    try:
+        r = requests.get(api_url, headers=_github_api_headers(),
+                          params={"ref": GITHUB_BACKUP_BRANCH}, timeout=20)
+        if r.status_code == 404:
+            print("[GitHub restore] バックアップ先ディレクトリが未作成のため復元対象なし")
+            return
+        if r.status_code != 200:
+            print(f"[GitHub restore] 一覧取得失敗: {r.status_code} {r.text[:200]}")
+            return
+        items = r.json()
+        if not isinstance(items, list):
+            print("[GitHub restore] 想定外のレスポンス形式のため中断")
+            return
+    except Exception as e:
+        print(f"[GitHub restore] 一覧取得例外: {e}")
+        return
+
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=SNAPSHOT_KEEP_DAYS)
+    restored, skipped, failed = 0, 0, 0
+    for item in items:
+        name = item.get("name", "")
+        if item.get("type") != "file" or not name.endswith(".json"):
+            continue
+        ts = _parse_snapshot_ts(name)
+        if ts is not None and ts < cutoff:
+            continue  # 保持期間より古いものは復元しない
+        local_path = os.path.join(SNAPSHOT_DIR, name)
+        if os.path.exists(local_path):
+            skipped += 1
+            continue
+        try:
+            fr = requests.get(item["url"], headers=_github_api_headers(),
+                               params={"ref": GITHUB_BACKUP_BRANCH}, timeout=20)
+            if fr.status_code != 200:
+                failed += 1
+                continue
+            content_b64 = fr.json().get("content", "")
+            raw = base64.b64decode(content_b64)
+            with open(local_path, "wb") as f:
+                f.write(raw)
+            restored += 1
+        except Exception as e:
+            print(f"[GitHub restore] {name} 復元失敗: {e}")
+            failed += 1
+    print(f"[GitHub restore] 完了 復元:{restored}件 既存済み:{skipped}件 失敗:{failed}件")
+    _cleanup_old_snapshots()
+
+def _github_restore_async():
+    """復元処理でアプリの起動自体をブロックしないよう、別スレッドで実行する。"""
+    if not GITHUB_BACKUP_ENABLED:
+        return
+    threading.Thread(target=github_restore_snapshots, daemon=True).start()
 
 def list_snapshots():
     """保存済みスナップショットのファイル名を新しい順に返す。"""
@@ -565,15 +704,25 @@ def load_snapshot(fname):
 
 def build_snapshots_zip(max_files=None):
     """
-    data/snapshots/ 配下のスナップショットJSONファイルをまとめて
-    メモリ上でZIP化し、BytesIOバッファを返す。1件もない場合は None。
+    data/snapshots/ 配下のスナップショットJSONファイルをまとめてZIP化し、
+    ディスク上の一時ファイルとして書き出してそのパスを返す。1件もない場合は None。
+    呼び出し側は使用後に必ずこのファイルを削除すること。
 
     max_files を指定すると新しい方から その件数だけに絞る。
-    ★ Render無料プランはメモリ・CPUが限られるため、保持件数が多い
-    （30日間×毎時 = 最大720件）場合に全件を一度にZIP化しようとすると
-    メモリ不足やリクエストタイムアウトで失敗することがある。
-    そのため既定では直近分のみに絞り、全件が欲しい場合は
-    ?all=1 を明示的に指定してもらう方式にした。
+    ★ 以前はio.BytesIOでメモリ上にZIPを構築していたが、それだと
+      ・件数/サイズが大きいとZIP全体を一度にメモリへ載せることになり、
+        Render無料プラン(メモリ512MB程度)ではプロセスがOOMで落ちて
+        ダウンロードが失敗することがあった
+      ・メモリバッファにはファイルとしての実体(mtime等)が無いため、
+        ブラウザがサイズの大きいダウンロードに対してRangeリクエスト
+        （分割・再開ダウンロード）を送ってきた際にsend_fileが正しく
+        扱えず、一定サイズを超えると「途中で止まる/保存できない」
+        不具合につながっていた
+      という問題があったため、ディスク上の一時ファイルに書き出し、
+      send_file()にはそのファイルパスを渡す方式に変更した
+      （実ファイルであればWerkzeugが正しくConditional/Rangeに対応できる）。
+      allowZip64も明示的に有効化し、件数・サイズが将来的に増えても
+      ZIP仕様上の上限(4GB/65535件)に達しないようにしてある。
     """
     if not os.path.isdir(SNAPSHOT_DIR):
         return None
@@ -583,13 +732,22 @@ def build_snapshots_zip(max_files=None):
     if max_files is not None:
         files = files[:max_files]
     files = sorted(files)  # zip内は時系列順にしておく
-    buf = io.BytesIO()
-    # compresslevel を下げてCPU負荷を抑える（JSONはテキストなのでlevel=1でも十分縮む）
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-        for fname in files:
-            zf.write(os.path.join(SNAPSHOT_DIR, fname), arcname=fname)
-    buf.seek(0)
-    return buf
+
+    os.makedirs(SNAPSHOT_TMP_DIR, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="snapshots_", dir=SNAPSHOT_TMP_DIR)
+    try:
+        with os.fdopen(fd, "wb") as raw:
+            # compresslevel を下げてCPU負荷を抑える（JSONはテキストなのでlevel=1でも十分縮む）
+            with zipfile.ZipFile(raw, "w", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as zf:
+                for fname in files:
+                    zf.write(os.path.join(SNAPSHOT_DIR, fname), arcname=fname)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+    return tmp_path
 
 
 # ══════════════════════════════════════════════════════
@@ -2460,7 +2618,7 @@ redraw();
 # メインページ（タブシェル）
 # ══════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════
-# TAB 7: スナップショット（1時間ごとの解析結果ログ）
+# TAB 7: アーカイブ（1時間ごとの解析結果ログ、旧称スナップショット）
 # ══════════════════════════════════════════════════════
 def render_snapshots(updated_str):
     html = """<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -2484,6 +2642,17 @@ body{display:flex;height:100vh;background:#0f172a;overflow:hidden;font-family:"H
     font-size:10px;font-weight:600;color:#9ca3af;background:transparent;border:1px solid #374151;
     border-radius:6px;cursor:pointer;text-decoration:none}
 #dlZipAll:hover{background:#1f2937;color:#d1d5db}
+#ghBackup{display:none;width:calc(100% - 28px);margin:0 14px 10px;padding:5px 0;text-align:center;
+    font-size:10px;font-weight:600;color:#a7f3d0;background:transparent;border:1px solid #065f46;
+    border-radius:6px;cursor:pointer}
+#ghBackup:hover{background:#064e3b}
+#ghBackup:disabled{opacity:.5;cursor:default}
+#ghRestore{display:none;width:calc(100% - 28px);margin:0 14px 4px;padding:5px 0;text-align:center;
+    font-size:10px;font-weight:600;color:#93c5fd;background:transparent;border:1px solid #1e3a5f;
+    border-radius:6px;cursor:pointer}
+#ghRestore:hover{background:#1e3a5f}
+#ghRestore:disabled{opacity:.5;cursor:default}
+#ghStatus{display:none;font-size:9px;color:#6b7280;margin:0 14px 8px;text-align:center}
 #detail{flex:1;overflow-y:auto;display:flex;flex-direction:column}
 #detailTop{padding:14px 18px 10px;flex-shrink:0}
 #detailTop h2{font-size:15px;color:#f3f4f6;margin-bottom:4px}
@@ -2507,12 +2676,15 @@ tr:hover td{background:#161b22}
 #loading{padding:30px;text-align:center;color:#6b7280;font-size:12px}
 </style></head><body>
 <div id="list">
-  <div id="hdr"><b>スナップショット一覧</b>1時間ごとの解析結果ログ</div>
+  <div id="hdr"><b>アーカイブ一覧</b>1時間ごとの解析結果ログ</div>
   <a id="dlZip" href="/snapshots/download">全件をZIPでダウンロード（直近7日分）</a>
   <a id="dlZipAll" href="/snapshots/download?all=1">全期間をまとめてダウンロード</a>
+  <button id="ghBackup" onclick="runGhBackup()">GitHubへ手動バックアップ</button>
+  <button id="ghRestore" onclick="runGhRestore()">GitHubから復元</button>
+  <div id="ghStatus"></div>
   <div id="items"><div id="loading">読込中...</div></div>
 </div>
-<div id="detail"><div class="empty" style="margin:auto">左のリストからスナップショットを選択してください</div></div>
+<div id="detail"><div class="empty" style="margin:auto">左のリストからアーカイブを選択してください</div></div>
 <script>
 var GRID_SIZE = __GRID_SIZE__;
 var BVALUE_GRID_SIZE = __BVALUE_GRID_SIZE__;
@@ -2587,11 +2759,50 @@ function buildBvalueCells(bvObj){
   });
 }
 
+fetch('/snapshots/backup_status').then(function(r){return r.json()}).then(function(d){
+  if(!d.enabled) return;
+  var btn = document.getElementById('ghBackup');
+  var rbtn = document.getElementById('ghRestore');
+  var st = document.getElementById('ghStatus');
+  btn.style.display = 'block';
+  rbtn.style.display = 'block';
+  st.style.display = 'block';
+  st.textContent = 'GitHub: ' + d.repo + ' (' + d.branch + ')';
+}).catch(function(e){});
+
+function runGhBackup(){
+  var btn = document.getElementById('ghBackup');
+  var st = document.getElementById('ghStatus');
+  btn.disabled = true;
+  btn.textContent = '送信開始中...';
+  fetch('/snapshots/backup_now', {method:'POST'}).then(function(r){return r.json()}).then(function(d){
+    btn.textContent = 'バックアップ開始（' + d.count + '件）';
+    st.textContent += ' - バックグラウンドで実行中';
+    setTimeout(function(){ btn.disabled = false; btn.textContent = 'GitHubへ手動バックアップ'; }, 4000);
+  }).catch(function(e){
+    btn.disabled = false;
+    btn.textContent = '送信失敗';
+  });
+}
+
+function runGhRestore(){
+  var rbtn = document.getElementById('ghRestore');
+  rbtn.disabled = true;
+  rbtn.textContent = '復元開始中...';
+  fetch('/snapshots/restore_now', {method:'POST'}).then(function(r){return r.json()}).then(function(d){
+    rbtn.textContent = '復元中（少し待って再読込）';
+    setTimeout(function(){ rbtn.disabled = false; rbtn.textContent = 'GitHubから復元'; }, 6000);
+  }).catch(function(e){
+    rbtn.disabled = false;
+    rbtn.textContent = '復元失敗';
+  });
+}
+
 fetch('/snapshots').then(function(r){return r.json()}).then(function(d){
   snapshots = d.snapshots || [];
   var wrap = document.getElementById('items');
   if(snapshots.length===0){
-    wrap.innerHTML = '<div class="empty">まだスナップショットがありません<br>(起動後1時間ほどで作成されます)</div>';
+    wrap.innerHTML = '<div class="empty">まだアーカイブがありません<br>(起動後1時間ほどで作成されます)</div>';
     document.getElementById('dlZip').style.display = 'none';
     document.getElementById('dlZipAll').style.display = 'none';
     return;
@@ -2805,7 +3016,7 @@ SHELL_HTML = """<!DOCTYPE html>
     <div class="sep"></div>
     <div class="group-title">ログ</div>
     <button class="tab-btn" onclick="sw(8)">
-      <span class="label">スナップショット</span>
+      <span class="label">アーカイブ</span>
       <span class="badge">1h</span>
     </button>
 
@@ -2980,16 +3191,80 @@ def snapshots_download():
     want_all = request.args.get("all") == "1"
     max_files = None if want_all else 168
     try:
-        buf = build_snapshots_zip(max_files=max_files)
+        tmp_path = build_snapshots_zip(max_files=max_files)
     except Exception as e:
         print(f"[snapshots_download] ZIP作成失敗: {e}")
         return Response(f"ZIP作成中にエラーが発生しました: {e}", status=500)
-    if buf is None:
-        return Response("スナップショットがまだありません", status=404)
+    if tmp_path is None:
+        return Response("アーカイブがまだありません", status=404)
     ts = datetime.now(JST).strftime("%Y%m%d_%H%M%S")
     suffix = "all" if want_all else "recent7d"
-    return send_file(buf, mimetype="application/zip", as_attachment=True,
-                      download_name=f"snapshots_{suffix}_{ts}.zip")
+    # 実ファイルとして送るのでWerkzeugがConditional/Rangeリクエストを正しく処理でき、
+    # 大きいZIPでもダウンロードが途中で失敗しない。送信完了後に一時ファイルを削除する。
+    resp = send_file(tmp_path, mimetype="application/zip", as_attachment=True,
+                      download_name=f"snapshots_{suffix}_{ts}.zip", conditional=True,
+                      max_age=0)
+
+    @resp.call_on_close
+    def _cleanup_tmp_zip():
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return resp
+
+@app.route("/snapshots/backup_status")
+def snapshots_backup_status():
+    """GitHub自動バックアップの設定状況を返す（トークン自体は返さない）。"""
+    return {
+        "enabled": GITHUB_BACKUP_ENABLED,
+        "repo":   GITHUB_BACKUP_REPO if GITHUB_BACKUP_ENABLED else None,
+        "branch": GITHUB_BACKUP_BRANCH if GITHUB_BACKUP_ENABLED else None,
+        "path":   GITHUB_BACKUP_PATH if GITHUB_BACKUP_ENABLED else None,
+    }
+
+@app.route("/snapshots/backup_now", methods=["POST"])
+def snapshots_backup_now():
+    """
+    ローカルに保存済みの全スナップショットをGitHubへまとめてバックアップする。
+    毎時の自動バックアップに失敗していた分の取りこぼしを手動で解消したい場合や、
+    初回導入時に既存の蓄積分をまとめて退避したい場合に使う。
+    件数が多いとGitHub APIを連続で叩くことになるため、レート制限に配慮して
+    バックグラウンドスレッドで1件ずつ間隔を空けながら実行する。
+    """
+    if not GITHUB_BACKUP_ENABLED:
+        return Response("GITHUB_BACKUP_REPO / GITHUB_BACKUP_TOKEN が未設定です", status=400)
+    files = list_snapshots()
+
+    def _run_backup_all():
+        ok, ng = 0, 0
+        for fname in files:
+            key = fname[:-5]
+            success = github_backup_file(
+                os.path.join(SNAPSHOT_DIR, fname),
+                f"{GITHUB_BACKUP_PATH}/{fname}",
+                f"backup: {key}",
+            )
+            ok += 1 if success else 0
+            ng += 0 if success else 1
+            time.sleep(1)  # GitHub APIのレート制限に配慮
+        print(f"[GitHub backup] 一括バックアップ完了 成功:{ok} 失敗:{ng}")
+
+    threading.Thread(target=_run_backup_all, daemon=True).start()
+    return {"status": "started", "count": len(files)}
+
+@app.route("/snapshots/restore_now", methods=["POST"])
+def snapshots_restore_now():
+    """
+    GitHub側のスナップショットをローカルへ復元する処理を手動で再実行する。
+    通常は起動時に自動実行されるが、バックアップ設定を後から追加した場合や
+    復元に失敗した疑いがある場合に手動で再試行できるようにしている。
+    """
+    if not GITHUB_BACKUP_ENABLED:
+        return Response("GITHUB_BACKUP_REPO / GITHUB_BACKUP_TOKEN が未設定です", status=400)
+    threading.Thread(target=github_restore_snapshots, daemon=True).start()
+    return {"status": "started"}
 
 @app.route("/snapshots/<fname>")
 def snapshot_detail(fname):
@@ -3004,5 +3279,6 @@ def snapshot_detail(fname):
     return out
 
 if __name__ == "__main__":
+    _github_restore_async()
     threading.Thread(target=_update_data, daemon=True).start()
     app.run(debug=False, host="0.0.0.0", port=5000)
