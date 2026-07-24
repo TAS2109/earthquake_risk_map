@@ -1660,10 +1660,10 @@ RISK_GRID_SIZE = 0.5   # 統合リスクマップの共通格子（ETAS/b値よ�
 # 各データソースの既定の重み（合計1.0。未選択/データ欠損のセルは
 # 選択されている項目だけで自動的に再正規化される）
 RISK_DEFAULT_WEIGHTS = {
-    "etas":     0.35,
-    "bvalue":   0.25,
-    "fault":    0.20,
-    "plate":    0.15,
+    "etas":     0.60,
+    "bvalue":   0.15,
+    "fault":    0.10,
+    "plate":    0.10,
     "pressure": 0.05,
 }
 RISK_LABELS = {"etas": "ETAS", "bvalue": "b値", "fault": "活断層",
