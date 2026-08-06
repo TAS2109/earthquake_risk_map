@@ -3655,7 +3655,36 @@ def quakes_restore_now():
     threading.Thread(target=github_restore_quakes_csv, daemon=True).start()
     return {"status": "started"}
 
-@app.route("/snapshots/backup_now", methods=["POST"])
+@app.route("/quakes/manual_add_kumamoto_20260728", methods=["POST"])
+def quakes_manual_add_kumamoto_20260728():
+    """
+    ★ 手動データ補完用（一時的なルート）:
+    2026/07/28 16:27頃 熊本県熊本地方 M7.1 最大震度7（令和8年熊本地震・本震）は、
+    その後の大規模な余震シーケンスによりAPIのページング上限を突破してしまい、
+    通常の自動取得では再取得できなくなっている。気象庁発表の確定値を手動で
+    1件だけCSVに追記するための使い切りエンドポイント。
+    save_quakes() 経由で追加するため、(time, lat, lon) が完全一致する行が
+    既に存在する場合は追加されず、複数回叩いても安全（冪等）。
+    追加に成功した場合はそのままGitHubへも自動バックアップされる
+    （save_quakes内のnew_count>0時のバックアップ処理により）。
+    """
+    quake = {
+        "time":  "2026-07-28T07:27:00+00:00",  # JST 16:27 → UTC 07:27
+        "lat":   32.6,
+        "lon":   130.7,
+        "mag":   7.1,
+        "depth": 16.0,
+        "source": "jma_bosai",
+        "place":  "熊本県熊本地方",
+        "max_int": "7",
+    }
+    before = load_quakes()
+    save_quakes([quake])
+    after = load_quakes()
+    added = len(after) - len(before)
+    return {"status": "done", "added": added, "quake": quake}
+
+
 def snapshots_backup_now():
     """
     ローカルに保存済みの全スナップショットをGitHubへまとめてバックアップする。
