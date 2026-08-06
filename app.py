@@ -2246,7 +2246,7 @@ function togglePlate(btn){{
 
 # ══════════════════════════════════════════════════════
 # 統合リスクマップ（β）
-# ETAS・b値・活断層近接度・プレート境界近接度・気圧偏差を統合し、
+# ETAS・b値・活断層/プレート境界への応力負荷・気圧偏差を統合し、
 # 地域ごとの「相対的な」地震リスク指数を算出する。
 # 発生確率を予測するものではなく、あくまで複数指標の相対順位を
 # 重み付け合成した比較指標である点に注意。
@@ -2265,6 +2265,26 @@ RISK_DEFAULT_WEIGHTS = {
 }
 RISK_LABELS = {"etas": "ETAS", "bvalue": "b値", "fault": "活断層",
                "plate": "プレート境界", "pressure": "気圧", "tec": "TEC(電離圏・実験的)"}
+
+# ── 活断層・プレート境界への「応力負荷」評価パラメータ ──────────
+# 活断層/プレート境界近接度は、以前は「格子セルから断層線までの単純な最短距離」
+# だったが、それだと地震活動と無関係な静的指標になってしまう。
+# ここでは各地震の震源が周辺の断層・プレート境界に与える影響を、
+# メカニズム解（走向・傾斜・すべり角）を使わない等方近似のクーロン応力変化に
+# 準じたモデルで評価し、断層・プレート境界側の「応力負荷」として数値化する。
+#   ・地震のモーメント M0 = 10^(1.5M+9.05) [Hanks & Kanamori 1979]
+#   ・破壊サイズ（下限距離）: 地表断層長 L[km] = 10^(-2.44+0.59M) [Wells & Coppersmith 1994]
+#   ・静的応力変化は震源近傍で r^-3 減衰する等方近似（メカニズム解が無いための簡略化）
+#   ・時間経過とともにOmori-Utsu型 (Δt+c)^-p で寄与を減衰させる
+#     （応力変化自体は本来は減衰しないが、本アプリでは「直近の活動によって
+#      現在どの断層/プレート境界が注視すべき状態にあるか」という監視指標として
+#      扱うため、意図的に古い地震の寄与を弱めている）
+class FaultStressParams:
+    M0_REF_MAG = 5.0     # 正規化基準マグニチュード（この規模の地震1回分を概ね1.0とする）
+    R_MIN_FLOOR_KM = 1.0 # 破壊サイズがごく小さい場合の距離下限
+    TIME_C = 1.0         # Omori-Utsu 減衰の c（日）
+    TIME_P = 1.0         # Omori-Utsu 減衰の p
+FSP = FaultStressParams()
 
 def _build_risk_cells():
     """L字型のETAS計算対象範囲を RISK_GRID_SIZE 格子で分割し、
@@ -2350,36 +2370,133 @@ def _min_dist_km_grid(points_latlon, chunk=2500):
         min_dist = np.minimum(min_dist, dist.min(axis=1))
     return {cell_keys[i]: float(min_dist[i]) for i in range(len(cell_keys))}
 
-_fault_proximity_cache = {"grid": None, "computed_for": None}
-_plate_proximity_cache = {"grid": None, "computed_for": None}
+_fault_stress_cache = {"grid": None, "computed_for": None}
+_plate_stress_cache = {"grid": None, "computed_for": None}
 
-def get_fault_proximity_grid():
-    """各リスク格子セルから最寄りの活断層までの距離(km)。
-    活断層データのキャッシュが更新された時だけ再計算する（距離計算は比較的重いため）。"""
-    global _fault_proximity_cache
+def _quake_signature(quakes):
+    """地震リストの「版」を安価に識別するための署名。件数＋最新時刻で近似する
+    （厳密なハッシュではないが、応力負荷キャッシュの再計算タイミング判定には十分）。"""
+    if not quakes:
+        return (0, None)
+    latest_time = max((q.get("time", "") for q in quakes), default=None)
+    return (len(quakes), latest_time)
+
+def _fault_plate_load_at_points(points_latlon, quakes, ref_time=None, chunk=1500):
+    """
+    断層/プレート境界のサンプル点(points_latlon)それぞれについて、与えられた
+    地震リストからの「応力負荷」を等方近似のクーロン応力変化モデルで積算する。
+        load = Σ_quakes  (M0/M0_ref) / max(r_km, r_min_km)^3 × 時間減衰(Δt)
+    r は震源とサンプル点の3次元距離（水平距離と震源深さから算出。断層/プレート
+    境界のトレースはほぼ地表付近とみなす）。
+    戻り値は points_latlon と同じ順序の numpy 配列。
+    """
+    n_pts = len(points_latlon)
+    if n_pts == 0 or not quakes:
+        return np.zeros(n_pts)
+
+    ref_time = ref_time or datetime.now(timezone.utc)
+    qlat, qlon, qmag, qdepth, qdt_days = [], [], [], [], []
+    for q in quakes:
+        try:
+            t = datetime.fromisoformat(q["time"].replace("Z", "+00:00"))
+            dt_days = (ref_time - t).total_seconds() / 86400.0
+            if dt_days < 0:
+                continue  # 参照時刻より未来の地震は無視（過去推移計算用）
+        except Exception:
+            continue
+        qlat.append(q["lat"]); qlon.append(q["lon"]); qmag.append(q["mag"])
+        qdepth.append(q.get("depth", 10.0) or 10.0)
+        qdt_days.append(dt_days)
+    if not qlat:
+        return np.zeros(n_pts)
+
+    qlat = np.array(qlat); qlon = np.array(qlon); qmag = np.array(qmag)
+    qdepth = np.array(qdepth); qdt = np.array(qdt_days)
+
+    m0_ref = 10.0 ** (1.5 * FSP.M0_REF_MAG + 9.05)
+    moment_ratio = (10.0 ** (1.5 * qmag + 9.05)) / m0_ref
+    rupture_len_km = 10.0 ** (-2.44 + 0.59 * qmag)          # Wells & Coppersmith 1994
+    r_min = np.maximum(rupture_len_km / 2.0, FSP.R_MIN_FLOOR_KM)
+    time_w = (qdt + FSP.TIME_C) ** (-FSP.TIME_P)             # Omori-Utsu型 時間減衰
+
+    pts = np.array(points_latlon)
+    cos_lat = np.cos(np.radians(pts[:, 0]))
+    load = np.zeros(n_pts)
+    for start in range(0, len(qlat), chunk):
+        blat = qlat[start:start + chunk]; blon = qlon[start:start + chunk]
+        bdepth = qdepth[start:start + chunk]
+        bmoment = moment_ratio[start:start + chunk]
+        brmin = r_min[start:start + chunk]
+        btime = time_w[start:start + chunk]
+
+        dlat = (pts[:, 0:1] - blat[None, :]) * 111.0
+        dlon = (pts[:, 1:2] - blon[None, :]) * 111.0 * cos_lat[:, None]
+        dh = np.sqrt(dlat ** 2 + dlon ** 2)
+        r = np.sqrt(dh ** 2 + bdepth[None, :] ** 2)
+        r = np.maximum(r, brmin[None, :])
+
+        load += (bmoment[None, :] / (r ** 3) * btime[None, :]).sum(axis=1)
+    return load
+
+def _load_to_grid_max(points_latlon, loads):
+    """断層/プレート境界のサンプル点ごとの応力負荷を、最も近いリスク格子セルへ
+    割り当てる。1セルに複数の点が対応する場合はその中の最大値をセルの代表値とする
+    （＝そのセル付近を通る断層/プレート境界のうち最も負荷が高いセグメントを表す）。"""
+    n_pts = len(points_latlon)
+    if n_pts == 0:
+        return {}
+    cell_keys = list(_RISK_CELLS.keys())
+    cell_latlon = np.array([_RISK_CELLS[k] for k in cell_keys])
+    cos_lat = np.cos(np.radians(cell_latlon[:, 0]))
+    pts = np.array(points_latlon)
+
+    nearest_cell_idx = np.empty(n_pts, dtype=int)
+    chunk = 2500
+    for start in range(0, n_pts, chunk):
+        batch = pts[start:start + chunk]
+        dlat = (cell_latlon[:, 0:1] - batch[:, 0][None, :]) * 111.0
+        dlon = (cell_latlon[:, 1:2] - batch[:, 1][None, :]) * 111.0 * cos_lat[:, None]
+        dist = np.sqrt(dlat ** 2 + dlon ** 2)
+        nearest_cell_idx[start:start + chunk] = dist.argmin(axis=0)
+
+    best = {}
+    for i, ci in enumerate(nearest_cell_idx):
+        key = cell_keys[ci]
+        v = float(loads[i])
+        if key not in best or v > best[key]:
+            best[key] = v
+    return best
+
+def get_fault_stress_grid(quakes):
+    """各リスク格子セル付近を通る活断層について、直近の地震活動による
+    クーロン応力変化の簡易近似（等方近似・時間減衰つき）に基づく「応力負荷」を返す。
+    断層線データ or 地震リストのいずれかが更新されるまではキャッシュを使い回す。"""
+    global _fault_stress_cache
     fault_data = get_japan_active_faults()
-    fetched_at = _fault_cache.get("fetched_at")
-    if (_fault_proximity_cache["grid"] is not None
-            and _fault_proximity_cache["computed_for"] == fetched_at):
-        return _fault_proximity_cache["grid"]
+    cache_key = (_fault_cache.get("fetched_at"), _quake_signature(quakes))
+    if (_fault_stress_cache["grid"] is not None
+            and _fault_stress_cache["computed_for"] == cache_key):
+        return _fault_stress_cache["grid"]
     pts = _flatten_line_points(fault_data)
-    grid = _min_dist_km_grid(pts)
-    _fault_proximity_cache = {"grid": grid, "computed_for": fetched_at}
-    print(f"[統合リスク] 活断層近接度 {len(grid)}セル計算完了")
+    loads = _fault_plate_load_at_points(pts, quakes)
+    grid = _load_to_grid_max(pts, loads)
+    _fault_stress_cache = {"grid": grid, "computed_for": cache_key}
+    print(f"[統合リスク] 活断層 応力負荷 {len(grid)}セル計算完了")
     return grid
 
-def get_plate_proximity_grid():
-    """各リスク格子セルから最寄りのプレート境界までの距離(km)。"""
-    global _plate_proximity_cache
+def get_plate_stress_grid(quakes):
+    """各リスク格子セル付近を通るプレート境界について、同様の応力負荷を返す。"""
+    global _plate_stress_cache
     plate_data = get_plate_boundaries()
-    fetched_at = _plate_cache.get("fetched_at")
-    if (_plate_proximity_cache["grid"] is not None
-            and _plate_proximity_cache["computed_for"] == fetched_at):
-        return _plate_proximity_cache["grid"]
+    cache_key = (_plate_cache.get("fetched_at"), _quake_signature(quakes))
+    if (_plate_stress_cache["grid"] is not None
+            and _plate_stress_cache["computed_for"] == cache_key):
+        return _plate_stress_cache["grid"]
     pts = _flatten_line_points(plate_data, bbox=FAULTS_BBOX)
-    grid = _min_dist_km_grid(pts)
-    _plate_proximity_cache = {"grid": grid, "computed_for": fetched_at}
-    print(f"[統合リスク] プレート境界近接度 {len(grid)}セル計算完了")
+    loads = _fault_plate_load_at_points(pts, quakes)
+    grid = _load_to_grid_max(pts, loads)
+    _plate_stress_cache = {"grid": grid, "computed_for": cache_key}
+    print(f"[統合リスク] プレート境界 応力負荷 {len(grid)}セル計算完了")
     return grid
 
 def _risk_etas_raw(etas_grid_scores):
@@ -2462,21 +2579,21 @@ def _percentile_rank_map(raw_map, invert=False):
         ranks = 1.0 - ranks
     return {keys[i]: float(ranks[i]) for i in range(len(keys))}
 
-def compute_risk_grid(etas_grid_scores, bvalue_grid):
+def compute_risk_grid(etas_grid_scores, bvalue_grid, quakes):
     """統合リスクマップ用に、各データソースのセルごとの正規化スコア(0〜1)と
     元データ値をまとめたセル一覧を返す。重み付け合成はフロントエンド(JS)側で行い、
     チェックボックスの選択変更に即座に反映できるようにする。"""
     etas_raw     = _risk_etas_raw(etas_grid_scores)
     bvalue_raw   = _risk_bvalue_raw(bvalue_grid)
-    fault_raw    = get_fault_proximity_grid()
-    plate_raw    = get_plate_proximity_grid()
+    fault_raw    = get_fault_stress_grid(quakes)
+    plate_raw    = get_plate_stress_grid(quakes)
     pressure_raw = _risk_pressure_raw()
     tec_raw      = _risk_tec_raw()
 
     etas_rank     = _percentile_rank_map(etas_raw, invert=False)
     bvalue_rank   = _percentile_rank_map(bvalue_raw, invert=True)    # 低b値 = 高リスク
-    fault_rank    = _percentile_rank_map(fault_raw, invert=True)     # 近い = 高リスク
-    plate_rank    = _percentile_rank_map(plate_raw, invert=True)     # 近い = 高リスク
+    fault_rank    = _percentile_rank_map(fault_raw, invert=False)    # 応力負荷が大きい = 高リスク
+    plate_rank    = _percentile_rank_map(plate_raw, invert=False)    # 応力負荷が大きい = 高リスク
     pressure_rank = _percentile_rank_map(pressure_raw, invert=False)
     tec_rank      = _percentile_rank_map(tec_raw, invert=False)      # 偏差が大きい = 高リスク
 
@@ -2502,8 +2619,9 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid):
 
 # ── 統合リスクマップ: セル別「前日比」「推移」────────────────────
 # 総合リスクマップは毎時のスナップショット(data/snapshots/)に保存された
-# ETAS/b値格子から過去分を再計算できるが、活断層・プレート境界近接度は
-# ほとんど時間変化しない静的データのため常に「現在値」を用い、気圧偏差は
+# ETAS/b値格子から過去分を再計算できるが、活断層・プレート境界への応力負荷は
+# 本来は地震のたびに変化する動的な値であるものの、過去168時点それぞれを
+# 再計算するのは負荷が大きいため常に「現在値」を用いる簡易実装とし、気圧偏差は
 # スナップショットに保存されていないため過去分の内訳には含めない
 # （選択項目から欠けても重み再正規化により自動的に無視される）。
 RISK_TREND_MAX_POINTS = 7 * 24  # 直近7日分（毎時想定で最大168点）に限定
@@ -2518,12 +2636,17 @@ def compute_risk_trend_for_cell(gi, gj, selected_keys):
     時系列順（古い→新しい）で返す。あわせて「前日比」比較用のスコアも返す。"""
     selected = set(selected_keys)
 
-    # 静的（近接度）データは全セル分を1度だけ計算して使い回す
+    # 活断層・プレート境界の応力負荷は本来は地震のたびに変化する動的な値だが、
+    # 過去168時点それぞれについて全地震データを再フィルタ・再計算するのは重いため、
+    # ここでは従来と同様に「現在の応力負荷」を全期間の推移に使い回す簡易実装とする
+    # （推移グラフ上のfault/plate成分は常に最新値になる）。
     fault_rank_all = plate_rank_all = {}
+    if "fault" in selected or "plate" in selected:
+        quakes_now = load_quakes()
     if "fault" in selected:
-        fault_rank_all = _percentile_rank_map(get_fault_proximity_grid(), invert=True)
+        fault_rank_all = _percentile_rank_map(get_fault_stress_grid(quakes_now), invert=False)
     if "plate" in selected:
-        plate_rank_all = _percentile_rank_map(get_plate_proximity_grid(), invert=True)
+        plate_rank_all = _percentile_rank_map(get_plate_stress_grid(quakes_now), invert=False)
 
     fnames = list_snapshots()  # 新しい順
     fnames = list(reversed(fnames[:RISK_TREND_MAX_POINTS]))  # 古い→新しい、直近分のみ
@@ -2685,9 +2808,9 @@ canvas.dChart{{display:block;width:100%}}
     <div class="chk-row"><input type="checkbox" id="chk_bvalue" checked onchange="onToggle('bvalue')">
       <span class="clabel">b値（Gutenberg-Richter）</span><span class="cweight">w={w['bvalue']}</span></div>
     <div class="chk-row"><input type="checkbox" id="chk_fault" checked onchange="onToggle('fault')">
-      <span class="clabel">活断層近接度</span><span class="cweight">w={w['fault']}</span></div>
+      <span class="clabel">活断層 応力負荷</span><span class="cweight">w={w['fault']}</span></div>
     <div class="chk-row"><input type="checkbox" id="chk_plate" checked onchange="onToggle('plate')">
-      <span class="clabel">プレート境界近接度</span><span class="cweight">w={w['plate']}</span></div>
+      <span class="clabel">プレート境界 応力負荷</span><span class="cweight">w={w['plate']}</span></div>
     <div class="chk-row"><input type="checkbox" id="chk_pressure" onchange="onToggle('pressure')">
       <span class="clabel">気圧偏差</span><span class="cweight">w={w['pressure']}</span></div>
     <div class="chk-row disabled"><input type="checkbox" disabled>
@@ -2713,7 +2836,7 @@ canvas.dChart{{display:block;width:100%}}
   <div class="note">
     重みは選択されたデータのみを使い自動的に再正規化されます。<br>
     セルをクリックすると統合リスク指数と各データの寄与度（内訳）を表示します。<br>
-    「地殻変動」プリセットは、GNSS実装までの暫定的な代理指標としてプレート境界近接度を使用しています。
+    「地殻変動」プリセットは、GNSS実装までの暫定的な代理指標としてプレート境界応力負荷を使用しています。
   </div>
 </div>
 <div id="mp">
@@ -3540,7 +3663,7 @@ def tab(name):
     elif name == "bvalue":   html = render_bvalue(data["bvalue"], data["all"], upd)
     elif name == "faultmap": html = render_faultmap(upd)
     elif name == "riskmap":
-        risk_cells = compute_risk_grid(data["etas"], data["bvalue"])
+        risk_cells = compute_risk_grid(data["etas"], data["bvalue"], data["all"])
         html = render_riskmap(risk_cells, upd)
     elif name == "tec":      html = render_tec(upd)
     elif name == "gnss":     html = render_gnss(upd)
