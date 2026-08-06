@@ -3665,8 +3665,14 @@ def quakes_manual_add_kumamoto_20260728():
     1件だけCSVに追記するための使い切りエンドポイント。
     save_quakes() 経由で追加するため、(time, lat, lon) が完全一致する行が
     既に存在する場合は追加されず、複数回叩いても安全（冪等）。
-    追加に成功した場合はそのままGitHubへも自動バックアップされる
-    （save_quakes内のnew_count>0時のバックアップ処理により）。
+
+    ★ Bug fix (2026-08): save_quakes() 内のGitHubバックアップは非同期(別スレッド)
+    で動くため、このエンドポイントがレスポンスを返した直後にRenderが再起動
+    （スリープ/再デプロイ）すると、GitHubへの書き込みが完了する前にプロセスごと
+    終了してしまい、せっかく追加したデータがバックアップされないまま消える
+    ことがあった。手動追加は頻繁に叩くものではないため、ここでは非同期にせず
+    同期的にバックアップを実行し、成功したかどうかをレスポンスに含めることで
+    「本当に保存されたか」をその場で確認できるようにする。
     """
     quake = {
         "time":  "2026-07-28T07:27:00+00:00",  # JST 16:27 → UTC 07:27
@@ -3679,10 +3685,42 @@ def quakes_manual_add_kumamoto_20260728():
         "max_int": "7",
     }
     before = load_quakes()
-    save_quakes([quake])
+    save_quakes([quake])  # 内部で追加時に非同期バックアップも走るが、下で同期バックアップを重ねて確実化する
     after = load_quakes()
     added = len(after) - len(before)
-    return {"status": "done", "added": added, "quake": quake}
+
+    backup_success = None
+    if GITHUB_BACKUP_ENABLED:
+        backup_success = github_backup_quakes_csv()  # ここで完了を待つ
+
+    # ★ Bug fix (2026-08): CSVには追記されるが、地震履歴タブが参照している
+    # メモリ上のキャッシュ(_cached_data)はバックグラウンド更新ループ
+    # (最大 FETCH_INTERVAL_SEC=600秒間隔) でしか作り直されないため、
+    # 手動追加した直後は画面に反映されず「追加したのに見えない」状態になっていた。
+    # ここでキャッシュも即座に作り直して、追加後すぐ画面に反映されるようにする。
+    global _cached_data, _last_update, _ready_phase
+    try:
+        quakes_now = load_quakes()
+        grid_scores = analyze_etas(quakes_now)
+        bvalue_grid = compute_bvalue_grid(quakes_now)
+        updated_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST") + "(手動追加反映)"
+        with _cache_lock:
+            _cached_data = {"all": quakes_now, "etas": grid_scores, "bvalue": bvalue_grid,
+                             "updated": updated_str}
+            _last_update = time.time(); _ready_phase = 2
+        cache_refreshed = True
+    except Exception as e:
+        print(f"[手動追加] キャッシュ再構築失敗: {e}")
+        cache_refreshed = False
+
+    return {
+        "status": "done",
+        "added": added,
+        "quake": quake,
+        "github_backup_enabled": GITHUB_BACKUP_ENABLED,
+        "github_backup_success": backup_success,
+        "cache_refreshed": cache_refreshed,
+    }
 
 
 def snapshots_backup_now():
