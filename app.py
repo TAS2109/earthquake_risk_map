@@ -9,7 +9,7 @@
   4. 活断層・プレート境界 - 都市圏活断層図(GSI) + プレート境界(PB2002)
   5. 統合リスクマップ(β) - ETAS/b値/活断層/プレート境界/気圧を統合した相対リスク指数
   6. TEC          - 電離圏全電子数 (NICT SCIDAS リンク)
-  7. GNSS         - 地殻変動 (GEONET リンク + 変位プレースホルダー)
+  7. GNSS         - 地殻変動 (GEONET SFTP実データ変位ベクトル、未設定時はプレースホルダー)
   8. 海面気圧     - アメダス海面気圧マップ
   9. アーカイブ - 1時間ごとの解析結果ログ
 """
@@ -18,6 +18,15 @@ from flask import Flask, Response, send_file, request
 import requests, csv, os, math, re, json, threading, time, zipfile, io, bisect, tempfile, base64
 from datetime import datetime, timezone, timedelta
 import numpy as np
+
+# GNSS変位（GEONET日々の座標値）のSFTP取得に使用。未インストールでもアプリ全体は動作する
+# （その場合はGNSS機能が自動的に無効化される。requirements.txtに paramiko の追加が必要）。
+try:
+    import paramiko
+    _PARAMIKO_AVAILABLE = True
+except ImportError:
+    paramiko = None
+    _PARAMIKO_AVAILABLE = False
 
 app = Flask(__name__)
 
@@ -83,6 +92,77 @@ GITHUB_BACKUP_ENABLED = bool(GITHUB_BACKUP_REPO and GITHUB_BACKUP_TOKEN)
 # 対策として、quakes.csv 自体も snapshots と同じ仕組みでGitHubへバックアップ/復元
 # できるようにする（保存先は snapshots ディレクトリとは別の固定ファイル名）。
 GITHUB_BACKUP_QUAKES_PATH = "quakes_backup/quakes.csv"
+
+# ── GNSS変位（GEONET電子基準点 日々の座標値）─────────────
+# 国土地理院(GSI)の「電子基準点日々の座標値」はSFTP経由でのみ取得できる
+# （単純なHTTPS公開APIは無い）。利用にはSFTPユーザー登録（無料・要申請）が必要:
+#   https://terras.gsi.go.jp/ftp_guide.php
+# 以下の環境変数を設定すると実データ取得が有効になる。
+# 未設定の場合は従来どおりプレースホルダー表示のまま（アプリの他機能には影響しない）。
+#   GSI_SFTP_HOST : 省略時 "terras.gsi.go.jp"
+#   GSI_SFTP_PORT : 省略時 22
+#   GSI_SFTP_USER / GSI_SFTP_PASS : SFTPユーザー登録で発行されたユーザ名・パスワード
+#     （「共通ログインサービス」のID/PWとは別物なので注意）
+# ★ 実装メモ（2026-08）: .posファイルの列フォーマットは一次資料で完全確認できておらず、
+# 暫定パーサー（_parse_pos_file）で対応している。SFTPユーザー登録後は
+# GET /gnss/raw_sample?station=<観測点コード> で実際のファイル内容を確認し、
+# 期待通りに解析できているか（/gnss/status）を必ず確認すること。
+GSI_SFTP_HOST    = os.environ.get("GSI_SFTP_HOST", "terras.gsi.go.jp").strip() or "terras.gsi.go.jp"
+GSI_SFTP_PORT    = int(os.environ.get("GSI_SFTP_PORT", "22") or "22")
+GSI_SFTP_USER    = os.environ.get("GSI_SFTP_USER", "").strip()
+GSI_SFTP_PASS    = os.environ.get("GSI_SFTP_PASS", "").strip()
+GSI_GNSS_ENABLED = bool(_PARAMIKO_AVAILABLE and GSI_SFTP_USER and GSI_SFTP_PASS)
+
+GNSS_LOOKBACK_DAYS = 7          # 変位ベクトル計算に使う直近日数（短期変位）
+GNSS_CACHE_SEC     = 6 * 3600   # 座標値は日次更新なので数時間キャッシュで十分
+GNSS_SFTP_TIMEOUT  = 20
+
+# ETAS対象範囲（in_etas_region）に絞った代表的な電子基準点。
+# 緯度経度は観測点名から得られる概算値（市区町村中心付近）であり、
+# 電子基準点そのものの精密な設置位置（cm精度）ではない点に注意。
+# 地図表示・変位ベクトルの向きの確認用途を想定。厳密な位置が必要な場合は
+# 国土地理院「電子基準点検索」で照合すること。
+GNSS_STATIONS = [
+    # (観測点コード, 名称, 緯度, 経度)
+    # ― 先島諸島・沖縄 ―
+    ("021096", "那覇",     26.2124, 127.6809),
+    ("960749", "石垣１",   24.3448, 124.1572),
+    ("960750", "石垣２",   24.3500, 124.2000),
+    ("950497", "与那国",   24.4667, 123.0100),
+    ("950498", "西表島",   24.3711, 123.7828),
+    ("940100", "玉城",     26.1500, 127.7667),
+    # ― 九州・四国・中国 ―
+    ("940097", "鹿児島１", 31.5966, 130.5571),
+    ("940092", "長崎",     32.7503, 129.8779),
+    ("940087", "古賀",     33.7489, 130.4747),
+    ("940079", "下関",     33.9490, 130.9210),
+    ("940083", "高知",     33.5597, 133.5311),
+    ("940080", "高松",     34.3428, 134.0466),
+    ("940082", "室戸",     33.2833, 134.1556),
+    ("940074", "松江",     35.4723, 133.0505),
+    ("940090", "大分佐伯", 32.9600, 131.8990),
+    ("940094", "日向",     32.4200, 131.6250),
+    ("940081", "阿南１",   33.9210, 134.6590),
+    # ― 中部・関東 ―
+    ("93078",  "静岡２",   34.9769, 138.3831),
+    ("93054",  "浜松",     34.7108, 137.7261),
+    ("93013",  "大宮",     35.9068, 139.6236),
+    ("132009", "石岡",     36.1893, 140.2825),
+    ("950266", "長野",     36.6513, 138.1810),
+    # ― 東北・北海道 ―
+    ("950128", "札幌",     43.0642, 141.3469),
+    ("960521", "帯広",     42.9180, 143.2040),
+    ("940010", "釧路市",   42.9850, 144.3820),
+    ("940022", "函館",     41.7687, 140.7288),
+    ("940025", "青森",     40.8244, 140.7400),
+    ("940029", "水沢１",   39.1300, 141.1310),
+    ("950172", "気仙沼",   38.9080, 141.5680),
+    ("940036", "女川",     38.4430, 141.4500),
+    ("940001", "稚内",     45.4150, 141.6730),
+]
+
+_gnss_cache = {"data": None, "ts": 0.0, "error": None, "updating": False}
+_gnss_lock  = threading.Lock()
 
 # ── グローバルキャッシュ ──────────────────────────────
 _cache_lock        = threading.Lock()
@@ -1771,47 +1851,255 @@ if (cells.length > 0) {{
 # ══════════════════════════════════════════════════════
 # TAB 5: GNSS（地殻変動）
 # ══════════════════════════════════════════════════════
-def _make_gnss_vectors():
+
+def _ecef_to_geodetic(x, y, z):
     """
-    GEONETの代表的な電子基準点に対して、
-    日本列島のプレート運動を模した擬似変位ベクトルを生成する。
-    実データ取得（F5ソリューション）は Phase 5 で実装予定。
-    ベクトル: [lat, lon, dE_mm/yr, dN_mm/yr] (東方向・北方向変位速度)
+    ECEF直交座標(m)を緯度・経度(度)・楕円体高(m)へ変換する（Bowring法、GRS80楕円体）。
+    GEONETの解析はGRS80/ITRF系のため、標準的なWGS84近似で十分な精度が得られる。
     """
-    # 日本列島の主要なプレート運動パターンを反映した代表点
-    # 参考: 国土地理院 GEONET F3解 基準速度場（Honshu fixed）
-    stations = [
-        # 北海道（オホーツクプレート、北西方向）
-        [43.1, 141.3, -10, -5],  [42.9, 143.2, -8, -6],
-        [41.8, 140.7, -12, -4],
-        # 東北（太平洋プレート沈み込み、西方向成分）
-        [40.8, 140.7, -22, -8],  [39.7, 141.1, -25, -7],
-        [38.3, 140.9, -28, -6],  [37.7, 140.5, -30, -5],
-        [37.0, 140.4, -28, -5],
-        # 関東（複合プレート境界、南西方向）
-        [36.6, 140.9, -20, -8],  [36.4, 140.5, -22, -9],
-        [36.1, 140.1, -24, -10], [35.9, 139.6, -20, -12],
-        [35.7, 139.7, -18, -13], [35.5, 139.6, -16, -14],
-        # 中部（ユーラシアプレート）
-        [36.7, 137.2, -5,  -8],  [36.6, 136.6, -4, -9],
-        [36.1, 136.2, -3, -10],  [35.7, 138.6, -10, -12],
-        [35.2, 136.9, -4,  -9],
-        # 近畿・中国・四国
-        [35.0, 135.8, -2, -10],  [34.7, 135.5, -1, -11],
-        [34.4, 132.5,  5, -12],  [33.8, 132.8,  6, -11],
-        [33.6, 133.5,  4, -10],
-        # 九州（フィリピン海プレート）
-        [33.3, 131.6, 12, -10],  [33.2, 130.3, 14, -9],
-        [32.8, 130.7, 15, -8],   [31.9, 131.4, 18, -6],
-        [31.6, 130.6, 16, -7],
-        # 沖縄・南西諸島（琉球弧）
-        [26.2, 127.7, 30, -5],   [24.3, 124.2, 35, -3],
-    ]
-    return stations
+    a = 6378137.0
+    f = 1.0 / 298.257222101  # GRS80
+    b = a * (1.0 - f)
+    e2  = 1.0 - (b * b) / (a * a)
+    ep2 = (a * a - b * b) / (b * b)
+    lon = math.atan2(y, x)
+    p = math.hypot(x, y)
+    if p < 1e-6:
+        return (90.0 if z > 0 else -90.0), math.degrees(lon), z - b
+    theta = math.atan2(z * a, p * b)
+    lat = math.atan2(z + ep2 * b * math.sin(theta) ** 3, p - e2 * a * math.cos(theta) ** 3)
+    N = a / math.sqrt(1.0 - e2 * math.sin(lat) ** 2)
+    h = p / math.cos(lat) - N
+    return math.degrees(lat), math.degrees(lon), h
+
+
+def _parse_pos_file(text):
+    """
+    GEONET「電子基準点日々の座標値」posファイル(1観測点1年分)をパースし、
+    [(date, X, Y, Z), ...] （ECEF座標, 単位m）のリストを返す。
+
+    ★ 注意: GSIの一次資料からは正確な列定義を確認できていない暫定パーサー。
+    ヘッダ行（'*'や'#'始まり、非数値始まりの行）を読み飛ばし、
+    「先頭列が8桁日付(yyyymmdd)、続く3列がECEFのX,Y,Z(概ね10^6〜10^7 m オーダー)」
+    というパターンに一致する行だけを抽出する。想定と異なるフォーマットの場合は
+    黙って0件になるだけなので、/gnss/raw_sample で実物を確認して調整すること。
+    """
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in ("*", "#"):
+            continue
+        parts = line.replace(",", " ").split()
+        if len(parts) < 4:
+            continue
+        date_tok = parts[0]
+        try:
+            if len(date_tok) == 8 and date_tok.isdigit():
+                d = datetime.strptime(date_tok, "%Y%m%d")
+            else:
+                continue
+            x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+        except (ValueError, IndexError):
+            continue
+        # ECEF座標として妥当な範囲（地球半径オーダー）か簡易チェック
+        if not (1e5 < abs(x) < 1e8 and 1e5 < abs(y) < 1e8 and 1e5 < abs(z) < 1e8):
+            continue
+        rows.append((d, x, y, z))
+    return rows
+
+
+def _gsi_sftp_connect():
+    transport = paramiko.Transport((GSI_SFTP_HOST, GSI_SFTP_PORT))
+    transport.banner_timeout = GNSS_SFTP_TIMEOUT
+    transport.connect(username=GSI_SFTP_USER, password=GSI_SFTP_PASS)
+    sftp = paramiko.SFTPClient.from_transport(transport)
+    sftp.get_channel().settimeout(GNSS_SFTP_TIMEOUT)
+    return sftp, transport
+
+
+# 日々の座標値の格納ディレクトリ候補。2026年4月にF5.1解へ移行中のため両方試す。
+_GNSS_POS_DIR_CANDIDATES = ("/data/coordinates_F5.1/GPS", "/data/coordinates_F5/GPS")
+
+
+def _fetch_station_pos_text(sftp, code, year):
+    """指定観測点・年のposファイル本文を取得する。見つからなければNone。"""
+    yy = str(year)[2:]
+    fname = f"{code}.{yy}.pos"
+    for base in _GNSS_POS_DIR_CANDIDATES:
+        path = f"{base}/{year}/{fname}"
+        try:
+            with sftp.open(path, "r") as f:
+                return f.read().decode("utf-8", errors="ignore"), path
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            print(f"[GNSS] {code} {path} 取得エラー: {e}")
+    return None, None
+
+
+def _fetch_station_positions(sftp, code, lookback_days=GNSS_LOOKBACK_DAYS):
+    """
+    指定観測点の直近 lookback_days 日分の(date, X, Y, Z)を返す（新しい順ではなく日付昇順）。
+    posファイルは1年分がまとまっているため、年をまたぐ場合は前年分も取得する。
+    """
+    today = datetime.now(timezone.utc).date()
+    years = [today.year]
+    if today.timetuple().tm_yday <= lookback_days + 5:
+        years.append(today.year - 1)
+
+    all_rows = []
+    for year in years:
+        text, _path = _fetch_station_pos_text(sftp, code, year)
+        if text:
+            all_rows.extend(_parse_pos_file(text))
+
+    dedup = {d: (x, y, z) for d, x, y, z in all_rows}  # 同一日付は後勝ちで統一
+    rows = sorted((d, x, y, z) for d, (x, y, z) in dedup.items())
+    return rows[-(lookback_days + 5):]
+
+
+def _compute_station_displacement(rows, lookback_days=GNSS_LOOKBACK_DAYS):
+    """
+    (date, X, Y, Z)の時系列から、直近lookback_days日間の東西・南北・上下変位(mm)を求める。
+    初日を原点としたローカルENU座標に変換し、日々のばらつきを最小二乗直線で
+    ならした上で、期間全体（span_days）分のトレンド変位を返す（短期変位ベクトル）。
+    データ点が3点未満の場合はNoneを返す。
+    """
+    if len(rows) < 3:
+        return None
+    cutoff = rows[-1][0] - timedelta(days=lookback_days)
+    recent = [r for r in rows if r[0] >= cutoff]
+    if len(recent) < 3:
+        recent = rows[-max(3, lookback_days):]
+    if len(recent) < 3:
+        return None
+
+    x0, y0, z0 = recent[0][1], recent[0][2], recent[0][3]
+    lat0, lon0, _h0 = _ecef_to_geodetic(x0, y0, z0)
+    lat0r, lon0r = math.radians(lat0), math.radians(lon0)
+    sl, cl = math.sin(lat0r), math.cos(lat0r)
+    so, co = math.sin(lon0r), math.cos(lon0r)
+    t0 = recent[0][0]
+
+    ts, es, ns, us = [], [], [], []
+    for d, x, y, z in recent:
+        dx, dy, dz = x - x0, y - y0, z - z0
+        e = -so * dx + co * dy
+        n = -sl * co * dx - sl * so * dy + cl * dz
+        u =  cl * co * dx + cl * so * dy + sl * dz
+        ts.append((d - t0).days)
+        es.append(e); ns.append(n); us.append(u)
+
+    def _slope(xs, ys):
+        n = len(xs)
+        mx = sum(xs) / n; my = sum(ys) / n
+        num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        den = sum((x - mx) ** 2 for x in xs)
+        return num / den if den > 1e-9 else 0.0
+
+    span = ts[-1] - ts[0]
+    if span <= 0:
+        return None
+    de = _slope(ts, es) * span * 1000.0  # m → mm
+    dn = _slope(ts, ns) * span * 1000.0
+    du = _slope(ts, us) * span * 1000.0
+    return {"dE_mm": de, "dN_mm": dn, "dU_mm": du, "n_points": len(recent), "span_days": span}
+
+
+def _refresh_gnss_cache():
+    """GNSS_STATIONS全点について実データを取得し、_gnss_cacheを更新する（バックグラウンド実行想定）。"""
+    with _gnss_lock:
+        if _gnss_cache["updating"]:
+            return
+        _gnss_cache["updating"] = True
+    try:
+        try:
+            sftp, transport = _gsi_sftp_connect()
+        except Exception as e:
+            msg = f"SFTP接続エラー: {e}"
+            print(f"[GNSS] {msg}")
+            with _gnss_lock:
+                _gnss_cache["error"] = msg
+            return
+
+        results, errors = [], 0
+        try:
+            for code, name, lat, lon in GNSS_STATIONS:
+                try:
+                    rows = _fetch_station_positions(sftp, code)
+                    disp = _compute_station_displacement(rows)
+                    if disp:
+                        results.append({"code": code, "name": name, "lat": lat, "lon": lon, **disp})
+                    else:
+                        errors += 1
+                except Exception as e:
+                    errors += 1
+                    print(f"[GNSS] {code}({name}) 処理エラー: {e}")
+        finally:
+            try:
+                sftp.close(); transport.close()
+            except Exception:
+                pass
+
+        with _gnss_lock:
+            if results:
+                _gnss_cache["data"] = results
+                _gnss_cache["error"] = (f"{errors}点でデータ取得/解析に失敗（{len(results)}/{len(GNSS_STATIONS)}点は成功）"
+                                         if errors else None)
+            else:
+                _gnss_cache["error"] = f"全{len(GNSS_STATIONS)}点でデータ取得に失敗しました"
+            _gnss_cache["ts"] = time.time()
+        print(f"[GNSS] 更新完了: {len(results)}/{len(GNSS_STATIONS)}点 成功（エラー{errors}件）")
+    finally:
+        with _gnss_lock:
+            _gnss_cache["updating"] = False
+
+
+def get_gnss_vectors():
+    """
+    キャッシュ済みのGNSS変位データを返す。
+    無効時（SFTP未設定/paramiko未インストール）や未取得時はNoneを返し、
+    呼び出し側でプレースホルダー表示にフォールバックする。
+    キャッシュが古い場合はバックグラウンドで非同期更新を開始する。
+    """
+    if not GSI_GNSS_ENABLED:
+        return None
+    with _gnss_lock:
+        stale   = (time.time() - _gnss_cache["ts"]) > GNSS_CACHE_SEC
+        data    = _gnss_cache["data"]
+        updating = _gnss_cache["updating"]
+    if (data is None or stale) and not updating:
+        threading.Thread(target=_refresh_gnss_cache, daemon=True).start()
+    return data
+
 
 def render_gnss(updated_str):
     now_jst = datetime.now(timezone(timedelta(hours=9)))
     date_str = now_jst.strftime("%Y年%m月%d日")
+
+    vectors = get_gnss_vectors()  # None＝無効/未取得（プレースホルダー表示にフォールバック）
+    with _gnss_lock:
+        gnss_ts    = _gnss_cache["ts"]
+        gnss_error = _gnss_cache["error"]
+
+    live = vectors is not None
+    if live:
+        gnss_updated_str = (datetime.fromtimestamp(gnss_ts, JST).strftime("%Y-%m-%d %H:%M JST")
+                             if gnss_ts else "取得中…")
+        badge_bg, badge_fg, badge_txt = "#064e3b", "#6ee7b7", "実データ (GEONET SFTP)"
+    elif GSI_GNSS_ENABLED:
+        gnss_updated_str = "取得中…"
+        badge_bg, badge_fg, badge_txt = "#1e3a5f", "#93c5fd", "実データ取得中…"
+    else:
+        gnss_updated_str = "―"
+        badge_bg, badge_fg, badge_txt = "#1e3a5f", "#93c5fd", "プレースホルダー表示"
+
+    vectors_json = json.dumps(vectors or [], ensure_ascii=False)
+    lookback_note = f"直近 {GNSS_LOOKBACK_DAYS} 日間の座標差分（短期変位ベクトル・mm単位）"
+    error_html = f'<p style="color:#f87171">⚠ {gnss_error}</p>' if (live and gnss_error) else ""
+    not_configured_html = ("" if GSI_GNSS_ENABLED else
+        '<p style="color:#fbbf24">SFTP未設定のためプレースホルダー表示です。'
+        '環境変数 GSI_SFTP_USER / GSI_SFTP_PASS を設定すると実データ表示に切り替わります。</p>')
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 {LEAFLET_CDN}
@@ -1824,7 +2112,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;color:#
 .hbadge{{padding:3px 10px;border-radius:5px;font-size:11px;font-weight:700}}
 #content{{flex:1;display:flex;overflow:hidden}}
 #map{{flex:1}}
-#panel{{width:260px;flex-shrink:0;background:#111827;border-left:2px solid #1f2937;overflow-y:auto;padding:14px}}
+#panel{{width:270px;flex-shrink:0;background:#111827;border-left:2px solid #1f2937;overflow-y:auto;padding:14px}}
 .sec{{margin-bottom:14px}}
 .sec h3{{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid #1f2937;padding-bottom:4px}}
 .sec p{{font-size:11px;color:#9ca3af;line-height:1.7}}
@@ -1834,13 +2122,15 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;color:#
 .link-btn:hover{{opacity:0.85}}
 .phase{{background:#1f2937;border-left:3px solid #7c3aed;padding:6px 8px;border-radius:0 5px 5px 0;
         margin-bottom:6px;font-size:11px;color:#d1d5db}}
+#station-list{{max-height:220px;overflow-y:auto;font-size:10px;color:#9ca3af;line-height:1.6}}
+#station-list div{{padding:2px 0;border-bottom:1px solid #1f2937}}
 </style></head><body>
 <div id="hdr">
   <div>
     <h2>GNSS 地殻変動モニタリング（GEONET）</h2>
-    <p>国土地理院 電子基準点ネットワーク / {date_str} / 更新: {updated_str}</p>
+    <p>国土地理院 電子基準点ネットワーク / {date_str} / 地震データ更新: {updated_str} / GNSS更新: {gnss_updated_str}</p>
   </div>
-  <span class="hbadge" style="background:#1e3a5f;color:#93c5fd;margin-left:auto">Phase 5 実装予定</span>
+  <span class="hbadge" style="background:{badge_bg};color:{badge_fg};margin-left:auto">{badge_txt}</span>
 </div>
 <div id="content">
   <div id="map"></div>
@@ -1858,17 +2148,18 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;color:#
       </a>
     </div>
     <div class="sec">
-      <h3>実装予定の内容</h3>
+      <h3>変位ベクトルについて</h3>
       <p>
-        ① GEONET F5座標の自動DL<br>
-        ② 各基準点の変位ベクトル計算<br>
-        ③ ETAS残差マップとの重ね合わせ<br>
-        ④ 統計的相関検定 (Spearman ρ)
+        {lookback_note}。<br>
+        矢印は東西・南北方向の変位を誇張した縮尺で表示しています（実際の変位量はmm〜cmオーダー）。<br>
+        対象範囲: ETAS計算対象域（先島諸島〜北海道）内の代表{len(GNSS_STATIONS)}点。
       </p>
+      {error_html}
+      {not_configured_html}
     </div>
     <div class="sec">
-      <h3>現在の地図</h3>
-      <p>下の地図は GEONET 電子基準点の<br>配置を示すプレースホルダーです。<br>実データは Phase 5 で実装。</p>
+      <h3>観測点リスト</h3>
+      <div id="station-list"></div>
     </div>
   </div>
 </div>
@@ -1877,8 +2168,10 @@ var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
 {DARK_TILE}
 {GEOJSON_JS}
 
-// GEONET 電子基準点の代表的な配置をプレースホルダーとして表示
-// 実際のGEONET座標は約1300点存在する
+var LIVE = {str(live).lower()};
+var VECTORS = {vectors_json};
+
+// プレースホルダー用の観測点座標（実データ無効時のフォールバック表示）
 var placeholders=[
   [43.1,141.3],[42.9,143.2],[41.8,140.7],[40.8,140.7],[39.7,141.1],[38.3,140.9],
   [37.7,140.5],[37.0,140.4],[36.6,140.9],[36.4,140.5],[36.1,140.1],[35.9,139.6],
@@ -1888,17 +2181,66 @@ var placeholders=[
   [36.7,137.2],[36.6,136.6],[36.1,136.2],[35.7,138.6],[35.4,133.9],[35.5,134.2]
 ];
 
-placeholders.forEach(function(p){{
-  L.circleMarker(p,{{radius:4,color:'#34d399',fillColor:'#34d399',fillOpacity:0.7,weight:1}})
-   .bindTooltip('GEONET電子基準点（プレースホルダー）').addTo(map);
-}});
+var listEl = document.getElementById('station-list');
+
+if (!LIVE) {{
+  placeholders.forEach(function(p){{
+    L.circleMarker(p,{{radius:4,color:'#34d399',fillColor:'#34d399',fillOpacity:0.7,weight:1}})
+     .bindTooltip('GEONET電子基準点（プレースホルダー）').addTo(map);
+  }});
+  listEl.innerHTML = '<div style="color:#6b7280">実データ未取得のため一覧なし</div>';
+}} else {{
+  // 変位量(mm)を地図上で見やすくするための誇張スケール（メートル/mm）
+  var SCALE_M_PER_MM = 400;
+  var mPerDegLat = 111320.0;
+
+  function destPoint(lat, lon, dE_mm, dN_mm){{
+    var mPerDegLon = 111320.0 * Math.cos(lat * Math.PI/180);
+    var dxM = dE_mm * SCALE_M_PER_MM, dyM = dN_mm * SCALE_M_PER_MM;
+    return [lat + dyM/mPerDegLat, lon + dxM/mPerDegLon];
+  }}
+
+  var listHtml = '';
+  VECTORS.forEach(function(v){{
+    var mag = Math.sqrt(v.dE_mm*v.dE_mm + v.dN_mm*v.dN_mm);
+    var color = mag > 15 ? '#f87171' : (mag > 7 ? '#fbbf24' : '#34d399');
+    var dest = destPoint(v.lat, v.lon, v.dE_mm, v.dN_mm);
+
+    L.circleMarker([v.lat, v.lon], {{radius:3.5, color:color, fillColor:color, fillOpacity:0.9, weight:1}})
+     .addTo(map);
+    L.polyline([[v.lat, v.lon], dest], {{color:color, weight:2, opacity:0.85}})
+     .bindTooltip(v.name + '：東' + v.dE_mm.toFixed(1) + 'mm / 北' + v.dN_mm.toFixed(1) + 'mm（' + v.span_days + '日間）')
+     .addTo(map);
+    // 簡易矢頭
+    var ang = Math.atan2(dest[0]-v.lat, dest[1]-v.lon);
+    var ah = 0.10, aw = 0.35;
+    var wing1 = [dest[0] - ah*Math.sin(ang) + aw*ah*Math.cos(ang), dest[1] - ah*Math.cos(ang) - aw*ah*Math.sin(ang)];
+    var wing2 = [dest[0] - ah*Math.sin(ang) - aw*ah*Math.cos(ang), dest[1] - ah*Math.cos(ang) + aw*ah*Math.sin(ang)];
+    L.polygon([dest, wing1, wing2], {{color:color, fillColor:color, fillOpacity:0.9, weight:0}}).addTo(map);
+
+    listHtml += '<div><b style="color:#e5e7eb">' + v.name + '</b>（' + v.code + '）<br>'
+      + '東西: ' + v.dE_mm.toFixed(1) + 'mm　南北: ' + v.dN_mm.toFixed(1) + 'mm　上下: ' + v.dU_mm.toFixed(1) + 'mm'
+      + '　<span style="color:#6b7280">(' + v.n_points + '点/' + v.span_days + '日)</span></div>';
+  }});
+  listEl.innerHTML = listHtml || '<div style="color:#6b7280">データなし</div>';
+}}
 
 // 凡例
 var legend=L.control({{position:'bottomleft'}});
 legend.onAdd=function(){{
   var d=L.DomUtil.create('div');
   d.style.cssText='background:rgba(17,24,39,.92);padding:10px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;color:#f3f4f6;line-height:2';
-  d.innerHTML='<b>GNSS 電子基準点</b><br><span style="color:#34d399">●</span> GEONET基準点（仮）<br><hr style="border-color:#374151;margin:4px 0"><small>変位ベクトル表示は Phase 5 で実装</small>';
+  if (LIVE) {{
+    d.innerHTML='<b>GNSS変位ベクトル</b><br>'
+      + '<span style="color:#34d399">━</span> 小（≤7mm）　'
+      + '<span style="color:#fbbf24">━</span> 中（〜15mm）　'
+      + '<span style="color:#f87171">━</span> 大（15mm〜）<br>'
+      + '<hr style="border-color:#374151;margin:4px 0">'
+      + '<small>矢印の向き＝変位方向、長さは誇張表示</small>';
+  }} else {{
+    d.innerHTML='<b>GNSS 電子基準点</b><br><span style="color:#34d399">●</span> GEONET基準点（仮）<br>'
+      + '<hr style="border-color:#374151;margin:4px 0"><small>実データはSFTP設定後に表示されます</small>';
+  }}
   return d;
 }};
 legend.addTo(map);
@@ -3747,6 +4089,74 @@ def status():
     with _cache_lock:
         return {"phase":_ready_phase,"last_update":_last_update,
                 "quakes":len(_cached_data["all"]) if _cached_data else 0}
+
+@app.route("/gnss/status")
+def gnss_status():
+    """GNSS(GEONET SFTP)実データ取得の設定・稼働状況を返す（パスワード等は含めない）。"""
+    with _gnss_lock:
+        n_data = len(_gnss_cache["data"]) if _gnss_cache["data"] else 0
+        ts = _gnss_cache["ts"]
+        error = _gnss_cache["error"]
+        updating = _gnss_cache["updating"]
+    return {
+        "paramiko_available": _PARAMIKO_AVAILABLE,
+        "enabled": GSI_GNSS_ENABLED,
+        "sftp_host": GSI_SFTP_HOST,
+        "sftp_user_set": bool(GSI_SFTP_USER),
+        "stations_configured": len(GNSS_STATIONS),
+        "stations_with_data": n_data,
+        "last_update": ts,
+        "last_update_str": (datetime.fromtimestamp(ts, JST).strftime("%Y-%m-%d %H:%M JST") if ts else None),
+        "updating": updating,
+        "error": error,
+        "lookback_days": GNSS_LOOKBACK_DAYS,
+    }
+
+@app.route("/gnss/refresh_now", methods=["POST"])
+def gnss_refresh_now():
+    """GNSSデータの再取得を手動でトリガーする（デバッグ・動作確認用）。"""
+    if not GSI_GNSS_ENABLED:
+        return Response("GSI_SFTP_USER / GSI_SFTP_PASS が未設定、またはparamiko未インストールです", status=400)
+    with _gnss_lock:
+        already = _gnss_cache["updating"]
+    if already:
+        return {"status": "already_updating"}
+    threading.Thread(target=_refresh_gnss_cache, daemon=True).start()
+    return {"status": "started"}
+
+@app.route("/gnss/raw_sample")
+def gnss_raw_sample():
+    """
+    指定した観測点コードの.posファイル生データ（先頭・末尾数十行）をそのまま返すデバッグ用エンドポイント。
+    実際のファイルフォーマットを確認し、_parse_pos_file() の解析ロジックを検証・調整するために使う。
+    例: /gnss/raw_sample?station=940025
+    """
+    if not GSI_GNSS_ENABLED:
+        return Response("GSI_SFTP_USER / GSI_SFTP_PASS が未設定、またはparamiko未インストールです", status=400)
+    code = (request.args.get("station") or "").strip()
+    if not code:
+        return Response("?station=<観測点コード> を指定してください（例: 940025）", status=400)
+    year = request.args.get("year", str(datetime.now(timezone.utc).year)).strip()
+    try:
+        sftp, transport = _gsi_sftp_connect()
+    except Exception as e:
+        return Response(f"SFTP接続エラー: {e}", status=502)
+    try:
+        text, path = _fetch_station_pos_text(sftp, code, year)
+    finally:
+        try:
+            sftp.close(); transport.close()
+        except Exception:
+            pass
+    if text is None:
+        return Response(f"ファイルが見つかりませんでした（station={code}, year={year}）。"
+                         f"候補ディレクトリ: {', '.join(_GNSS_POS_DIR_CANDIDATES)}", status=404)
+    lines = text.splitlines()
+    preview = "\n".join(lines[:40] + (["...(中略)..."] if len(lines) > 80 else []) + (lines[-20:] if len(lines) > 80 else []))
+    parsed = _parse_pos_file(text)
+    return Response(
+        f"path: {path}\ntotal_lines: {len(lines)}\nparsed_rows: {len(parsed)}\n\n--- preview ---\n{preview}",
+        mimetype="text/plain")
 
 @app.route("/snapshots")
 def snapshots():
