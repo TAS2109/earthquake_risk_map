@@ -2284,6 +2284,16 @@ class FaultStressParams:
     R_MIN_FLOOR_KM = 1.0 # 破壊サイズがごく小さい場合の距離下限
     TIME_C = 1.0         # Omori-Utsu 減衰の c（日）
     TIME_P = 1.0         # Omori-Utsu 減衰の p
+    # ★ Bug fix (2026-08): Renderのメモリ制限でOOMになる問題への対策。
+    # quakes.csvは無期限に蓄積されるため地震件数が数千〜数万件に増える一方、
+    # 活断層データ(GEM Global Active Faults)もJapanバウンディングボックス内だけで
+    # 数千〜数万頂点になりうる。対策なしだと (点数 × 地震数) の密行列がそのまま
+    # メモリに載ってしまうため、以下で計算前に上限を設けて間引く。
+    MAX_LOOKBACK_DAYS = 730   # これより古い地震は時間減衰でほぼ寄与ゼロなので除外
+    MAX_QUAKES        = 4000  # 上記フィルタ後もなお多い場合は直近優先で間引く
+    MAX_POINTS        = 2000  # 断層/プレート境界サンプル点の上限（多い場合は等間隔に間引く）
+    POINT_CHUNK       = 300   # 点側のチャンクサイズ（ピークメモリを固定するため）
+    QUAKE_CHUNK       = 800   # 地震側のチャンクサイズ
 FSP = FaultStressParams()
 
 def _build_risk_cells():
@@ -2381,7 +2391,18 @@ def _quake_signature(quakes):
     latest_time = max((q.get("time", "") for q in quakes), default=None)
     return (len(quakes), latest_time)
 
-def _fault_plate_load_at_points(points_latlon, quakes, ref_time=None, chunk=1500):
+def _decimate_points(points_latlon, max_points):
+    """点群が多すぎる場合、等間隔に間引いて上限点数以下にする。
+    リスク格子(RISK_GRID_SIZE=0.5°)に対して十分な密度は保ちつつ、
+    メモリ/計算量を抑えるための簡易な間引き。"""
+    n = len(points_latlon)
+    if n <= max_points:
+        return points_latlon
+    stride = math.ceil(n / max_points)
+    return points_latlon[::stride]
+
+def _fault_plate_load_at_points(points_latlon, quakes, ref_time=None,
+                                 quake_chunk=None, point_chunk=None):
     """
     断層/プレート境界のサンプル点(points_latlon)それぞれについて、与えられた
     地震リストからの「応力負荷」を等方近似のクーロン応力変化モデルで積算する。
@@ -2389,7 +2410,14 @@ def _fault_plate_load_at_points(points_latlon, quakes, ref_time=None, chunk=1500
     r は震源とサンプル点の3次元距離（水平距離と震源深さから算出。断層/プレート
     境界のトレースはほぼ地表付近とみなす）。
     戻り値は points_latlon と同じ順序の numpy 配列。
+
+    ★ Bug fix (2026-08): 点数×地震数の密行列を一括確保するとRenderのメモリ制限で
+    OOMになったため、(1) 寄与がほぼゼロな古い地震を事前に除外、(2) それでも
+    件数が多い場合は直近優先で上限件数まで間引き、(3) 点側・地震側の両方を
+    チャンク分割してピークメモリを固定サイズに抑える、の3段構えで対策する。
     """
+    quake_chunk = quake_chunk or FSP.QUAKE_CHUNK
+    point_chunk = point_chunk or FSP.POINT_CHUNK
     n_pts = len(points_latlon)
     if n_pts == 0 or not quakes:
         return np.zeros(n_pts)
@@ -2400,8 +2428,8 @@ def _fault_plate_load_at_points(points_latlon, quakes, ref_time=None, chunk=1500
         try:
             t = datetime.fromisoformat(q["time"].replace("Z", "+00:00"))
             dt_days = (ref_time - t).total_seconds() / 86400.0
-            if dt_days < 0:
-                continue  # 参照時刻より未来の地震は無視（過去推移計算用）
+            if dt_days < 0 or dt_days > FSP.MAX_LOOKBACK_DAYS:
+                continue  # 未来の地震、または古すぎて寄与が無視できる地震は除外
         except Exception:
             continue
         qlat.append(q["lat"]); qlon.append(q["lon"]); qmag.append(q["mag"])
@@ -2409,6 +2437,14 @@ def _fault_plate_load_at_points(points_latlon, quakes, ref_time=None, chunk=1500
         qdt_days.append(dt_days)
     if not qlat:
         return np.zeros(n_pts)
+
+    # 上限件数を超える場合は直近の地震を優先して間引く（時間減衰が効くため
+    # 古い地震から間引いても寄与への影響は小さい）
+    if len(qlat) > FSP.MAX_QUAKES:
+        order = np.argsort(qdt_days)[:FSP.MAX_QUAKES]  # dt_daysが小さい=新しい順
+        qlat = [qlat[i] for i in order]; qlon = [qlon[i] for i in order]
+        qmag = [qmag[i] for i in order]; qdepth = [qdepth[i] for i in order]
+        qdt_days = [qdt_days[i] for i in order]
 
     qlat = np.array(qlat); qlon = np.array(qlon); qmag = np.array(qmag)
     qdepth = np.array(qdepth); qdt = np.array(qdt_days)
@@ -2420,22 +2456,30 @@ def _fault_plate_load_at_points(points_latlon, quakes, ref_time=None, chunk=1500
     time_w = (qdt + FSP.TIME_C) ** (-FSP.TIME_P)             # Omori-Utsu型 時間減衰
 
     pts = np.array(points_latlon)
-    cos_lat = np.cos(np.radians(pts[:, 0]))
+    cos_lat_all = np.cos(np.radians(pts[:, 0]))
     load = np.zeros(n_pts)
-    for start in range(0, len(qlat), chunk):
-        blat = qlat[start:start + chunk]; blon = qlon[start:start + chunk]
-        bdepth = qdepth[start:start + chunk]
-        bmoment = moment_ratio[start:start + chunk]
-        brmin = r_min[start:start + chunk]
-        btime = time_w[start:start + chunk]
 
-        dlat = (pts[:, 0:1] - blat[None, :]) * 111.0
-        dlon = (pts[:, 1:2] - blon[None, :]) * 111.0 * cos_lat[:, None]
-        dh = np.sqrt(dlat ** 2 + dlon ** 2)
-        r = np.sqrt(dh ** 2 + bdepth[None, :] ** 2)
-        r = np.maximum(r, brmin[None, :])
+    # 点側・地震側の両方をチャンク分割し、ピークメモリを point_chunk×quake_chunk
+    # の行列サイズ（固定）に抑える
+    for pstart in range(0, n_pts, point_chunk):
+        p_batch = pts[pstart:pstart + point_chunk]
+        p_cos = cos_lat_all[pstart:pstart + point_chunk]
+        batch_load = np.zeros(len(p_batch))
+        for qstart in range(0, len(qlat), quake_chunk):
+            blat = qlat[qstart:qstart + quake_chunk]; blon = qlon[qstart:qstart + quake_chunk]
+            bdepth = qdepth[qstart:qstart + quake_chunk]
+            bmoment = moment_ratio[qstart:qstart + quake_chunk]
+            brmin = r_min[qstart:qstart + quake_chunk]
+            btime = time_w[qstart:qstart + quake_chunk]
 
-        load += (bmoment[None, :] / (r ** 3) * btime[None, :]).sum(axis=1)
+            dlat = (p_batch[:, 0:1] - blat[None, :]) * 111.0
+            dlon = (p_batch[:, 1:2] - blon[None, :]) * 111.0 * p_cos[:, None]
+            dh = np.sqrt(dlat ** 2 + dlon ** 2)
+            r = np.sqrt(dh ** 2 + bdepth[None, :] ** 2)
+            r = np.maximum(r, brmin[None, :])
+
+            batch_load += (bmoment[None, :] / (r ** 3) * btime[None, :]).sum(axis=1)
+        load[pstart:pstart + point_chunk] = batch_load
     return load
 
 def _load_to_grid_max(points_latlon, loads):
@@ -2478,10 +2522,11 @@ def get_fault_stress_grid(quakes):
             and _fault_stress_cache["computed_for"] == cache_key):
         return _fault_stress_cache["grid"]
     pts = _flatten_line_points(fault_data)
+    pts = _decimate_points(pts, FSP.MAX_POINTS)
     loads = _fault_plate_load_at_points(pts, quakes)
     grid = _load_to_grid_max(pts, loads)
     _fault_stress_cache = {"grid": grid, "computed_for": cache_key}
-    print(f"[統合リスク] 活断層 応力負荷 {len(grid)}セル計算完了")
+    print(f"[統合リスク] 活断層 応力負荷 {len(grid)}セル計算完了（サンプル点{len(pts)}件）")
     return grid
 
 def get_plate_stress_grid(quakes):
@@ -2493,10 +2538,11 @@ def get_plate_stress_grid(quakes):
             and _plate_stress_cache["computed_for"] == cache_key):
         return _plate_stress_cache["grid"]
     pts = _flatten_line_points(plate_data, bbox=FAULTS_BBOX)
+    pts = _decimate_points(pts, FSP.MAX_POINTS)
     loads = _fault_plate_load_at_points(pts, quakes)
     grid = _load_to_grid_max(pts, loads)
     _plate_stress_cache = {"grid": grid, "computed_for": cache_key}
-    print(f"[統合リスク] プレート境界 応力負荷 {len(grid)}セル計算完了")
+    print(f"[統合リスク] プレート境界 応力負荷 {len(grid)}セル計算完了（サンプル点{len(pts)}件）")
     return grid
 
 def _risk_etas_raw(etas_grid_scores):
