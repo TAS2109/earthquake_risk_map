@@ -68,6 +68,22 @@ GITHUB_BACKUP_BRANCH  = os.environ.get("GITHUB_BACKUP_BRANCH", "main").strip() o
 GITHUB_BACKUP_PATH    = os.environ.get("GITHUB_BACKUP_PATH", "snapshots").strip().strip("/") or "snapshots"
 GITHUB_BACKUP_ENABLED = bool(GITHUB_BACKUP_REPO and GITHUB_BACKUP_TOKEN)
 
+# ★ Bug fix (2026-08): quakes.csv（生の地震履歴）自体はこれまでGitHubバックアップの
+# 対象外だった。スナップショットは解析結果（ETAS/b値の格子）だけを保存しており、
+# 生データはRenderの起動のたびにAPIから再取得する設計だったため、以下のケースで
+# 特定の地震（例: 2026/07/28 16:27 熊本地方 M7.1, 最大震度7）が恒久的に欠落しうる:
+#   1. その地震発生後、Renderが再デプロイ/長時間スリープでディスクをリセット
+#   2. 再起動後 fetch_all_quakes() がAPIから直近分を再取得するが、当該地震は
+#      直後から続く大規模な余震活動（数百〜数千回規模）により「直近30日分」の
+#      中でもさらに古い側に押しやられ、各APIのページング上限
+#      （下記 fetch_quakes_p2p の PAGES / fetch_quakes_p2p_jma の
+#      MAX_PAGES_PER_TYPE）内に収まらなくなる
+#   3. 結果として、一度取得できていたはずのデータがRenderの再起動を境に失われ、
+#      再取得もできない状態になる
+# 対策として、quakes.csv 自体も snapshots と同じ仕組みでGitHubへバックアップ/復元
+# できるようにする（保存先は snapshots ディレクトリとは別の固定ファイル名）。
+GITHUB_BACKUP_QUAKES_PATH = "quakes_backup/quakes.csv"
+
 # ── グローバルキャッシュ ──────────────────────────────
 _cache_lock        = threading.Lock()
 _cached_data       = None
@@ -147,7 +163,11 @@ def fetch_quakes_p2p():
     """
     BASE_URL = "https://api.p2pquake.net/v2/history"
     HEADERS  = {"User-Agent": "SeismoApp/5.0"}
-    PAGES    = 10       # 1ページ100件 → 最大1000件（増量）
+    # ★ Bug fix (2026-08): 大地震発生後は余震が数百〜数千回規模で続くことがあり、
+    # PAGES=10（最大1000件）では「直近30日分」に到達する前にページ上限へ達し、
+    # 本震そのものが取得対象から漏れることがあった（例: 2026/07/28 熊本地方 M7.1）。
+    # 余震活動が活発な時期でも30日分を確実にカバーできるよう上限を引き上げる。
+    PAGES    = 30       # 1ページ100件 → 最大3000件（大規模余震シーケンス対策で増量）
     cutoff   = datetime.now(timezone.utc) - timedelta(days=30)
 
     quakes = []
@@ -223,7 +243,13 @@ def fetch_quakes_p2p_jma():
     # /jma エンドポイントは 10 リクエスト/分。安全マージンを取って 6.5 秒間隔にする
     # (= 1分あたり約9リクエストでレート制限に抵触しないようにする)
     REQUEST_INTERVAL_SEC = 6.5
-    MAX_PAGES_PER_TYPE    = 15  # 1タイプあたり最大15ページ(1500件)に増量
+    # ★ Bug fix (2026-08): 大規模な余震シーケンス（例: 2026/07/28 熊本地方 M7.1、
+    # その後も数百〜数千回規模の余震が継続）が発生すると、"since_date"で30日分を
+    # 指定していても MAX_PAGES_PER_TYPE=15（1500件/タイプ）に達した時点で
+    # ページングが打ち切られ、本震のように「余震群の中で最も古い側」にある
+    # レコードが取得できなくなっていた。上限を引き上げて対応する
+    # （fetch_all_quakes 側の thread.join タイムアウトも合わせて延長済み）。
+    MAX_PAGES_PER_TYPE    = 30  # 1タイプあたり最大30ページ(3000件)に増量
 
     quakes = []
     seen_ids = set()
@@ -393,11 +419,14 @@ def fetch_all_quakes():
     for t in threads: t.start()
     # ★ Bug fix: p2p_jma は /jma のレート制限(10req/分)に対応するため
     # リクエスト間に約6.5秒のスリープを挟んでいる。Destination/ScaleAndDestination
-    # 各最大15ページなので、最悪ケースで約2〜3分ほどかかる。
+    # 各最大30ページ(増量後)なので、最悪ケースで約6〜7分ほどかかる。
     # 旧コードは timeout=30 で join していたため、p2p_jma が時間内に完了せず
     # results["p2p_jma"] が一切セットされない（=空扱いになる）ことが多発し、
     # 無感地震が取得できていなかった。十分なタイムアウトに変更する。
-    for t in threads: t.join(timeout=240)
+    # ★ さらに2026-08、MAX_PAGES_PER_TYPEを15→30に増量したのに合わせて、
+    # ここのタイムアウトも240秒のままだと新しい上限まで到達する前に打ち切られて
+    # 元の木阿弥になるため、余裕を持って600秒に延長する。
+    for t in threads: t.join(timeout=600)
     for name in ("p2p", "p2p_jma", "usgs", "jma"):
         if name not in results:
             print(f"[fetch_all] {name} タイムアウトで未完了のためスキップ")
@@ -443,6 +472,11 @@ def save_quakes(quakes):
                 existing.add(key); new_count += 1
     print(f"[保存] {new_count}件追加")
     _cleanup_old_quakes()
+    # ★ Bug fix (2026-08): 新規データが追加された時だけGitHubへバックアップし、
+    # data/quakes.csv がRenderの再起動をまたいでも失われないようにする。
+    # 変化がない場合は無駄なコミットを避けるためスキップする。
+    if new_count > 0:
+        _github_backup_quakes_csv_async()
 
 def _cleanup_old_quakes(keep_days=65):
     if not os.path.exists(DATA_FILE): return
@@ -671,6 +705,96 @@ def _github_restore_async():
     if not GITHUB_BACKUP_ENABLED:
         return
     threading.Thread(target=github_restore_snapshots, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════
+# quakes.csv（生の地震履歴）のGitHubバックアップ/復元
+# ★ Bug fix (2026-08): 詳細はファイル冒頭 GITHUB_BACKUP_QUAKES_PATH のコメント参照。
+# 生データはRenderの再起動のたびにAPIから再取得する設計だったため、大規模な余震
+# シーケンスでAPIのページング上限を超えてしまうと、本震のような重要なレコードが
+# 恒久的に欠落する不具合があった。スナップショットと同様にGitHubへ退避することで、
+# 「一度取得できたデータは再起動後も失われない」状態にする。
+# ══════════════════════════════════════════════════════
+def github_backup_quakes_csv():
+    """ローカルの quakes.csv をGitHubへバックアップする（同期実行・失敗しても例外を投げない）。"""
+    if not GITHUB_BACKUP_ENABLED:
+        return False
+    if not os.path.exists(DATA_FILE):
+        return False
+    return github_backup_file(DATA_FILE, GITHUB_BACKUP_QUAKES_PATH, "quakes.csv backup")
+
+def _github_backup_quakes_csv_async():
+    if not GITHUB_BACKUP_ENABLED:
+        return
+    threading.Thread(target=github_backup_quakes_csv, daemon=True).start()
+
+def github_restore_quakes_csv():
+    """
+    起動時にGitHub側にバックアップされた quakes.csv を取得し、ローカルの
+    data/quakes.csv とマージする（時刻・緯度・経度が一致するものは重複除外）。
+
+    ★ ローカルファイルが存在しない（Render再起動直後でディスクが空）場合はもちろん、
+    既に存在する場合でも欠けている行だけを補完できるよう、常にマージ処理を行う。
+    これにより、大規模な余震シーケンスでAPIのページング上限に引っかかって
+    再取得できなくなった古いレコード（本震など）も、過去にバックアップ済みで
+    あれば復元できる。
+    """
+    if not GITHUB_BACKUP_ENABLED:
+        return
+    api_url = f"https://api.github.com/repos/{GITHUB_BACKUP_REPO}/contents/{GITHUB_BACKUP_QUAKES_PATH}"
+    try:
+        r = requests.get(api_url, headers=_github_api_headers(),
+                          params={"ref": GITHUB_BACKUP_BRANCH}, timeout=20)
+        if r.status_code == 404:
+            print("[GitHub restore] quakes.csv バックアップ未作成のため復元対象なし")
+            return
+        if r.status_code != 200:
+            print(f"[GitHub restore] quakes.csv 取得失敗: {r.status_code} {r.text[:200]}")
+            return
+        content_b64 = r.json().get("content", "")
+        raw = base64.b64decode(content_b64).decode("utf-8", errors="ignore")
+    except Exception as e:
+        print(f"[GitHub restore] quakes.csv 取得例外: {e}")
+        return
+
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+
+    existing = set()
+    existing_rows = []
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, encoding="utf-8") as f:
+            for row in csv.reader(f):
+                if len(row) >= 3:
+                    existing.add((row[0], row[1], row[2]))
+                    existing_rows.append(row)
+
+    restored_rows = []
+    for row in csv.reader(io.StringIO(raw)):
+        if len(row) >= 3 and (row[0], row[1], row[2]) not in existing:
+            existing.add((row[0], row[1], row[2]))
+            restored_rows.append(row)
+
+    if not restored_rows:
+        print("[GitHub restore] quakes.csv 復元: 追加分なし（既に最新）")
+        return
+
+    with open(DATA_FILE, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(restored_rows)
+    print(f"[GitHub restore] quakes.csv 復元: {len(restored_rows)}件追加")
+    _cleanup_old_quakes()
+
+def _github_restore_quakes_csv_sync():
+    """
+    quakes.csv の復元はバックグラウンド更新ループの1回目のキャッシュ読み込み
+    (load_quakes) より前に完了している必要があるため、非同期スレッドではなく
+    起動シーケンス内で同期的に実行する（ファイル1つの取得のみなので数秒程度）。
+    """
+    if not GITHUB_BACKUP_ENABLED:
+        return
+    try:
+        github_restore_quakes_csv()
+    except Exception as e:
+        print(f"[GitHub restore] quakes.csv 復元処理で例外: {e}")
 
 def list_snapshots():
     """保存済みスナップショットのファイル名を新しい順に返す。"""
@@ -3502,7 +3626,34 @@ def snapshots_backup_status():
         "repo":   GITHUB_BACKUP_REPO if GITHUB_BACKUP_ENABLED else None,
         "branch": GITHUB_BACKUP_BRANCH if GITHUB_BACKUP_ENABLED else None,
         "path":   GITHUB_BACKUP_PATH if GITHUB_BACKUP_ENABLED else None,
+        "quakes_path": GITHUB_BACKUP_QUAKES_PATH if GITHUB_BACKUP_ENABLED else None,
     }
+
+@app.route("/quakes/backup_now", methods=["POST"])
+def quakes_backup_now():
+    """
+    ローカルの data/quakes.csv を手動でGitHubへバックアップする。
+    導入直後にこれまでの蓄積分を退避したい場合や、自動バックアップに
+    失敗していた疑いがある場合の手動リトライ用。
+    """
+    if not GITHUB_BACKUP_ENABLED:
+        return Response("GITHUB_BACKUP_REPO / GITHUB_BACKUP_TOKEN が未設定です", status=400)
+    if not os.path.exists(DATA_FILE):
+        return Response("data/quakes.csv がまだ存在しません", status=400)
+    _github_backup_quakes_csv_async()
+    return {"status": "started"}
+
+@app.route("/quakes/restore_now", methods=["POST"])
+def quakes_restore_now():
+    """
+    GitHub側にバックアップされた quakes.csv をローカルへ復元（マージ）する処理を
+    手動で再実行する。通常は起動時に自動実行されるが、後からバックアップ設定を
+    追加した場合や復元に失敗した疑いがある場合に手動で再試行できるようにしている。
+    """
+    if not GITHUB_BACKUP_ENABLED:
+        return Response("GITHUB_BACKUP_REPO / GITHUB_BACKUP_TOKEN が未設定です", status=400)
+    threading.Thread(target=github_restore_quakes_csv, daemon=True).start()
+    return {"status": "started"}
 
 @app.route("/snapshots/backup_now", methods=["POST"])
 def snapshots_backup_now():
@@ -3559,6 +3710,10 @@ def snapshot_detail(fname):
     return out
 
 if __name__ == "__main__":
+    # ★ Bug fix (2026-08): quakes.csv の復元は、バックグラウンド更新ループが
+    # 1回目に load_quakes() でキャッシュを温める前に完了している必要があるため、
+    # スナップショット復元（非同期）とは別に、ここで同期的に実行する。
+    _github_restore_quakes_csv_sync()
     _github_restore_async()
     threading.Thread(target=_update_data, daemon=True).start()
     app.run(debug=False, host="0.0.0.0", port=5000)
