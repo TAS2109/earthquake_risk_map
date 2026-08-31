@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v6.4
+地震研究統合プラットフォーム v7.01
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -3944,7 +3944,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v6.4 / 研究用</div>
+      <div>v7.01 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
