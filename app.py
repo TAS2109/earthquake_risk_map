@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v7.03
+地震研究統合プラットフォーム v7.21
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -840,6 +840,8 @@ def _github_restore_async():
     threading.Thread(target=github_restore_snapshots, daemon=True).start()
 
 
+
+
 # ══════════════════════════════════════════════════════
 # quakes.csv（生の地震履歴）のGitHubバックアップ/復元
 # ★ Bug fix (2026-08): 詳細はファイル冒頭 GITHUB_BACKUP_QUAKES_PATH のコメント参照。
@@ -1071,6 +1073,153 @@ def _percentile_thresholds(values_arr):
     return (np.percentile(log_v,99.8), np.percentile(log_v,98.5),
             np.percentile(log_v,95.0), np.percentile(log_v,85.0),
             np.percentile(log_v,50.0))
+
+
+# ══════════════════════════════════════════════════════
+# 絶対基準キャリブレーション（気象庁の警戒レベル方式に近づける）
+# ──────────────────────────────────────────────────────
+# 従来の _percentile_thresholds() / _percentile_rank_map() は「今この瞬間の
+# グリッド間の相対順位」でレベルを決めていたため、日本全体が平穏な日でも
+# 機械的に上位0.2%がLv5になってしまう（＝相対評価）。
+#
+# ここでは「アーカイブ」タブと同じ仕組み（load_quakes_between + analyze_etas の
+# ref_time指定）を使い、取得できる範囲（quakes.csvの保持期間=65日分）を
+# 一定間隔でサンプリングして「過去実績の生値の分布」をプールする。
+# 現在の値をこの過去実績分布と比較した順位（＝絶対評価）を求め、
+# 相対評価と絶対評価の小さい方（より保守的な方）を採用することで、
+# 「相対的にも高く、かつ過去65日の実績と比べても稀」な場合だけ
+# 高レベルになるようにする。
+#
+# さらに、統計的な稀さだけでは「たまたま直近65日がずっと静穏だった／
+# 逆にずっと活発だった」場合に基準がぶれるため、ドメイン知識に基づく
+# 絶対的な下限フィルタ（_etas_domain_floor / _bvalue_domain_floor）も
+# 組み合わせるハイブリッド方式にする。
+# ══════════════════════════════════════════════════════
+HIST_CALIB_LOOKBACK_DAYS = 65     # quakes.csv の保持期間(_cleanup_old_quakes)に合わせる
+HIST_CALIB_SAMPLE_HOURS  = 24     # 24時間おきにサンプリング（最大65点、計算負荷とのバランス）
+HIST_CALIB_TTL_SEC       = 6 * 3600  # 6時間ごとに再キャリブレーション（新着データを反映）
+HIST_CALIB_MIN_POOL      = 30     # プール件数がこれ未満なら未キャリブレーション扱い（相対評価にフォールバック）
+
+_hist_calib_cache = {"ts": 0.0, "etas": None, "bvalue": None, "fault": None, "plate": None, "n_samples": 0}
+_hist_calib_lock = threading.Lock()
+
+def _sample_ref_times(lookback_days=HIST_CALIB_LOOKBACK_DAYS, step_hours=HIST_CALIB_SAMPLE_HOURS):
+    now = datetime.now(timezone.utc)
+    n = int(lookback_days * 24 / step_hours)
+    # 直近(0時間前=現在)は「今まさに評価しようとしている値」と重なるため含めない
+    return [now - timedelta(hours=step_hours * i) for i in range(1, n + 1)]
+
+def _compute_historical_calibration():
+    """過去HIST_CALIB_LOOKBACK_DAYS日間を定期サンプリングし、ETAS/b値/断層・
+    プレート応力それぞれの「生の値」の分布(プール)を作る。アーカイブタブの
+    再計算ロジック(load_quakes_between / analyze_etas(ref_time=...) /
+    _historical_fault_plate_raw)をそのまま流用する。"""
+    ref_times = _sample_ref_times()
+    etas_pool, bvalue_pool, fault_pool, plate_pool = [], [], [], []
+    ok = 0
+    for rt in ref_times:
+        try:
+            start = rt - timedelta(days=60)
+            quakes = load_quakes_between(start, rt)
+            if not quakes:
+                continue
+            etas_scores = analyze_etas(quakes, ref_time=rt)
+            etas_pool.extend(_risk_etas_raw(etas_scores).values())
+
+            bgrid = compute_bvalue_grid(quakes)
+            bvalue_pool.extend(_risk_bvalue_raw(bgrid).values())
+
+            fault_raw, plate_raw = _historical_fault_plate_raw(quakes, rt)
+            fault_pool.extend(fault_raw.values())
+            plate_pool.extend(plate_raw.values())
+            ok += 1
+        except Exception as e:
+            print(f"[絶対基準キャリブレーション] サンプル({rt})でエラー: {e}")
+            continue
+    print(f"[絶対基準キャリブレーション] {ok}/{len(ref_times)}時点サンプリング完了 "
+          f"(etas={len(etas_pool)} bvalue={len(bvalue_pool)} fault={len(fault_pool)} plate={len(plate_pool)})")
+    return {
+        "ts": time.time(),
+        "etas":   np.array(etas_pool)   if etas_pool   else None,
+        "bvalue": np.array(bvalue_pool) if bvalue_pool else None,
+        "fault":  np.array(fault_pool)  if fault_pool  else None,
+        "plate":  np.array(plate_pool)  if plate_pool  else None,
+        "n_samples": ok,
+    }
+
+def _get_historical_calibration():
+    """キャリブレーション結果をキャッシュから返す。期限切れ・未計算の場合は
+    バックグラウンドスレッドで再計算を開始しつつ、それまでは古い(または空の)
+    結果をそのまま返す（Webリクエストの応答をブロックしないため）。"""
+    global _hist_calib_cache
+    if time.time() - _hist_calib_cache["ts"] > HIST_CALIB_TTL_SEC:
+        if _hist_calib_lock.acquire(blocking=False):
+            def _job():
+                global _hist_calib_cache
+                try:
+                    _hist_calib_cache = _compute_historical_calibration()
+                finally:
+                    _hist_calib_lock.release()
+            threading.Thread(target=_job, daemon=True).start()
+    return _hist_calib_cache
+
+def _historical_abs_rank(raw_map, pool, invert=False, log_transform=False):
+    """raw_mapの各セルの値を『過去実績分布(pool)の中での位置』(0〜1)に変換する。
+    poolが不足している(キャリブレーション未完了)場合はNoneを返す。"""
+    if not raw_map or pool is None or len(pool) < HIST_CALIB_MIN_POOL:
+        return None
+    ref = np.log(np.clip(pool, 0, None) + 1) if log_transform else pool
+    ref_sorted = np.sort(ref)
+    n = len(ref_sorted)
+    out = {}
+    for k, v in raw_map.items():
+        x = math.log(max(v, 0) + 1) if log_transform else v
+        rank = np.searchsorted(ref_sorted, x, side="right") / n
+        if invert:
+            rank = 1.0 - rank
+        out[k] = float(np.clip(rank, 0.0, 1.0))
+    return out
+
+def _etas_domain_floor(raw_v, s):
+    """ドメイン知識: ETASスコアが背景地震活動(EP.MU)の何倍かを見て、
+    ごく僅かな上振れではLv4/5相当のスコアにならないよう頭打ちにする
+    （過去65日間がたまたま静穏/活発だった場合の安全弁）。倍率は経験則であり、
+    観測実績が蓄積され次第チューニングする前提の暫定値。"""
+    ratio = raw_v / max(EP.MU, 1e-9)
+    if ratio < 1.5: return min(s, 0.55)   # Lv3相当まで
+    if ratio < 3.0: return min(s, 0.80)   # Lv4相当まで
+    return s
+
+def _bvalue_domain_floor(raw_v, s):
+    """ドメイン知識: 地殻の平均的なb値はおよそ1.0前後とされる。0.8を下回って
+    初めて応力集中の可能性を疑うレベルとみなし、それより高い(平均的な)場合は
+    スコアを頭打ちにする。"""
+    if raw_v >= 0.9: return min(s, 0.55)
+    if raw_v >= 0.8: return min(s, 0.80)
+    return s
+
+# 気圧偏差・TEC(電離圏)は過去分のデータを保持しておらず絶対評価の基準を
+# 作れないため、単独でLv4/5の主因にならないようスコアに上限を設ける
+# （ドメイン知識: 気圧・電離圏異常と地震の関連は実証段階であり、あくまで
+# 補助的な参考指標として扱う、という判断）。
+PRESSURE_TEC_SCORE_CAP = 0.6
+
+def _hybrid_rank_map(raw_map, pool, invert=False, log_transform=False, domain_floor_fn=None):
+    """『今この瞬間の空間内相対順位』と『過去65日間の実績と比べた絶対順位』の
+    両方を求め、小さい方（より保守的な方）を採用する。さらにdomain_floor_fnが
+    与えられればドメイン知識による絶対下限フィルタも適用する。
+    キャリブレーション未完了時は相対評価のみにフォールバックする。"""
+    rel = _percentile_rank_map(raw_map, invert=invert)
+    absr = _historical_abs_rank(raw_map, pool, invert=invert, log_transform=log_transform)
+    if absr is None:
+        return rel
+    out = {}
+    for k, rv in rel.items():
+        s = min(rv, absr.get(k, rv))
+        if domain_floor_fn is not None:
+            s = domain_floor_fn(raw_map[k], s)
+        out[k] = s
+    return out
 
 
 # ══════════════════════════════════════════════════════
@@ -1344,15 +1493,35 @@ def render_etas(grid_scores, quakes, updated_str):
     cells = []
     if grid_scores:
         vals = np.array(list(grid_scores.values()))
-        th5,th4,th3,th2,th1 = _percentile_thresholds(vals)
+        th5,th4,th3,th2,th1 = _percentile_thresholds(vals)          # 相対評価（今この瞬間の空間内順位）
+        calib = _get_historical_calibration()
+        hist_pool = calib.get("etas")
+        hth5=hth4=hth3=hth2=hth1=None
+        if hist_pool is not None and len(hist_pool) >= HIST_CALIB_MIN_POOL:
+            hth5,hth4,hth3,hth2,hth1 = _percentile_thresholds(hist_pool)  # 絶対評価（過去65日間の実績）
         for (gi,gj), score in grid_scores.items():
             s = math.log(score+1)
+            # ① 相対評価: 今の空間内での順位
             if   s>=th5: lv=5
             elif s>=th4: lv=4
             elif s>=th3: lv=3
             elif s>=th2: lv=2
             elif s>=th1: lv=1
             else: continue
+            # ② 絶対評価: 過去65日間の実績分布と比べても稀な値かどうか（キャリブレーション未完了時はスキップ）
+            if hth5 is not None:
+                if   s>=hth5: lv_abs=5
+                elif s>=hth4: lv_abs=4
+                elif s>=hth3: lv_abs=3
+                elif s>=hth2: lv_abs=2
+                elif s>=hth1: lv_abs=1
+                else: lv_abs=0
+                lv = min(lv, lv_abs)
+            # ③ ドメイン知識: 背景地震活動(EP.MU)に対する倍率が小さいうちはLv4/5にしない安全弁
+            ratio = score / max(EP.MU, 1e-9)
+            if ratio < 1.5: lv = min(lv, 3)
+            elif ratio < 3.0: lv = min(lv, 4)
+            if lv <= 0: continue
             cells.append({"lat":gi*GRID_SIZE,"lon":gj*GRID_SIZE,
                           "color":ETAS_COLOR[lv],"lv":lv,"score":round(score,4)})
 
@@ -3034,12 +3203,23 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid, quakes):
     pressure_raw = _risk_pressure_raw()
     tec_raw      = _risk_tec_raw()
 
-    etas_rank     = _percentile_rank_map(etas_raw, invert=False)
-    bvalue_rank   = _percentile_rank_map(bvalue_raw, invert=True)    # 低b値 = 高リスク
-    fault_rank    = _percentile_rank_map(fault_raw, invert=False)    # 応力負荷が大きい = 高リスク
-    plate_rank    = _percentile_rank_map(plate_raw, invert=False)    # 応力負荷が大きい = 高リスク
-    pressure_rank = _percentile_rank_map(pressure_raw, invert=False)
-    tec_rank      = _percentile_rank_map(tec_raw, invert=False)      # 偏差が大きい = 高リスク
+    # ── ハイブリッド方式 ──────────────────────────────
+    # 「今この瞬間の空間内相対順位」だけでなく、「アーカイブ(過去65日間)の
+    # 実績分布と比べても稀な値か」「ドメイン知識から見て意味のある水準か」
+    # も併せて満たす場合にのみスコアが高くなるようにする。
+    # 気圧偏差・TECは過去分の履歴を保持していないため絶対評価ができず、
+    # 単独でLv4/5の主因にならないよう固定の上限(PRESSURE_TEC_SCORE_CAP)を課す。
+    calib = _get_historical_calibration()
+    etas_rank     = _hybrid_rank_map(etas_raw, calib.get("etas"), invert=False,
+                                      log_transform=True, domain_floor_fn=_etas_domain_floor)
+    bvalue_rank   = _hybrid_rank_map(bvalue_raw, calib.get("bvalue"), invert=True,
+                                      log_transform=False, domain_floor_fn=_bvalue_domain_floor)
+    fault_rank    = _hybrid_rank_map(fault_raw, calib.get("fault"), invert=False, log_transform=False)
+    plate_rank    = _hybrid_rank_map(plate_raw, calib.get("plate"), invert=False, log_transform=False)
+    pressure_rank = {k: min(v, PRESSURE_TEC_SCORE_CAP)
+                      for k, v in _percentile_rank_map(pressure_raw, invert=False).items()}
+    tec_rank      = {k: min(v, PRESSURE_TEC_SCORE_CAP)
+                      for k, v in _percentile_rank_map(tec_raw, invert=False).items()}   # 偏差が大きい = 高リスク
 
     cells = []
     for key, (lat, lon) in _RISK_CELLS.items():
@@ -3094,10 +3274,16 @@ def compute_risk_grid_historical(quakes, ref_time):
     etas_raw   = _risk_etas_raw(etas_grid_scores)
     bvalue_raw = _risk_bvalue_raw(bvalue_grid)
 
-    etas_rank   = _percentile_rank_map(etas_raw, invert=False)
-    bvalue_rank = _percentile_rank_map(bvalue_raw, invert=True)   # 低b値 = 高リスク
-    fault_rank  = _percentile_rank_map(fault_raw, invert=False)
-    plate_rank  = _percentile_rank_map(plate_raw, invert=False)
+    # 通常版(compute_risk_grid)と同じハイブリッド方式（相対順位×過去実績との
+    # 絶対比較×ドメイン知識）を適用し、アーカイブ表示と現在表示でレベルの
+    # 意味がぶれないようにする。
+    calib = _get_historical_calibration()
+    etas_rank   = _hybrid_rank_map(etas_raw, calib.get("etas"), invert=False,
+                                    log_transform=True, domain_floor_fn=_etas_domain_floor)
+    bvalue_rank = _hybrid_rank_map(bvalue_raw, calib.get("bvalue"), invert=True,
+                                    log_transform=False, domain_floor_fn=_bvalue_domain_floor)
+    fault_rank  = _hybrid_rank_map(fault_raw, calib.get("fault"), invert=False, log_transform=False)
+    plate_rank  = _hybrid_rank_map(plate_raw, calib.get("plate"), invert=False, log_transform=False)
 
     cells = []
     for key, (lat, lon) in _RISK_CELLS.items():
@@ -3931,7 +4117,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震研究統合プラットフォーム v7.03</title>
+  <title>地震研究統合プラットフォーム v7.21</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
@@ -3976,7 +4162,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v7.03 / 研究用</div>
+      <div>v7.21 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -4493,5 +4679,11 @@ if __name__ == "__main__":
     # スナップショット復元（非同期）とは別に、ここで同期的に実行する。
     _github_restore_quakes_csv_sync()
     _github_restore_async()
+    # 絶対基準キャリブレーション（過去65日間の実績プール作成）も起動直後に
+    # 開始しておく。この関数自体が内部でバックグラウンドスレッドを起動して
+    # 即座に返るため、ここで呼んでもアプリ起動をブロックしない。
+    # 初回リクエストまで待つと最初の数時間は相対評価のみにフォールバック
+    # してしまうため、できるだけ早く準備を始める。
+    _get_historical_calibration()
     threading.Thread(target=_update_data, daemon=True).start()
     app.run(debug=False, host="0.0.0.0", port=5000)
