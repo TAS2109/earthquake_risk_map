@@ -3325,11 +3325,11 @@ function computeComposite(cell){{
   return {{score: ssum/wsum, used: used, wsum: wsum}};
 }}
 function levelOf(score){{
-  if(score>=0.8) return 5;
-  if(score>=0.6) return 4;
-  if(score>=0.4) return 3;
-  if(score>=0.2) return 2;
-  return 1;
+  if(score>=0.95) return 5;
+  if(score>=0.8) return 4;
+  if(score>=0.7) return 3;
+  if(score>=0.6) return 2;
+  if(score>=0.4return 1;
 }}
 
 // 寄与度(浮動小数)の配列を、合計が total(整数)に一致するよう最大剰余法で丸める
