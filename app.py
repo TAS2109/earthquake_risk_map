@@ -3326,8 +3326,8 @@ function computeComposite(cell){{
 }}
 function levelOf(score){{
   if(score>=0.95) return 5;
-  if(score>=0.7) return 4;
-  if(score>=0.5) return 3;
+  if(score>=0.75) return 4;
+  if(score>=0.55) return 3;
   if(score>=0.3) return 2;
   return 1;
 }}
