@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v7.22
+地震研究統合プラットフォーム v7.33
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -4155,7 +4155,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震研究統合プラットフォーム v7.22</title>
+  <title>地震研究統合プラットフォーム v7.33</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
@@ -4200,7 +4200,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v7.22 / 研究用</div>
+      <div>v7.33 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -4210,30 +4210,30 @@ SHELL_HTML = """<!DOCTYPE html>
     </button>
     <button class="tab-btn" onclick="sw(1)">
       <span class="label">地震履歴</span>
-      <span class="badge">有感+無感</span>
+      <span class="badge">JMA/P2P/USGS</span>
     </button>
     <button class="tab-btn" onclick="sw(2)">
       <span class="label">ETASマップ</span>
-      <span class="badge">P1</span>
+      <span class="badge">JMA/P2P/USGS</span>
     </button>
     <button class="tab-btn" onclick="sw(3)">
       <span class="label">b値マップ</span>
-      <span class="badge">P4</span>
+      <span class="badge">JMA/P2P/USGS</span>
     </button>
     <button class="tab-btn" onclick="sw(4)">
       <span class="label">活断層・プレート境界</span>
-      <span class="badge">地質</span>
+      <span class="badge">GEM</span>
     </button>
 
     <div class="sep"></div>
     <div class="group-title">地球物理データ</div>
     <button class="tab-btn" onclick="sw(5)">
       <span class="label">TEC</span>
-      <span class="badge">P5+</span>
+      <span class="badge">NICT</span>
     </button>
     <button class="tab-btn" onclick="sw(6)">
       <span class="label">GNSS変位</span>
-      <span class="badge">P5</span>
+      <span class="badge">GSI</span>
     </button>
 
     <div class="sep"></div>
@@ -4247,7 +4247,7 @@ SHELL_HTML = """<!DOCTYPE html>
     <div class="group-title">ログ</div>
     <button class="tab-btn" onclick="sw(8)">
       <span class="label">アーカイブ</span>
-      <span class="badge">1h</span>
+      <span class="badge">USGS</span>
     </button>
 
     <div class="version">ETAS残差研究プロジェクト</div>
