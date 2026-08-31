@@ -11,7 +11,7 @@
   6. TEC          - 電離圏全電子数 (NICT SCIDAS リンク)
   7. GNSS         - 地殻変動 (GEONET SFTP実データ変位ベクトル、未設定時はプレースホルダー)
   8. 海面気圧     - アメダス海面気圧マップ
-  9. アーカイブ - 1時間ごとの解析結果ログ
+  9. アーカイブ     - 日時指定で過去1か月分の地震データから統合リスクマップを再計算
 """
 
 from flask import Flask, Response, send_file, request
@@ -591,6 +591,27 @@ def load_quakes(days=60):
             except Exception: continue
     return data
 
+def load_quakes_between(start_utc, end_utc):
+    """指定したUTC期間 [start_utc, end_utc] に含まれる地震だけをCSVから読み込む。
+    load_quakes()は「直近N日」しか扱えないため、過去の任意時点を基準にした
+    再解析（アーカイブタブの日時指定検索）用にこちらを使う。
+    ★ quakes.csv は_cleanup_old_quakes(keep_days=65)により65日より古いデータが
+    削除されるため、65日より前の期間を指定した場合はヒットしない点に注意。"""
+    if not os.path.exists(DATA_FILE): return []
+    data = []
+    with open(DATA_FILE, encoding="utf-8") as f:
+        for row in csv.reader(f):
+            try:
+                t = datetime.fromisoformat(row[0].replace("Z","+00:00"))
+                if t < start_utc or t > end_utc: continue
+                data.append({"time":row[0],"lat":float(row[1]),"lon":float(row[2]),
+                             "mag":float(row[3]),"depth":float(row[4]),
+                             "source":row[5] if len(row)>5 else "",
+                             "place":row[6] if len(row)>6 else "",
+                             "max_int":row[7] if len(row)>7 else ""})
+            except Exception: continue
+    return data
+
 
 # ══════════════════════════════════════════════════════
 # スナップショット（解析結果を1時間ごとにログして後で読み込めるようにする）
@@ -957,16 +978,19 @@ def build_snapshots_zip(max_files=None):
 # ══════════════════════════════════════════════════════
 # ETAS 解析
 # ══════════════════════════════════════════════════════
-def analyze_etas(quakes):
+def analyze_etas(quakes, ref_time=None):
+    """ETAS格子スコアを計算する。ref_timeを指定すると「その時点」を基準に
+    時間減衰を計算する（過去のある時点での統合リスクマップ再現用）。
+    省略時は従来通り現在時刻を基準にする。"""
     if not quakes: return {}
-    now_utc = datetime.now(timezone.utc)
-    cutoff  = now_utc - timedelta(days=60)
+    ref_time = ref_time or datetime.now(timezone.utc)
+    cutoff  = ref_time - timedelta(days=60)
     valid = []
     for q in quakes:
         try:
             t = datetime.fromisoformat(q["time"].replace("Z","+00:00"))
             if t < cutoff: continue
-            dt_days = (now_utc - t).total_seconds() / 86400
+            dt_days = (ref_time - t).total_seconds() / 86400
             if dt_days < 0: continue
             depth_factor = math.exp(-q["depth"] / EP.DEPTH_SCALE)
             valid.append((q["lat"], q["lon"], q["mag"], dt_days, depth_factor))
@@ -3005,6 +3029,60 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid, quakes):
     return cells
 
 
+# ══════════════════════════════════════════════════════
+# アーカイブタブ: 過去の任意時点における統合リスクマップの再計算
+# ══════════════════════════════════════════════════════
+# 通常の統合リスクマップ(tab: riskmap)は「現在」を基準にETAS/応力負荷を計算するが、
+# こちらは指定された過去の日時(ref_time)を基準に、その1か月前までの地震データだけを
+# 使って同様のマップを再現する。気圧偏差(pressure)とTEC(tec)は過去分のデータを
+# 保持していないため、この再計算には含めない（選択項目から欠けても重み再正規化で
+# 自動的に無視される、という既存のフロントエンドの仕組みをそのまま利用する）。
+def _historical_fault_plate_raw(quakes, ref_time):
+    """過去時点(ref_time)を基準に、活断層・プレート境界への応力負荷を計算する。
+    通常版(get_fault_stress_grid/get_plate_stress_grid)は「現在」基準の結果を
+    キャッシュして使い回す設計のため、ここでは流用せず都度計算する
+    （アーカイブ検索は頻繁には呼ばれない想定のため、キャッシュ無しでも許容できる）。"""
+    fault_data = get_japan_active_faults()
+    fpts = _decimate_points(_flatten_line_points(fault_data), FSP.MAX_POINTS)
+    fault_raw = _load_to_grid_max(fpts, _fault_plate_load_at_points(fpts, quakes, ref_time=ref_time))
+
+    plate_data = get_plate_boundaries()
+    ppts = _decimate_points(_flatten_line_points(plate_data, bbox=FAULTS_BBOX), FSP.MAX_POINTS)
+    plate_raw = _load_to_grid_max(ppts, _fault_plate_load_at_points(ppts, quakes, ref_time=ref_time))
+
+    return fault_raw, plate_raw
+
+def compute_risk_grid_historical(quakes, ref_time):
+    """過去時点(ref_time)における統合リスクマップ用のセル一覧を返す。
+    quakesは事前に [ref_time - 1か月, ref_time] の範囲でフィルタ済みのものを渡す。"""
+    etas_grid_scores = analyze_etas(quakes, ref_time=ref_time)
+    bvalue_grid = compute_bvalue_grid(quakes)
+    fault_raw, plate_raw = _historical_fault_plate_raw(quakes, ref_time)
+
+    etas_raw   = _risk_etas_raw(etas_grid_scores)
+    bvalue_raw = _risk_bvalue_raw(bvalue_grid)
+
+    etas_rank   = _percentile_rank_map(etas_raw, invert=False)
+    bvalue_rank = _percentile_rank_map(bvalue_raw, invert=True)   # 低b値 = 高リスク
+    fault_rank  = _percentile_rank_map(fault_raw, invert=False)
+    plate_rank  = _percentile_rank_map(plate_raw, invert=False)
+
+    cells = []
+    for key, (lat, lon) in _RISK_CELLS.items():
+        comp = {}
+        if key in etas_rank:
+            comp["etas"] = {"s": round(etas_rank[key], 4), "r": round(etas_raw[key], 4)}
+        if key in bvalue_rank:
+            comp["bvalue"] = {"s": round(bvalue_rank[key], 4), "r": round(bvalue_raw[key], 3)}
+        if key in fault_rank:
+            comp["fault"] = {"s": round(fault_rank[key], 4), "r": round(fault_raw[key], 1)}
+        if key in plate_rank:
+            comp["plate"] = {"s": round(plate_rank[key], 4), "r": round(plate_raw[key], 1)}
+        if comp:
+            cells.append({"lat": round(lat, 3), "lon": round(lon, 3), "c": comp})
+    return cells
+
+
 # ── 統合リスクマップ: セル別「前日比」「推移」────────────────────
 # 総合リスクマップは毎時のスナップショット(data/snapshots/)に保存された
 # ETAS/b値格子から過去分を再計算できるが、活断層・プレート境界への応力負荷は
@@ -3326,8 +3404,8 @@ function computeComposite(cell){{
 }}
 function levelOf(score){{
   if(score>=0.95) return 5;
-  if(score>=0.75) return 4;
-  if(score>=0.55) return 3;
+  if(score>=0.7) return 4;
+  if(score>=0.5) return 3;
   if(score>=0.3) return 2;
   return 1;
 }}
@@ -3527,308 +3605,295 @@ redraw();
 # メインページ（タブシェル）
 # ══════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════
-# TAB 7: アーカイブ（1時間ごとの解析結果ログ、旧称スナップショット）
+# TAB 9: アーカイブ（過去の任意時点における統合リスクマップ検索）
 # ══════════════════════════════════════════════════════
+# ★ 旧仕様（1時間ごとのETAS/b値スナップショット一覧を左のリストから選んで
+# 見る形式）は撤去した。代わりに、日付と時刻を指定すると「その時刻」を基準に
+# 1か月前までの地震データを取得し直し、統合リスクマップ（ETAS/b値/活断層/
+# プレート境界）をその時点の状態として再計算・表示する形式にしている。
+# なお1時間ごとのスナップショット保存自体（data/snapshots/）は、統合リスク
+# マップタブのセル詳細に出る「推移（直近7日）」グラフが引き続き利用するため、
+# バックエンド側の保存処理は維持している。
 def render_snapshots(updated_str):
     html = """<!DOCTYPE html><html><head><meta charset="utf-8">
 __LEAFLET_CDN__
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{display:flex;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif;color:#f3f4f6}
-#list{width:250px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;overflow-y:auto}
-#hdr{padding:10px 14px;border-bottom:2px solid #1f2937;font-size:12px;color:#9ca3af;position:sticky;top:0;background:#111827}
-#hdr b{color:#f3f4f6;font-size:13px;display:block;margin-bottom:2px}
-.snap-item{padding:9px 14px;cursor:pointer;border-bottom:1px solid #1f2937;font-size:12px;color:#d1d5db}
-.snap-item:hover{background:#161b22}
-.snap-item.active{background:#162032;border-left:3px solid #3b82f6;color:#fff}
-.snap-time{font-weight:600;color:#60a5fa;font-size:12px}
-.snap-meta{font-size:10px;color:#6b7280;margin-top:2px}
-#dlZip{display:block;width:calc(100% - 28px);margin:8px 14px 4px;padding:7px 0;text-align:center;
-    font-size:11px;font-weight:600;color:#93c5fd;background:#1e3a5f;border:1px solid #2563eb;
-    border-radius:6px;cursor:pointer;text-decoration:none}
-#dlZip:hover{background:#2563eb;color:#fff}
-#dlZipAll{display:block;width:calc(100% - 28px);margin:0 14px 8px;padding:5px 0;text-align:center;
-    font-size:10px;font-weight:600;color:#9ca3af;background:transparent;border:1px solid #374151;
-    border-radius:6px;cursor:pointer;text-decoration:none}
-#dlZipAll:hover{background:#1f2937;color:#d1d5db}
-#ghBackup{display:none;width:calc(100% - 28px);margin:0 14px 10px;padding:5px 0;text-align:center;
-    font-size:10px;font-weight:600;color:#a7f3d0;background:transparent;border:1px solid #065f46;
-    border-radius:6px;cursor:pointer}
-#ghBackup:hover{background:#064e3b}
-#ghBackup:disabled{opacity:.5;cursor:default}
-#ghRestore{display:none;width:calc(100% - 28px);margin:0 14px 4px;padding:5px 0;text-align:center;
-    font-size:10px;font-weight:600;color:#93c5fd;background:transparent;border:1px solid #1e3a5f;
-    border-radius:6px;cursor:pointer}
-#ghRestore:hover{background:#1e3a5f}
-#ghRestore:disabled{opacity:.5;cursor:default}
-#ghStatus{display:none;font-size:9px;color:#6b7280;margin:0 14px 8px;text-align:center}
-#detail{flex:1;overflow-y:auto;display:flex;flex-direction:column}
-#detailTop{padding:14px 18px 10px;flex-shrink:0}
-#detailTop h2{font-size:15px;color:#f3f4f6;margin-bottom:4px}
-#detailTop .sub{font-size:11px;color:#6b7280;margin-bottom:12px}
-.stat-row{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}
-.stat{background:#1f2937;padding:7px 12px;border-radius:6px;font-size:11px;color:#d1d5db}
-.stat span{display:block;color:#60a5fa;font-weight:700;font-size:15px;margin-top:2px}
-.tog{padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;border:none;border-radius:5px;background:#1f2937;color:#9ca3af;margin-right:6px}
-.tog.on{background:#2563eb;color:#fff}
-#mapWrap{position:relative;height:440px;flex-shrink:0;border-top:1px solid #1f2937;border-bottom:1px solid #1f2937}
+#panel{width:300px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;overflow-y:auto;padding:14px}
+#panel h2{font-size:14px;color:#f3f4f6;margin-bottom:4px}
+#panel p.sub{font-size:11px;color:#6b7280;margin-bottom:14px;line-height:1.6}
+.sec{margin-bottom:16px}
+.sec h3{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid #1f2937;padding-bottom:4px}
+.field{margin-bottom:10px}
+.field label{display:block;font-size:11px;color:#9ca3af;margin-bottom:4px}
+.field input{width:100%;padding:7px 8px;font-size:12px;background:#1f2937;border:1px solid #374151;
+    border-radius:6px;color:#f3f4f6}
+.field input:focus{outline:none;border-color:#3b82f6}
+#fetchBtn{width:100%;padding:9px 0;font-size:12.5px;font-weight:700;color:#fff;cursor:pointer;
+    background:linear-gradient(135deg,#2563eb,#7c3aed);border:none;border-radius:7px;margin-top:2px}
+#fetchBtn:hover{filter:brightness(1.1)}
+#fetchBtn:disabled{opacity:.5;cursor:default;filter:none}
+#statusBox{font-size:11px;color:#9ca3af;line-height:1.8;margin-top:12px;padding:10px 12px;
+    background:#161b22;border-radius:7px;border:1px solid #1f2937;display:none}
+#statusBox b{color:#60a5fa}
+#statusBox.err{border-color:#7f1d1d;color:#fca5a5}
+.chk-row{display:flex;align-items:center;gap:8px;padding:5px 4px;border-radius:5px;font-size:12px}
+.chk-row:hover{background:#161b22}
+.chk-row input{width:15px;height:15px;flex-shrink:0}
+.chk-row .clabel{flex:1;color:#e5e7eb}
+.chk-row .cweight{font-size:10px;color:#6b7280}
+#cellCount{font-size:11px;color:#9ca3af;margin-top:8px}
+#cellCount span{color:#60a5fa;font-weight:700}
+.note{font-size:10.5px;color:#6b7280;line-height:1.7;margin-top:10px}
+#mp{flex:1;overflow:hidden;position:relative}
 #map{width:100%;height:100%}
-#lg{position:absolute;bottom:14px;left:14px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:10px 12px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.9;color:#f3f4f6}
-#tablesWrap{padding:16px 18px 26px}
-table{width:100%;border-collapse:collapse;font-size:11px;margin-bottom:22px}
-th{text-align:left;padding:6px 8px;color:#6b7280;border-bottom:1px solid #374151;font-weight:600}
-td{padding:5px 8px;border-bottom:1px solid #1f2937;color:#d1d5db}
-tr:hover td{background:#161b22}
-.section-title{font-size:12px;color:#9ca3af;font-weight:700;margin:6px 0 8px;text-transform:uppercase;letter-spacing:0.5px}
-.empty{color:#4b5563;font-size:12px;padding:30px;text-align:center}
-#loading{padding:30px;text-align:center;color:#6b7280;font-size:12px}
+#lg{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
+    padding:10px 13px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.9;color:#f3f4f6}
+#mapEmpty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    color:#4b5563;font-size:13px;text-align:center;padding:20px}
+#detailBox{display:none;position:absolute;top:14px;right:14px;z-index:1500;width:270px;
+    background:rgba(17,24,39,.97);border:1px solid #374151;border-radius:10px;padding:12px 14px;
+    font-size:11px;color:#e5e7eb}
+#detailBox .dHead{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+#dTitle{font-weight:700;font-size:14px;color:#f3f4f6}
+#dClose{flex-shrink:0;width:20px;height:20px;border:none;border-radius:5px;background:#374151;color:#d1d5db;
+    cursor:pointer;font-size:12px;line-height:1}
+#dClose:hover{background:#4b5563;color:#fff}
+#dLoc{font-size:10px;color:#6b7280;margin:2px 0 10px}
+.brk-row{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;color:#d1d5db}
+.brk-val{font-weight:700;color:#f3f4f6}
+canvas.dChart{display:block;width:100%;margin-top:6px}
 </style></head><body>
-<div id="list">
-  <div id="hdr"><b>アーカイブ一覧</b>1時間ごとの解析結果ログ</div>
-  <a id="dlZip" href="/snapshots/download">全件をZIPでダウンロード（直近7日分）</a>
-  <a id="dlZipAll" href="/snapshots/download?all=1">全期間をまとめてダウンロード</a>
-  <button id="ghBackup" onclick="runGhBackup()">GitHubへ手動バックアップ</button>
-  <button id="ghRestore" onclick="runGhRestore()">GitHubから復元</button>
-  <div id="ghStatus"></div>
-  <div id="items"><div id="loading">読込中...</div></div>
+<div id="panel">
+  <h2>過去時点マップ検索</h2>
+  <p class="sub">日付と時刻を指定すると、その時刻から1か月前までの地震データを取得し直し、その時点の統合リスクマップ（ETAS・b値・活断層・プレート境界）を再現します。</p>
+
+  <div class="sec">
+    <h3>基準日時（JST）</h3>
+    <div class="field"><label>日付</label><input type="date" id="inDate"></div>
+    <div class="field"><label>時刻</label><input type="time" id="inTime" value="00:00"></div>
+    <button id="fetchBtn" onclick="runFetch()">この時点のリスクマップを取得</button>
+    <div id="statusBox"></div>
+  </div>
+
+  <div class="sec" id="chkSec" style="display:none">
+    <h3>使用データ（チェックで選択）</h3>
+    <div class="chk-row"><input type="checkbox" id="chk_etas" checked onchange="onToggle('etas')">
+      <span class="clabel">ETAS（地震活動度）</span><span class="cweight">w=0.55</span></div>
+    <div class="chk-row"><input type="checkbox" id="chk_bvalue" checked onchange="onToggle('bvalue')">
+      <span class="clabel">b値（Gutenberg-Richter）</span><span class="cweight">w=0.15</span></div>
+    <div class="chk-row"><input type="checkbox" id="chk_fault" checked onchange="onToggle('fault')">
+      <span class="clabel">活断層 応力負荷</span><span class="cweight">w=0.10</span></div>
+    <div class="chk-row"><input type="checkbox" id="chk_plate" checked onchange="onToggle('plate')">
+      <span class="clabel">プレート境界 応力負荷</span><span class="cweight">w=0.05</span></div>
+  </div>
+
+  <div id="cellCount" style="display:none">表示中のセル数: <span id="cellN">0</span></div>
+  <div class="note">
+    気圧偏差・TECは過去分のデータを保持していないため、この検索には含まれません。<br>
+    地震データは直近65日分のみ保持しているため、それより古い日時は結果が空になる場合があります。
+  </div>
 </div>
-<div id="detail"><div class="empty" style="margin:auto">左のリストからアーカイブを選択してください</div></div>
+<div id="mp">
+  <div id="map"></div>
+  <div id="mapEmpty">日付と時刻を指定して取得してください</div>
+  <div id="lg" style="display:none">
+    <b>統合リスクレベル</b><br>
+    <span style="color:#7f1d1d">■</span> Lv5（最高）<br>
+    <span style="color:#dc2626">■</span> Lv4<br>
+    <span style="color:#f97316">■</span> Lv3<br>
+    <span style="color:#facc15">■</span> Lv2<br>
+    <span style="color:#4ade80">■</span> Lv1（最低）<br>
+    <hr style="border-color:#374151;margin:5px 0">
+    <small>指定時点における相対リスク指数<br>（発生確率を意味するものではありません）</small>
+  </div>
+  <div id="detailBox">
+    <div class="dHead">
+      <div><div id="dTitle">-</div><div id="dLoc"></div></div>
+      <button id="dClose" onclick="closeDetail()" title="閉じる">✕</button>
+    </div>
+    <div id="dBreakdown"></div>
+    <canvas id="dBarCanvas" class="dChart" width="230" height="100"></canvas>
+  </div>
+</div>
 <script>
-var GRID_SIZE = __GRID_SIZE__;
-var BVALUE_GRID_SIZE = __BVALUE_GRID_SIZE__;
-var ETAS_COLOR = {5:'#1a0033',4:'#8000ff',3:'#ff0000',2:'#ff8800',1:'#66ccff'};
-var snapshots = [];
-var map = null;
-var curGroups = {};
+var RISK_COLOR = {5:'#7f1d1d',4:'#dc2626',3:'#f97316',2:'#facc15',1:'#4ade80'};
+var COMP_COLOR = {etas:'#ef4444', bvalue:'#f97316', fault:'#facc15', plate:'#38bdf8'};
+var WEIGHTS = {etas:0.55, bvalue:0.15, fault:0.10, plate:0.05};
+var LABELS  = {etas:'ETAS', bvalue:'b値', fault:'活断層', plate:'プレート境界'};
+var KEYS = ['etas','bvalue','fault','plate'];
+var GS = __RISK_GRID_SIZE__;
+var selected = {etas:true, bvalue:true, fault:true, plate:true};
+var CELLS = [];
+var lastShownList = [];
+var map = null, rectLayer = null;
 
-function fmtTime(fname){
-  var m = fname.match(/(\\d{4})(\\d{2})(\\d{2})_(\\d{2})(\\d{2})(\\d{2})/);
-  if(!m) return fname;
-  // ファイル名はUTC基準のタイムスタンプなのでJST(+9h)に変換して表示する
-  var utcMs = Date.UTC(parseInt(m[1]), parseInt(m[2])-1, parseInt(m[3]), parseInt(m[4]), parseInt(m[5]), parseInt(m[6]));
-  var jst = new Date(utcMs + 9*3600*1000);
-  function pad(n){return n<10?'0'+n:''+n}
-  return jst.getUTCFullYear()+'-'+pad(jst.getUTCMonth()+1)+'-'+pad(jst.getUTCDate())+' '+
-         pad(jst.getUTCHours())+':'+pad(jst.getUTCMinutes())+':'+pad(jst.getUTCSeconds())+' JST';
+function onToggle(key){
+  selected[key] = document.getElementById('chk_'+key).checked;
+  redraw();
 }
 
-function bColor(ratio){
-  var r = Math.round(220*(1-ratio)), g = Math.round(60+100*ratio), bl = Math.round(220*ratio);
-  function h(v){var s=v.toString(16); return s.length<2?'0'+s:s}
-  return '#'+h(r)+h(g)+h(bl);
-}
-
-function percentileThresholds(sortedAsc, p){
-  if(sortedAsc.length===0) return 0;
-  var idx = Math.min(sortedAsc.length-1, Math.max(0, Math.round(p/100*(sortedAsc.length-1))));
-  return sortedAsc[idx];
-}
-
-function buildEtasCells(etasObj){
-  var entries = Object.entries(etasObj);
-  if(entries.length===0) return [];
-  var logVals = entries.map(function(kv){return Math.log(kv[1]+1)}).sort(function(a,b){return a-b});
-  var th5=percentileThresholds(logVals,99.8), th4=percentileThresholds(logVals,98.5),
-      th3=percentileThresholds(logVals,95.0), th2=percentileThresholds(logVals,85.0),
-      th1=percentileThresholds(logVals,50.0);
-  var cells = [];
-  entries.forEach(function(kv){
-    var parts = kv[0].split('_');
-    var score = kv[1];
-    var s = Math.log(score+1);
-    var lv;
-    if(s>=th5) lv=5; else if(s>=th4) lv=4; else if(s>=th3) lv=3;
-    else if(s>=th2) lv=2; else if(s>=th1) lv=1; else return;
-    cells.push({lat:parseInt(parts[0])*GRID_SIZE, lon:parseInt(parts[1])*GRID_SIZE,
-                color:ETAS_COLOR[lv], lv:lv, score:score});
+function computeComposite(cell){
+  var wsum=0, ssum=0, used=[];
+  KEYS.forEach(function(k){
+    if(selected[k] && cell.c[k]){
+      var wk = WEIGHTS[k];
+      wsum += wk; ssum += wk*cell.c[k].s; used.push(k);
+    }
   });
-  return cells;
+  if(wsum<=0) return null;
+  return {score: ssum/wsum, used: used, wsum: wsum};
+}
+function levelOf(score){
+  if(score>=0.95) return 5;
+  if(score>=0.7) return 4;
+  if(score>=0.5) return 3;
+  if(score>=0.3) return 2;
+  return 1;
 }
 
-function buildBvalueCells(bvObj){
-  var entries = Object.entries(bvObj);
-  var bSorted = entries.map(function(kv){return kv[1].b}).sort(function(a,b){return a-b});
-  function percentileRank(b){
-    if(bSorted.length<=1) return 0.5;
-    // 二分探索で順位(0〜1)を求める
-    var lo=0, hi=bSorted.length;
-    while(lo<hi){var mid=(lo+hi)>>1; if(bSorted[mid]<b) lo=mid+1; else hi=mid;}
-    var left=lo;
-    lo=0; hi=bSorted.length;
-    while(lo<hi){var mid=(lo+hi)>>1; if(bSorted[mid]<=b) lo=mid+1; else hi=mid;}
-    var right=lo;
-    var midRank = (left+right-1)/2;
-    return midRank/(bSorted.length-1);
+function roundPartsToTotal(parts, total){
+  var floors = parts.map(Math.floor);
+  var used = floors.reduce(function(a,b){return a+b;}, 0);
+  var remainder = Math.round(total - used);
+  var order = parts.map(function(p,i){return {i:i, frac:p-Math.floor(p)};})
+                   .sort(function(a,b){return b.frac-a.frac;});
+  var result = floors.slice();
+  for(var k=0; k<remainder && k<order.length; k++){ result[order[k].i] += 1; }
+  return result;
+}
+
+function drawBarChart(canvas, labels, values, colors){
+  var ctx = canvas.getContext('2d');
+  var W = canvas.width, H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+  var n = labels.length;
+  if(n===0) return;
+  var maxV = Math.max(1, Math.max.apply(null, values.map(function(v){return Math.abs(v);})));
+  var labelW = 60, valW = 28;
+  var trackW = W - labelW - valW;
+  var rowH = H / n;
+  var barH = Math.min(14, rowH - 6);
+  ctx.font = '10px sans-serif';
+  ctx.textBaseline = 'middle';
+  for(var i=0; i<n; i++){
+    var cy = rowH*i + rowH/2;
+    ctx.fillStyle = '#9ca3af';
+    ctx.fillText(labels[i], 0, cy);
+    ctx.fillStyle = '#1f2937';
+    ctx.fillRect(labelW, cy-barH/2, trackW, barH);
+    var w = Math.max(1, trackW * (Math.abs(values[i]) / maxV));
+    ctx.fillStyle = colors[i] || '#60a5fa';
+    ctx.fillRect(labelW, cy-barH/2, w, barH);
+    ctx.fillStyle = '#f3f4f6';
+    ctx.fillText((values[i]>=0?'+':'')+values[i], labelW+trackW+4, cy);
   }
-  return entries.map(function(kv){
-    var parts = kv[0].split('_'); var info = kv[1];
-    return {lat:parseInt(parts[0])*BVALUE_GRID_SIZE, lon:parseInt(parts[1])*BVALUE_GRID_SIZE,
-            color:bColor(percentileRank(info.b)), b:info.b, n:info.n, mean_m:info.mean_m};
-  });
 }
 
-fetch('/snapshots/backup_status').then(function(r){return r.json()}).then(function(d){
-  if(!d.enabled) return;
-  var btn = document.getElementById('ghBackup');
-  var rbtn = document.getElementById('ghRestore');
-  var st = document.getElementById('ghStatus');
-  btn.style.display = 'block';
-  rbtn.style.display = 'block';
-  st.style.display = 'block';
-  st.textContent = 'GitHub: ' + d.repo + ' (' + d.branch + ')';
-}).catch(function(e){});
+function closeDetail(){ document.getElementById('detailBox').style.display = 'none'; }
 
-function runGhBackup(){
-  var btn = document.getElementById('ghBackup');
-  var st = document.getElementById('ghStatus');
-  btn.disabled = true;
-  btn.textContent = '送信開始中...';
-  fetch('/snapshots/backup_now', {method:'POST'}).then(function(r){return r.json()}).then(function(d){
-    btn.textContent = 'バックアップ開始（' + d.count + '件）';
-    st.textContent += ' - バックグラウンドで実行中';
-    setTimeout(function(){ btn.disabled = false; btn.textContent = 'GitHubへ手動バックアップ'; }, 4000);
-  }).catch(function(e){
-    btn.disabled = false;
-    btn.textContent = '送信失敗';
+function showDetail(cell, comp, lv){
+  document.getElementById('detailBox').style.display = 'block';
+  var total = Math.round(comp.score*100);
+  document.getElementById('dTitle').textContent = '総合リスク ' + total + ' (Lv' + lv + ')';
+  document.getElementById('dLoc').textContent = '緯度' + cell.lat.toFixed(2) + ' / 経度' + cell.lon.toFixed(2);
+  var labels=[], contribFloat=[], colors=[];
+  comp.used.forEach(function(k){
+    var d = cell.c[k];
+    var nw = WEIGHTS[k] / comp.wsum;
+    labels.push(LABELS[k]); contribFloat.push(nw * d.s * 100); colors.push(COMP_COLOR[k] || '#60a5fa');
   });
-}
-
-function runGhRestore(){
-  var rbtn = document.getElementById('ghRestore');
-  rbtn.disabled = true;
-  rbtn.textContent = '復元開始中...';
-  fetch('/snapshots/restore_now', {method:'POST'}).then(function(r){return r.json()}).then(function(d){
-    rbtn.textContent = '復元中（少し待って再読込）';
-    setTimeout(function(){ rbtn.disabled = false; rbtn.textContent = 'GitHubから復元'; }, 6000);
-  }).catch(function(e){
-    rbtn.disabled = false;
-    rbtn.textContent = '復元失敗';
-  });
-}
-
-fetch('/snapshots').then(function(r){return r.json()}).then(function(d){
-  snapshots = d.snapshots || [];
-  var wrap = document.getElementById('items');
-  if(snapshots.length===0){
-    wrap.innerHTML = '<div class="empty">まだアーカイブがありません<br>(起動後1時間ほどで作成されます)</div>';
-    document.getElementById('dlZip').style.display = 'none';
-    document.getElementById('dlZipAll').style.display = 'none';
-    return;
-  }
-  wrap.innerHTML = snapshots.map(function(f,i){
-    return '<div class="snap-item" data-i="'+i+'" onclick="selectSnap('+i+')">'+
-      '<div class="snap-time">'+fmtTime(f)+'</div>'+
-      '<div class="snap-meta">'+f+'</div></div>';
+  var contribInt = roundPartsToTotal(contribFloat, total);
+  document.getElementById('dBreakdown').innerHTML = comp.used.map(function(k, i){
+    return '<div class="brk-row"><span>' + LABELS[k] + '</span>' +
+      '<span class="brk-val">' + (contribInt[i]>=0?'+':'') + contribInt[i] + '</span></div>';
   }).join('');
-  selectSnap(0);
-}).catch(function(e){
-  document.getElementById('items').innerHTML = '<div class="empty">読込失敗</div>';
-});
-
-function selectSnap(i){
-  document.querySelectorAll('.snap-item').forEach(function(el){el.classList.toggle('active', el.dataset.i==i)});
-  var fname = snapshots[i];
-  document.getElementById('detail').innerHTML = '<div id="loading">読込中...</div>';
-  fetch('/snapshots/'+fname).then(function(r){return r.json()}).then(function(d){
-    renderDetail(fname, d);
-  }).catch(function(e){
-    document.getElementById('detail').innerHTML = '<div class="empty">読込失敗</div>';
-  });
+  drawBarChart(document.getElementById('dBarCanvas'), labels, contribInt, colors);
 }
 
-function renderDetail(fname, d){
-  var etasCount = Object.keys(d.etas||{}).length;
-  var bvCount = Object.keys(d.bvalue||{}).length;
-
-  var etasEntries = Object.entries(d.etas||{}).map(function(kv){
-    var parts = kv[0].split('_');
-    return {lat:(parseInt(parts[0])*GRID_SIZE).toFixed(2), lon:(parseInt(parts[1])*GRID_SIZE).toFixed(2), score:kv[1]};
-  }).sort(function(a,b){return b.score-a.score}).slice(0,15);
-
-  var bvEntries = Object.entries(d.bvalue||{}).map(function(kv){
-    var parts = kv[0].split('_');
-    return {lat:(parseInt(parts[0])*1.0).toFixed(1), lon:(parseInt(parts[1])*1.0).toFixed(1),
-             b:kv[1].b, n:kv[1].n, mean_m:kv[1].mean_m};
-  }).sort(function(a,b){return b.n-a.n}).slice(0,15);
-
-  var html =
-    '<div id="detailTop">'+
-      '<h2>'+fmtTime(fname)+'</h2>'+
-      '<div class="sub">'+fname+' ／ 保存時点の更新表示: '+(d.updated||'-')+'</div>'+
-      '<div class="stat-row">'+
-        '<div class="stat">地震件数<span>'+d.quake_count+'</span></div>'+
-        '<div class="stat">ETAS格子数<span>'+etasCount+'</span></div>'+
-        '<div class="stat">b値格子数<span>'+bvCount+'</span></div>'+
-      '</div>'+
-      '<div>'+
-        '<button class="tog on" id="togEtas" onclick="toggleLayer(\\'etas\\',this)">ETASグリッド</button>'+
-        '<button class="tog on" id="togBv" onclick="toggleLayer(\\'bvalue\\',this)">b値グリッド</button>'+
-      '</div>'+
-    '</div>'+
-    '<div id="mapWrap"><div id="map"></div>'+
-      '<div id="lg">'+
-        '<b>ETAS</b><br>'+
-        '<span style="color:#1a0033">■</span> Lv5&nbsp; <span style="color:#8000ff">■</span> Lv4&nbsp; '+
-        '<span style="color:#ff0000">■</span> Lv3&nbsp; <span style="color:#ff8800">■</span> Lv2&nbsp; '+
-        '<span style="color:#66ccff">■</span> Lv1<br>'+
-        '<hr style="border-color:#374151;margin:5px 0">'+
-        '<b>b値</b><br>'+
-        '<div style="width:110px;height:8px;border-radius:3px;background:linear-gradient(to right,#dc3c3c,#60a0dc);margin:4px 0 2px"></div>'+
-        '<div style="display:flex;justify-content:space-between;width:110px;font-size:9px;color:#9ca3af">'+
-          '<span>低(0.5)</span><span>高(2.0)</span></div>'+
-      '</div>'+
-    '</div>'+
-    '<div id="tablesWrap">'+
-      '<div class="section-title">ETASスコア上位グリッド (上位15件)</div>'+
-      (etasEntries.length? ('<table><tr><th>緯度</th><th>経度</th><th>ETASスコア</th></tr>'+
-        etasEntries.map(function(e){return '<tr><td>'+e.lat+'</td><td>'+e.lon+'</td><td>'+e.score.toFixed(4)+'</td></tr>'}).join('')
-        +'</table>') : '<div class="empty">データなし</div>')+
-      '<div class="section-title">b値グリッド 地震数上位15件</div>'+
-      (bvEntries.length? ('<table><tr><th>緯度</th><th>経度</th><th>b値</th><th>地震数</th><th>平均M</th></tr>'+
-        bvEntries.map(function(e){return '<tr><td>'+e.lat+'</td><td>'+e.lon+'</td><td>'+e.b+'</td><td>'+e.n+'</td><td>'+e.mean_m+'</td></tr>'}).join('')
-        +'</table>') : '<div class="empty">データなし</div>')+
-    '</div>';
-
-  document.getElementById('detail').innerHTML = html;
-
-  if(map){ map.remove(); map = null; }
-  map = L.map('map',{center:[36,138],zoom:4,preferCanvas:true});
+function ensureMap(){
+  if(map) return;
+  map = L.map('map',{center:[36,138],zoom:5,preferCanvas:true});
   __DARK_TILE__
   __GEOJSON_JS__
-
-  var etasGroup = L.layerGroup().addTo(map);
-  buildEtasCells(d.etas||{}).forEach(function(c){
-    L.rectangle([[c.lat,c.lon],[c.lat+GRID_SIZE,c.lon+GRID_SIZE]],
-      {color:null,weight:0,fill:true,fillColor:c.color,fillOpacity:0.65})
-     .bindTooltip('Level '+c.lv+' / score='+c.score.toFixed(4)).addTo(etasGroup);
-  });
-
-  var bvGroup = L.layerGroup().addTo(map);
-  buildBvalueCells(d.bvalue||{}).forEach(function(c){
-    L.rectangle([[c.lat,c.lon],[c.lat+BVALUE_GRID_SIZE,c.lon+BVALUE_GRID_SIZE]],
-      {color:null,weight:0,fill:true,fillColor:c.color,fillOpacity:0.6})
-     .bindTooltip('b='+c.b+' / N='+c.n+' / M̄='+c.mean_m).addTo(bvGroup);
-  });
-
-  curGroups = {etas:etasGroup, bvalue:bvGroup};
-  document.getElementById('togEtas').onclick = function(){toggleLayer('etas', this)};
-  document.getElementById('togBv').onclick = function(){toggleLayer('bvalue', this)};
 }
 
-function toggleLayer(key, btn){
-  btn.classList.toggle('on');
-  var g = curGroups[key];
-  if(!g || !map) return;
-  if(map.hasLayer(g)) map.removeLayer(g); else g.addTo(map);
+function redraw(){
+  if(!map) return;
+  if(rectLayer) map.removeLayer(rectLayer);
+  rectLayer = L.layerGroup().addTo(map);
+  var shown = 0;
+  lastShownList = [];
+  CELLS.forEach(function(cell){
+    var comp = computeComposite(cell);
+    if(!comp) return;
+    shown++;
+    var lv = levelOf(comp.score);
+    lastShownList.push({cell:cell, comp:comp, lv:lv});
+    var rect = L.rectangle(
+      [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
+      {color:null, weight:0, fill:true, fillColor:RISK_COLOR[lv], fillOpacity:0.6}
+    );
+    rect.on('click', function(){ showDetail(cell, comp, lv); });
+    rect.addTo(rectLayer);
+  });
+  document.getElementById('cellN').textContent = shown;
+}
+
+function fmtStatus(d){
+  return '基準時刻: <b>' + d.ref_time_jst + '</b><br>' +
+         '取得期間: ' + d.period_start_jst + ' 〜 ' + d.ref_time_jst + '<br>' +
+         '使用した地震データ: <b>' + d.quake_count + '</b>件 ／ セル数: <b>' + d.cells.length + '</b>';
+}
+
+function runFetch(){
+  var dateVal = document.getElementById('inDate').value;
+  var timeVal = document.getElementById('inTime').value || '00:00';
+  var statusBox = document.getElementById('statusBox');
+  var btn = document.getElementById('fetchBtn');
+  if(!dateVal){
+    statusBox.className = 'err'; statusBox.style.display = 'block';
+    statusBox.innerHTML = '日付を入力してください。';
+    return;
+  }
+  btn.disabled = true; btn.textContent = '取得中...';
+  statusBox.className = ''; statusBox.style.display = 'block';
+  statusBox.innerHTML = '地震データを取得し、統合リスクマップを再計算しています…（数十秒かかる場合があります）';
+  closeDetail();
+
+  fetch('/archive/historical_riskmap?datetime=' + encodeURIComponent(dateVal + 'T' + timeVal))
+    .then(function(r){
+      if(!r.ok) return r.json().then(function(e){ throw new Error(e.error || ('HTTPエラー ' + r.status)); });
+      return r.json();
+    })
+    .then(function(d){
+      CELLS = d.cells || [];
+      statusBox.className = ''; statusBox.innerHTML = fmtStatus(d);
+      document.getElementById('chkSec').style.display = CELLS.length ? 'block' : 'none';
+      document.getElementById('cellCount').style.display = CELLS.length ? 'block' : 'none';
+      document.getElementById('lg').style.display = CELLS.length ? 'block' : 'none';
+      document.getElementById('mapEmpty').style.display = CELLS.length ? 'none' : 'flex';
+      if(CELLS.length){
+        ensureMap();
+        setTimeout(function(){ map.invalidateSize(); redraw(); }, 50);
+      }
+    })
+    .catch(function(e){
+      statusBox.className = 'err';
+      statusBox.innerHTML = '取得に失敗しました: ' + e.message;
+    })
+    .finally(function(){
+      btn.disabled = false; btn.textContent = 'この時点のリスクマップを取得';
+    });
 }
 </script></body></html>"""
-    html = html.replace("__GRID_SIZE__", str(GRID_SIZE))
-    html = html.replace("__BVALUE_GRID_SIZE__", str(BVALUE_GRID_SIZE))
+    html = html.replace("__RISK_GRID_SIZE__", str(RISK_GRID_SIZE))
     html = html.replace("__LEAFLET_CDN__", LEAFLET_CDN)
     html = html.replace("__DARK_TILE__", DARK_TILE)
     html = html.replace("__GEOJSON_JS__", GEOJSON_JS)
     return html
+
 
 SHELL_HTML = """<!DOCTYPE html>
 <html>
@@ -4157,6 +4222,41 @@ def gnss_raw_sample():
     return Response(
         f"path: {path}\ntotal_lines: {len(lines)}\nparsed_rows: {len(parsed)}\n\n--- preview ---\n{preview}",
         mimetype="text/plain")
+
+@app.route("/archive/historical_riskmap")
+def archive_historical_riskmap():
+    """
+    アーカイブタブ用: 指定された日時(JST)を基準に、その1か月前までの
+    地震データを取得し直して、その時点の統合リスクマップ（ETAS/b値/活断層/
+    プレート境界）を再計算して返す。
+    クエリパラメータ: datetime = "YYYY-MM-DDTHH:MM" (JST基準、入力欄のvalueをそのまま渡す想定)
+    """
+    dt_str = request.args.get("datetime", "")
+    try:
+        naive = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M")
+    except Exception:
+        return {"error": "日時の形式が正しくありません（YYYY-MM-DDTHH:MM）"}, 400
+
+    ref_time_jst = naive.replace(tzinfo=JST)
+    ref_time_utc = ref_time_jst.astimezone(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    if ref_time_utc > now_utc:
+        return {"error": "未来の日時は指定できません"}, 400
+
+    start_utc = ref_time_utc - timedelta(days=30)
+    quakes = load_quakes_between(start_utc, ref_time_utc)
+    try:
+        cells = compute_risk_grid_historical(quakes, ref_time_utc)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return {"error": f"リスクマップの再計算に失敗しました: {e}"}, 500
+
+    return {
+        "ref_time_jst": ref_time_jst.strftime("%Y-%m-%d %H:%M JST"),
+        "period_start_jst": (start_utc.astimezone(JST)).strftime("%Y-%m-%d %H:%M JST"),
+        "quake_count": len(quakes),
+        "cells": cells,
+    }
 
 @app.route("/snapshots")
 def snapshots():
