@@ -12,6 +12,7 @@
   7. GNSS         - 地殻変動 (GEONET SFTP実データ変位ベクトル、未設定時はプレースホルダー)
   8. 海面気圧     - アメダス海面気圧マップ
   9. アーカイブ     - 日時指定で過去1か月分の地震データから統合リスクマップを再計算
+                  （直近60日以内はJMA/P2P統合データ、それより古い日時はUSGS過去カタログを都度取得）
 
 コード内目次（"# ══" 区切りの主要セクション。おおよその行番号）:
   178  ETASパラメータ (Ogata 1998)
@@ -488,18 +489,30 @@ def fetch_quakes_jma_bosai():
                        "source":"jma_bosai","place":item.get("anm","不明"),"max_int":maxi})
     print(f"[JMA] {len(quakes)}件"); return quakes
 
-def fetch_quakes_usgs():
-    now = datetime.now(timezone.utc)
-    start = (now - timedelta(days=90)).strftime("%Y-%m-%d")
+def fetch_quakes_usgs_range(start_utc, end_utc, timeout=30):
+    """
+    指定したUTC期間 [start_utc, end_utc] の地震をUSGSの過去カタログ(FDSNWS)から取得する。
+    USGSのイベント検索APIは starttime/endtime に任意の日時（数十年前でも可）を指定できるため、
+    quakes.csv がローカルに保持していない古い期間（アーカイブタブで65日より前を指定した場合）
+    のデータ取得に使う。fetch_quakes_usgs()（直近90日固定）はこの関数のラッパーとして実装する。
+
+    ★ 注意点（呼び出し側・UIでも案内していること）:
+      - USGSカタログは全世界対象で、日本国内の小規模地震についてはJMAほど網羅的ではない
+        （検知下限マグニチュードがJMAより大きい）。そのため古い期間のb値・ETAS計算は
+        直近65日分（JMA/P2P統合データ使用）と比べて精度が落ちる可能性がある。
+      - 震度情報(max_int)はUSGSデータには含まれないため空文字となる。
+      - limit=20000（USGS FDSNWSの上限）に達した場合は結果が打ち切られている可能性がある
+        （大規模な余震シーケンスを含む期間を指定した場合など）。
+    """
     lat_min, lat_max, lon_min, lon_max = ETAS_FETCH_BBOX
     url = (f"https://earthquake.usgs.gov/fdsnws/event/1/query"
-           f"?format=geojson&starttime={start}&minlatitude={lat_min}&maxlatitude={lat_max}"
-           f"&minlongitude={lon_min}&maxlongitude={lon_max}&minmagnitude=0.0&orderby=time&limit=5000")
-    try: data = requests.get(url, timeout=12).json()
-    except Exception as e:
-        print(f"[USGS] {e}"); return []
+           f"?format=geojson&starttime={start_utc.strftime('%Y-%m-%dT%H:%M:%S')}"
+           f"&endtime={end_utc.strftime('%Y-%m-%dT%H:%M:%S')}"
+           f"&minlatitude={lat_min}&maxlatitude={lat_max}"
+           f"&minlongitude={lon_min}&maxlongitude={lon_max}&minmagnitude=0.0&orderby=time&limit=20000")
+    data = requests.get(url, timeout=timeout).json()
     quakes = []
-    for feat in data.get("features",[]):
+    for feat in data.get("features", []):
         try:
             props = feat["properties"]; coords = feat["geometry"]["coordinates"]
             lat, lon = float(coords[1]), float(coords[0])
@@ -509,7 +522,19 @@ def fetch_quakes_usgs():
                            "mag":float(props["mag"]),"depth":float(coords[2]),"source":"usgs",
                            "place":props.get("place",""),"max_int":""})
         except Exception: continue
-    print(f"[USGS] {len(quakes)}件"); return quakes
+    if len(data.get("features", [])) >= 20000:
+        print(f"[USGS/range] 警告: limit(20000)に達しました。結果が打ち切られている可能性があります "
+              f"({start_utc.date()}〜{end_utc.date()})")
+    print(f"[USGS/range] {start_utc.date()}〜{end_utc.date()} {len(quakes)}件")
+    return quakes
+
+def fetch_quakes_usgs():
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=90)
+    try:
+        return fetch_quakes_usgs_range(start, now, timeout=12)
+    except Exception as e:
+        print(f"[USGS] {e}"); return []
 
 def fetch_all_quakes():
     results = {}
@@ -633,7 +658,9 @@ def load_quakes_between(start_utc, end_utc):
     load_quakes()は「直近N日」しか扱えないため、過去の任意時点を基準にした
     再解析（アーカイブタブの日時指定検索）用にこちらを使う。
     ★ quakes.csv は_cleanup_old_quakes(keep_days=65)により65日より古いデータが
-    削除されるため、65日より前の期間を指定した場合はヒットしない点に注意。"""
+    削除されるため、65日より前の期間を指定した場合はヒットしない点に注意。
+    アーカイブタブではこの関数の代わりに fetch_quakes_usgs_range() を使うことで
+    65日より古い期間（数年前まで）にも対応している（archive_historical_riskmap参照）。"""
     if not os.path.exists(DATA_FILE): return []
     data = []
     with open(DATA_FILE, encoding="utf-8") as f:
@@ -3915,7 +3942,9 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
   <div id="cellCount" style="display:none">表示中のセル数: <span id="cellN">0</span></div>
   <div class="note">
     気圧偏差・TECは過去分のデータを保持していないため、この検索には含まれません。<br>
-    地震データは直近65日分のみ保持しているため、それより古い日時は結果が空になる場合があります。
+    直近60日以内は気象庁(JMA)・P2P地震情報を統合した高精度データを使用します。<br>
+    それより古い日時はUSGSの過去カタログから都度取得します（数年前まで指定可能）。
+    ただし国内のごく小規模な地震が漏れる場合があり、震度情報も含まれません。
   </div>
 </div>
 <div id="mp">
@@ -4065,8 +4094,12 @@ function redraw(){
 }
 
 function fmtStatus(d){
+  var srcLabel = d.data_source === 'usgs_historical'
+    ? 'USGS過去カタログ（60日超のため。震度情報なし・小規模地震が漏れる場合あり）'
+    : 'JMA/P2P統合データ（直近60日）';
   return '基準時刻: <b>' + d.ref_time_jst + '</b><br>' +
          '取得期間: ' + d.period_start_jst + ' 〜 ' + d.ref_time_jst + '<br>' +
+         'データソース: <b>' + srcLabel + '</b><br>' +
          '使用した地震データ: <b>' + d.quake_count + '</b>件 ／ セル数: <b>' + d.cells.length + '</b>';
 }
 
@@ -4446,6 +4479,13 @@ def gnss_raw_sample():
         f"path: {path}\ntotal_lines: {len(lines)}\nparsed_rows: {len(parsed)}\n\n--- preview ---\n{preview}",
         mimetype="text/plain")
 
+# quakes.csv（JMA/P2P/USGS統合データ）はkeep_days=HIST_CALIB_LOOKBACK_DAYS(65)より
+# 古いデータを保持していない。アーカイブ検索の対象期間がこの保持範囲より古い場合は
+# ローカルCSVではなくUSGSの過去カタログ(fetch_quakes_usgs_range)から都度取得する。
+# 保持日数ギリギリではなく少し早めに切り替えることで、バックグラウンド更新の
+# タイミング次第で「本来は残っているはずのデータが直前に削除されていた」ケースを避ける。
+ARCHIVE_LOCAL_SAFE_DAYS = HIST_CALIB_LOOKBACK_DAYS - 5   # = 60日
+
 @app.route("/archive/historical_riskmap")
 def archive_historical_riskmap():
     """
@@ -4453,6 +4493,14 @@ def archive_historical_riskmap():
     地震データを取得し直して、その時点の統合リスクマップ（ETAS/b値/活断層/
     プレート境界）を再計算して返す。
     クエリパラメータ: datetime = "YYYY-MM-DDTHH:MM" (JST基準、入力欄のvalueをそのまま渡す想定)
+
+    データソースの切り替え:
+      - 取得期間の開始が直近 ARCHIVE_LOCAL_SAFE_DAYS 日以内に収まる場合は、
+        従来どおりローカルのquakes.csv（JMA/P2P/USGS統合・重複排除済み）を使う。
+      - それより古い期間を含む場合は、quakes.csvには既に無いため、
+        USGSの過去カタログAPIから期間全体を都度取得する（数年前でも取得可能）。
+        期間の一部だけをUSGSに差し替えると検知下限マグニチュードの違いで
+        b値等の計算が歪むため、期間全体を同一ソースに揃えている。
     """
     dt_str = request.args.get("datetime", "")
     try:
@@ -4467,7 +4515,18 @@ def archive_historical_riskmap():
         return {"error": "未来の日時は指定できません"}, 400
 
     start_utc = ref_time_utc - timedelta(days=30)
-    quakes = load_quakes_between(start_utc, ref_time_utc)
+    local_cutoff = now_utc - timedelta(days=ARCHIVE_LOCAL_SAFE_DAYS)
+
+    if start_utc >= local_cutoff:
+        data_source = "local"
+        quakes = load_quakes_between(start_utc, ref_time_utc)
+    else:
+        data_source = "usgs_historical"
+        try:
+            quakes = fetch_quakes_usgs_range(start_utc, ref_time_utc)
+        except Exception as e:
+            return {"error": f"過去データ(USGS)の取得に失敗しました: {e}"}, 500
+
     try:
         cells = compute_risk_grid_historical(quakes, ref_time_utc)
     except Exception as e:
@@ -4478,6 +4537,7 @@ def archive_historical_riskmap():
         "ref_time_jst": ref_time_jst.strftime("%Y-%m-%d %H:%M JST"),
         "period_start_jst": (start_utc.astimezone(JST)).strftime("%Y-%m-%d %H:%M JST"),
         "quake_count": len(quakes),
+        "data_source": data_source,
         "cells": cells,
     }
 
