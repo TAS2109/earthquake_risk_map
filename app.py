@@ -12,6 +12,28 @@
   7. GNSS         - 地殻変動 (GEONET SFTP実データ変位ベクトル、未設定時はプレースホルダー)
   8. 海面気圧     - アメダス海面気圧マップ
   9. アーカイブ     - 日時指定で過去1か月分の地震データから統合リスクマップを再計算
+
+コード内目次（"# ══" 区切りの主要セクション。おおよその行番号）:
+  178  ETASパラメータ (Ogata 1998)
+  224  データ取得（JMA/P2P/USGSからの地震データ取得・重複排除・CSV保存）
+  626  スナップショット（解析結果の時系列ログ）
+  821  quakes.csv のGitHubバックアップ/復元
+  988  ETAS解析
+ 1054  b値解析 (Gutenberg-Richter)
+ 1094  ユーティリティ
+ 1144  TAB1 統合地震履歴
+ 1315  TAB2 ETASマップ
+ 1422  TAB3 b値マップ
+ 1526  TAB4 TEC（電離圏全電子数）
+ 1885  TAB5 GNSS（地殻変動）
+ 2284  TAB6 海面気圧（アメダス）
+ 2449  TAB  活断層・プレート境界マップ
+ 2623  統合リスクマップ（β）
+ 3042  アーカイブ: 過去時点の統合リスクマップ再計算
+ 3614  メインページ（タブシェル）
+ 3617  TAB9 アーカイブUI
+ 4045  バックグラウンド更新ループ
+ 4109  Flaskルーティング
 """
 
 from flask import Flask, Response, send_file, request
@@ -185,6 +207,30 @@ EP = ETASParams()
 
 ETAS_COLOR = {5:"#1a0033", 4:"#8000ff", 3:"#ff0000", 2:"#ff8800", 1:"#66ccff"}
 
+# JMA震度階級コード → 表示用震度文字列（P2Pの maxScale フィールド用）。
+# 元は _parse_p2p_item() と fetch_quakes_p2p_jma() に同じ辞書が別々に
+# 定義されていたため、ここに1つにまとめて両方から参照する。
+JMA_SCALE_MAP = {10:"1", 20:"2", 30:"3", 40:"4", 45:"5-", 50:"5+", 55:"6-", 60:"6+", 70:"7"}
+
+def jma_max_int(max_scale):
+    """P2Pの maxScale 値（-1=無感）を表示用の震度文字列に変換する。"""
+    if max_scale == -1:
+        return ""
+    return JMA_SCALE_MAP.get(int(max_scale), str(max_scale))
+
+def jst_str_to_utc_iso(raw_time, fallback=None):
+    """"YYYY/MM/DD HH:MM[:SS]" 形式のJST時刻文字列をUTCのISO8601文字列に変換する。
+    パースできない場合は fallback（省略時は raw_time そのもの）を返す。
+    元は fetch_quakes_p2p / fetch_quakes_p2p_jma の中に同じフォーマット試行
+    ループが重複していたため、共通関数として1箇所にまとめた。"""
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            dt_jst = datetime.strptime(raw_time, fmt)
+            return dt_jst.replace(tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc).isoformat()
+        except ValueError:
+            continue
+    return raw_time if fallback is None else fallback
+
 LEAFLET_CDN = """
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>"""
@@ -214,22 +260,8 @@ def _parse_p2p_item(item):
         if mag < 0:
             return None
         depth = abs(float(hypo.get("depth", 0)))
-        raw_time = eq.get("time", "")
-        time_str = raw_time
-        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
-            try:
-                dt_jst   = datetime.strptime(raw_time, fmt)
-                time_str = dt_jst.replace(tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc).isoformat()
-                break
-            except ValueError:
-                continue
-        scale_map = {10:"1",20:"2",30:"3",40:"4",45:"5-",50:"5+",55:"6-",60:"6+",70:"7"}
-        # maxScale フィールド（-1 = 無感）
-        max_scale = eq.get("maxScale", -1)
-        if max_scale == -1:
-            max_int = ""          # 無感
-        else:
-            max_int = scale_map.get(int(max_scale), str(max_scale))
+        time_str = jst_str_to_utc_iso(eq.get("time", ""))
+        max_int = jma_max_int(eq.get("maxScale", -1))  # maxScale: -1 = 無感
         return {"time":time_str,"lat":lat,"lon":lon,"mag":mag,"depth":depth,
                 "source":"p2p","place":hypo.get("name","不明"),"max_int":max_int}
     except Exception:
@@ -316,7 +348,6 @@ def fetch_quakes_p2p_jma():
     """
     BASE_URL = "https://api.p2pquake.net/v2/jma/quake"
     HEADERS  = {"User-Agent": "SeismoApp/5.0"}
-    scale_map = {10:"1",20:"2",30:"3",40:"4",45:"5-",50:"5+",55:"6-",60:"6+",70:"7"}
     cutoff   = datetime.now(timezone.utc) - timedelta(days=30)
     since    = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y%m%d")
 
@@ -383,16 +414,7 @@ def fetch_quakes_p2p_jma():
                     if mag < 0:
                         continue
                     depth = abs(float(hypo.get("depth", 0)))
-
-                    raw_time = eq.get("time", "")
-                    time_str = raw_time
-                    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
-                        try:
-                            dt_jst   = datetime.strptime(raw_time, fmt)
-                            time_str = dt_jst.replace(tzinfo=timezone(timedelta(hours=9))).astimezone(timezone.utc).isoformat()
-                            break
-                        except ValueError:
-                            continue
+                    time_str = jst_str_to_utc_iso(eq.get("time", ""))
 
                     try:
                         t = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
@@ -402,8 +424,7 @@ def fetch_quakes_p2p_jma():
                     except Exception:
                         pass
 
-                    max_scale = eq.get("maxScale", -1)
-                    max_int   = "" if max_scale == -1 else scale_map.get(int(max_scale), str(max_scale))
+                    max_int = jma_max_int(eq.get("maxScale", -1))
 
                     quakes.append({
                         "time": time_str, "lat": lat, "lon": lon,
@@ -574,21 +595,33 @@ def _cleanup_old_quakes(keep_days=65):
             csv.writer(f).writerows(kept)
         print(f"[CSV整理] {removed}件削除、{len(kept)}件保持")
 
+def _row_to_quake(row):
+    """quakes.csv の1行(list[str])を地震dictへ変換する。
+    load_quakes() と load_quakes_between() で同一のロジックが重複していたため
+    共通化。変換できない行は None を返す（呼び出し側でスキップする）。"""
+    try:
+        return {"time": row[0], "lat": float(row[1]), "lon": float(row[2]),
+                "mag": float(row[3]), "depth": float(row[4]),
+                "source": row[5] if len(row) > 5 else "",
+                "place":  row[6] if len(row) > 6 else "",
+                "max_int": row[7] if len(row) > 7 else ""}
+    except Exception:
+        return None
+
 def load_quakes(days=60):
+    """直近 days 日分の地震をCSVから読み込む。"""
     if not os.path.exists(DATA_FILE): return []
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     data = []
     with open(DATA_FILE, encoding="utf-8") as f:
         for row in csv.reader(f):
             try:
-                t = datetime.fromisoformat(row[0].replace("Z","+00:00"))
-                if t < cutoff: continue
-                data.append({"time":row[0],"lat":float(row[1]),"lon":float(row[2]),
-                             "mag":float(row[3]),"depth":float(row[4]),
-                             "source":row[5] if len(row)>5 else "",
-                             "place":row[6] if len(row)>6 else "",
-                             "max_int":row[7] if len(row)>7 else ""})
-            except Exception: continue
+                if datetime.fromisoformat(row[0].replace("Z", "+00:00")) < cutoff:
+                    continue
+            except Exception:
+                continue
+            q = _row_to_quake(row)
+            if q: data.append(q)
     return data
 
 def load_quakes_between(start_utc, end_utc):
@@ -602,14 +635,13 @@ def load_quakes_between(start_utc, end_utc):
     with open(DATA_FILE, encoding="utf-8") as f:
         for row in csv.reader(f):
             try:
-                t = datetime.fromisoformat(row[0].replace("Z","+00:00"))
-                if t < start_utc or t > end_utc: continue
-                data.append({"time":row[0],"lat":float(row[1]),"lon":float(row[2]),
-                             "mag":float(row[3]),"depth":float(row[4]),
-                             "source":row[5] if len(row)>5 else "",
-                             "place":row[6] if len(row)>6 else "",
-                             "max_int":row[7] if len(row)>7 else ""})
-            except Exception: continue
+                t = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+                if t < start_utc or t > end_utc:
+                    continue
+            except Exception:
+                continue
+            q = _row_to_quake(row)
+            if q: data.append(q)
     return data
 
 
