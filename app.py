@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v7.33
+地震研究統合プラットフォーム v7.43
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -208,7 +208,10 @@ EP = ETASParams()
 
 # ETAS・統合リスクマップ共通のレベル別配色（気象庁の警戒レベル風に統一）。
 # Lv1=水色 / Lv2=黄色 / Lv3=赤 / Lv4=紫 / Lv5=黒。マップ上では半透明で描画する。
-LEVEL_COLOR = {5:"#000000", 4:"#8000ff", 3:"#ff0000", 2:"#ffe600", 1:"#66ccff"}
+LEVEL_COLOR = {5:"#ff2fd6", 4:"#8000ff", 3:"#ff0000", 2:"#ffe600", 1:"#66ccff"}
+# ↑ Lv5は元々#000000(黒)だったが、ダーク基調の地図背景(CARTOのdark_allタイル/#0f172a)と
+#   同化して見えなくなるため、視認性の高いマゼンタに変更(v7.43)。
+#   ダークテイストは崩さず、既存の紫(4)・赤(3)・黄(2)・水色(1)とも被らない色を選定。
 LEVEL_FILL_OPACITY = 0.55  # マップの地形が透けて見えるよう半透明にする
 ETAS_COLOR = LEVEL_COLOR
 
@@ -3838,7 +3841,7 @@ function redraw(){{
     lastShownList.push({{cell:cell, comp:comp, lv:lv}});
     var rect = L.rectangle(
       [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
-      {{color:null, weight:0, fill:true, fillColor:RISK_COLOR[lv], fillOpacity:{LEVEL_FILL_OPACITY}}}
+      {{color: lv===5 ? '#ffffff' : null, weight: lv===5 ? 1 : 0, fill:true, fillColor:RISK_COLOR[lv], fillOpacity:{LEVEL_FILL_OPACITY}}}
     );
     rect.on('click', function(){{ showDetail(cell, comp, lv); }});
     rect.addTo(rectLayer);
@@ -3952,7 +3955,7 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
   <div id="mapEmpty">日付と時刻を指定して取得してください</div>
   <div id="lg" style="display:none">
     <b>統合リスクレベル</b><br>
-    <span style="color:#000000;background:#000000;opacity:0.55;padding:0 6px;border:1px solid #666">■</span> Lv5（特に稀な高リスク）<br>
+    <span style="color:#ff2fd6;background:#ff2fd6;opacity:0.55;padding:0 6px;border:1px solid #666">■</span> Lv5（特に稀な高リスク）<br>
     <span style="color:#8000ff;opacity:0.55">■</span> Lv4（警戒）<br>
     <span style="color:#ff0000;opacity:0.55">■</span> Lv3（注意）<br>
     <span style="color:#ffe600;opacity:0.55">■</span> Lv2（やや注意）<br>
@@ -3970,7 +3973,7 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
   </div>
 </div>
 <script>
-var RISK_COLOR = {5:'#000000',4:'#8000ff',3:'#ff0000',2:'#ffe600',1:'#66ccff'};
+var RISK_COLOR = {5:'#ff2fd6',4:'#8000ff',3:'#ff0000',2:'#ffe600',1:'#66ccff'};
 var COMP_COLOR = {etas:'#ef4444', bvalue:'#f97316', fault:'#facc15', plate:'#38bdf8'};
 var WEIGHTS = {etas:0.55, bvalue:0.15, fault:0.10, plate:0.05};
 var LABELS  = {etas:'ETAS', bvalue:'b値', fault:'活断層', plate:'プレート境界'};
@@ -4085,7 +4088,7 @@ function redraw(){
     lastShownList.push({cell:cell, comp:comp, lv:lv});
     var rect = L.rectangle(
       [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
-      {color:null, weight:0, fill:true, fillColor:RISK_COLOR[lv], fillOpacity:0.55}
+      {color: lv===5 ? '#ffffff' : null, weight: lv===5 ? 1 : 0, fill:true, fillColor:RISK_COLOR[lv], fillOpacity:0.55}
     );
     rect.on('click', function(){ showDetail(cell, comp, lv); });
     rect.addTo(rectLayer);
@@ -4155,7 +4158,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震研究統合プラットフォーム v7.33</title>
+  <title>地震研究統合プラットフォーム v7.43</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
@@ -4200,7 +4203,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v7.33 / 研究用</div>
+      <div>v7.43 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
