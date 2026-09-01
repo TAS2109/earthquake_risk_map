@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v7.45
+地震研究統合プラットフォーム v7.55
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -1135,8 +1135,32 @@ HIST_CALIB_SAMPLE_HOURS  = 24     # 24時間おきにサンプリング（最大
 HIST_CALIB_TTL_SEC       = 6 * 3600  # 6時間ごとに再キャリブレーション（新着データを反映）
 HIST_CALIB_MIN_POOL      = 30     # プール件数がこれ未満なら未キャリブレーション扱い（相対評価にフォールバック）
 
+# ★ Bug fix (2026-09): 従来は各サンプル時刻について「全セルの生値」をそのまま
+# プールに入れていた。これだと『格子が約600セルある中で、その瞬間たまたま
+# 一番賑わっているセル』は、日本のどこかで地震活動が続く限りほぼ毎日存在してしまい、
+# それがプール全体の上位数%に入るのは統計的にありふれた現象（多重比較・
+# look-elsewhere効果）になる。つまり「本日のホットスポットがプールの上位2%に入る」
+# ことは「本日は特別に危険」を意味せず、「約600セル同時に検定すればどれかは
+# 上位に来て当然」というだけの現象だった。これがLv4/5セルが常態的に
+# 大量発生していた主因。
+# 対策: 各サンプル時刻について、全セルではなく「その時刻に最も際立っていた
+# セル」上位HIST_CALIB_TOPK件だけをプールに採用する。こうするとプールが
+# 『日本で最も活発な地点は、過去65日間の中でどれくらいの水準まで振れてきたか』
+# という分布になり、絶対評価が正しく「今日のホットスポットは過去実績と比べて
+# 本当に稀か」を判定できるようになる（多重比較を補正した分布に対する比較）。
+HIST_CALIB_TOPK          = 3      # 各サンプル時刻からプールに採用する上位セル数
+
 _hist_calib_cache = {"ts": 0.0, "etas": None, "bvalue": None, "fault": None, "plate": None, "n_samples": 0}
 _hist_calib_lock = threading.Lock()
+
+def _topk_values(raw_map, k=HIST_CALIB_TOPK, invert=False):
+    """raw_map(セル→生値)から『最も際立っている』上位k件の値だけを返す。
+    invert=Trueの場合は値が小さいほど際立っている指標（b値など）とみなし、
+    下位k件を返す。"""
+    if not raw_map:
+        return []
+    vals = sorted(raw_map.values(), reverse=not invert)
+    return list(vals[:k])
 
 def _sample_ref_times(lookback_days=HIST_CALIB_LOOKBACK_DAYS, step_hours=HIST_CALIB_SAMPLE_HOURS):
     now = datetime.now(timezone.utc)
@@ -1159,14 +1183,15 @@ def _compute_historical_calibration():
             if not quakes:
                 continue
             etas_scores = analyze_etas(quakes, ref_time=rt)
-            etas_pool.extend(_risk_etas_raw(etas_scores).values())
+            etas_pool.extend(_topk_values(_risk_etas_raw(etas_scores), invert=False))
 
             bgrid = compute_bvalue_grid(quakes)
-            bvalue_pool.extend(_risk_bvalue_raw(bgrid).values())
+            # b値は値が小さいほど高リスク（応力集中の疑い）なので、下位k件を採用する
+            bvalue_pool.extend(_topk_values(_risk_bvalue_raw(bgrid), invert=True))
 
             fault_raw, plate_raw = _historical_fault_plate_raw(quakes, rt)
-            fault_pool.extend(fault_raw.values())
-            plate_pool.extend(plate_raw.values())
+            fault_pool.extend(_topk_values(fault_raw, invert=False))
+            plate_pool.extend(_topk_values(plate_raw, invert=False))
             ok += 1
         except Exception as e:
             print(f"[絶対基準キャリブレーション] サンプル({rt})でエラー: {e}")
@@ -4163,7 +4188,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震研究統合プラットフォーム v7.45</title>
+  <title>地震研究統合プラットフォーム v7.55</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
@@ -4208,7 +4233,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v7.45 / 研究用</div>
+      <div>v7.55 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
