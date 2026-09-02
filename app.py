@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v7.57
+地震研究統合プラットフォーム v7.67
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -1133,11 +1133,10 @@ def _percentile_thresholds(values_arr):
 HIST_CALIB_LOOKBACK_DAYS = 65     # quakes.csv の保持期間(_cleanup_old_quakes)に合わせる
 HIST_CALIB_SAMPLE_HOURS  = 24     # 24時間おきにサンプリング（最大65点、計算負荷とのバランス）
 HIST_CALIB_TTL_SEC       = 6 * 3600  # 6時間ごとに再キャリブレーション（新着データを反映）
-HIST_CALIB_MIN_POOL      = 30     # プール件数がこれ未満なら未キャリブレーション扱い（相対評価にフォールバック、ETASマップ用の全体プールにのみ使用）
 HIST_CALIB_MIN_CELL_SAMPLES = 20  # (v7.56) セル単位の絶対評価に必要な最低サンプル数(最大65点中)。
                                    # これ未満のセルは自セルの履歴が薄いため、そのセルだけ相対評価にフォールバックする。
 
-_hist_calib_cache = {"ts": 0.0, "etas": None, "bvalue": None, "fault": None, "plate": None,
+_hist_calib_cache = {"ts": 0.0,
                       "etas_cell": None, "bvalue_cell": None, "fault_cell": None, "plate_cell": None,
                       "n_samples": 0}
 _hist_calib_lock = threading.Lock()
@@ -1155,17 +1154,17 @@ def _compute_historical_calibration():
     _historical_fault_plate_raw)をそのまま流用する。
 
     (v7.56) 従来は全セル・全時刻の値を1本の配列にまとめる「空間+時間混合プール」
-    (etas/bvalue/fault/plateキー。ETASマップ(Tab2)用に維持) だけを作っていたが、
-    これだと活断層が密集する地域のセルは活動量に関わらず常に生値が高いため、
-    プール全体の中での順位が恒常的に上位に張り付き、統合リスクマップのLv4/5が
-    平穏な時期でも大量発生する原因になっていた（空間的な下駄と時間的な稀少性の混同）。
-    そこで統合リスクマップ用には、セルごとに「そのセル自身の過去
-    HIST_CALIB_LOOKBACK_DAYS日間の値」だけを集めたプール(*_cellキー)を別途作る。
-    これにより絶対評価が「他の場所と比べて高いか」ではなく「そのセル自身の
-    いつもと比べて高いか」という真の時間的異常度になる。"""
+    だけを作っていたが、これだと活断層が密集する地域のセルは活動量に関わらず
+    常に生値が高いため、プール全体の中での順位が恒常的に上位に張り付き、
+    統合リスクマップ・ETASマップともにLv4/5が平穏な時期でも大量発生する
+    原因になっていた（空間的な下駄と時間的な稀少性の混同）。
+    そこでセルごとに「そのセル自身の過去HIST_CALIB_LOOKBACK_DAYS日間の値」だけを
+    集めたプール(*_cellキー)のみを作る方式に統一する。これにより絶対評価が
+    「他の場所と比べて高いか」ではなく「そのセル自身のいつもと比べて高いか」
+    という真の時間的異常度になる（統合リスクマップ・ETASマップ・アーカイブの
+    いずれもこのプールを参照する）。"""
     from collections import defaultdict
     ref_times = _sample_ref_times()
-    etas_pool, bvalue_pool, fault_pool, plate_pool = [], [], [], []
     etas_cell, bvalue_cell, fault_cell, plate_cell = (defaultdict(list), defaultdict(list),
                                                        defaultdict(list), defaultdict(list))
     ok = 0
@@ -1177,17 +1176,13 @@ def _compute_historical_calibration():
                 continue
             etas_scores = analyze_etas(quakes, ref_time=rt)
             etas_raw_t = _risk_etas_raw(etas_scores)
-            etas_pool.extend(etas_raw_t.values())
             for k, v in etas_raw_t.items(): etas_cell[k].append(v)
 
             bgrid = compute_bvalue_grid(quakes)
             bvalue_raw_t = _risk_bvalue_raw(bgrid)
-            bvalue_pool.extend(bvalue_raw_t.values())
             for k, v in bvalue_raw_t.items(): bvalue_cell[k].append(v)
 
             fault_raw, plate_raw = _historical_fault_plate_raw(quakes, rt)
-            fault_pool.extend(fault_raw.values())
-            plate_pool.extend(plate_raw.values())
             for k, v in fault_raw.items(): fault_cell[k].append(v)
             for k, v in plate_raw.items(): plate_cell[k].append(v)
             ok += 1
@@ -1195,17 +1190,14 @@ def _compute_historical_calibration():
             print(f"[絶対基準キャリブレーション] サンプル({rt})でエラー: {e}")
             continue
     print(f"[絶対基準キャリブレーション] {ok}/{len(ref_times)}時点サンプリング完了 "
-          f"(etas={len(etas_pool)} bvalue={len(bvalue_pool)} fault={len(fault_pool)} plate={len(plate_pool)})")
+          f"(etas_cells={len(etas_cell)} bvalue_cells={len(bvalue_cell)} "
+          f"fault_cells={len(fault_cell)} plate_cells={len(plate_cell)})")
     # セル単位プールは、サンプル時点数(ok)が少なすぎる(=積み上げ途中)場合は
     # 誤ったセル基準値で誤判定するより「未キャリブレーション」扱いの方が安全なため、
     # 十分な時点数が確保できるまではNoneのままにする。
     cell_ready = ok >= max(10, HIST_CALIB_MIN_CELL_SAMPLES // 2)
     return {
         "ts": time.time(),
-        "etas":   np.array(etas_pool)   if etas_pool   else None,
-        "bvalue": np.array(bvalue_pool) if bvalue_pool else None,
-        "fault":  np.array(fault_pool)  if fault_pool  else None,
-        "plate":  np.array(plate_pool)  if plate_pool  else None,
         "etas_cell":   dict(etas_cell)   if (cell_ready and etas_cell)   else None,
         "bvalue_cell": dict(bvalue_cell) if (cell_ready and bvalue_cell) else None,
         "fault_cell":  dict(fault_cell)  if (cell_ready and fault_cell)  else None,
@@ -1602,32 +1594,50 @@ def render_etas(grid_scores, quakes, updated_str):
     cells = []
     if grid_scores:
         vals = np.array(list(grid_scores.values()))
-        th5,th4,th3,th2,th1 = _percentile_thresholds(vals)          # 相対評価（今この瞬間の空間内順位）
+        th5,th4,th3,th2,th1 = _percentile_thresholds(vals)          # 相対評価（今この瞬間の空間内順位。細かい格子内の濃淡表現はそのまま維持）
+
+        # (v7.56) 絶対評価(アーカイブ=過去実績との比較)を、統合リスクマップと同じ
+        # 「そのエリア自身の過去実績」方式に統一する。
+        # 旧実装は全セル・全時刻を混ぜた1本のプール(calib["etas"])と比較していたため、
+        # 三陸沖・南海トラフ等の恒常的に活発なエリアは、平常運転でも絶対評価側で
+        # 常に上位に張り付く「空間的な下駄」問題があった。
+        # ETASの細かい格子(GRID_SIZE=0.1°)ではセルごとの過去サンプルが疎になり
+        # 単独では履歴を組めないため、統合リスクマップと同じ粗い格子
+        # (RISK_GRID_SIZE=0.5°)に集約した上で「そのエリアが今、平常時と比べて
+        # 活発かどうか」を絶対評価し、その結果を該当エリア内の細かい格子すべてに
+        # 上限として適用する。相対評価(①)による細かい濃淡表現はそのまま活かしつつ、
+        # 絶対評価(②)・ドメイン知識(③)の頭打ちだけをエリア単位の真の実績で行う。
         calib = _get_historical_calibration()
-        hist_pool = calib.get("etas")
-        hth5=hth4=hth3=hth2=hth1=None
-        if hist_pool is not None and len(hist_pool) >= HIST_CALIB_MIN_POOL:
-            hth5,hth4,hth3,hth2,hth1 = _percentile_thresholds(hist_pool)  # 絶対評価（過去65日間の実績）
+        etas_raw_coarse = _risk_etas_raw(grid_scores)
+        etas_cell_pool = calib.get("etas_cell")
+        abs_rank_coarse = _historical_abs_rank(etas_raw_coarse, etas_cell_pool, invert=False, log_transform=True)
+        median_map = _cellwise_median_map(etas_cell_pool)
+
         for (gi,gj), score in grid_scores.items():
             s = math.log(score+1)
-            # ① 相対評価: 今の空間内での順位
+            # ① 相対評価: 今の細かい格子内での順位
             if   s>=th5: lv=5
             elif s>=th4: lv=4
             elif s>=th3: lv=3
             elif s>=th2: lv=2
             elif s>=th1: lv=1
             else: continue
-            # ② 絶対評価: 過去65日間の実績分布と比べても稀な値かどうか（キャリブレーション未完了時はスキップ）
-            if hth5 is not None:
-                if   s>=hth5: lv_abs=5
-                elif s>=hth4: lv_abs=4
-                elif s>=hth3: lv_abs=3
-                elif s>=hth2: lv_abs=2
-                elif s>=hth1: lv_abs=1
+            # ② 絶対評価: そのエリア(RISK_GRID_SIZE格子)自身の過去実績と比べて稀な値かどうか
+            #    （キャリブレーション未完了、またはそのエリアの履歴サンプルが不足している場合はスキップ）
+            lat = gi * GRID_SIZE; lon = gj * GRID_SIZE
+            rkey = (int(math.floor(lat / RISK_GRID_SIZE)), int(math.floor(lon / RISK_GRID_SIZE)))
+            if abs_rank_coarse is not None and rkey in abs_rank_coarse:
+                abs_s = abs_rank_coarse[rkey]
+                if   abs_s>=0.97: lv_abs=5
+                elif abs_s>=0.85: lv_abs=4
+                elif abs_s>=0.6:  lv_abs=3
+                elif abs_s>=0.4:  lv_abs=2
                 else: lv_abs=0
                 lv = min(lv, lv_abs)
-            # ③ ドメイン知識: 背景地震活動(EP.MU)に対する倍率が小さいうちはLv4/5にしない安全弁
-            ratio = score / max(EP.MU, 1e-9)
+            # ③ ドメイン知識: 全国一律のEP.MUではなく、そのエリア自身の平常時中央値に
+            #    対する倍率が小さいうちはLv4/5にしない安全弁（中央値が無ければEP.MUで代用）
+            base = median_map.get(rkey, EP.MU)
+            ratio = etas_raw_coarse.get(rkey, score) / max(base, EP.MU, 1e-9)
             if ratio < 1.5: lv = min(lv, 3)
             elif ratio < 3.0: lv = min(lv, 4)
             if lv <= 0: continue
@@ -4253,7 +4263,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震研究統合プラットフォーム v7.57</title>
+  <title>地震研究統合プラットフォーム v7.67</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
@@ -4298,7 +4308,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v7.57 / 研究用</div>
+      <div>v7.67 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
