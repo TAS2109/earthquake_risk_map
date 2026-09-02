@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v7.56
+地震研究統合プラットフォーム v7.57
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -1127,7 +1127,7 @@ def _percentile_thresholds(values_arr):
 #
 # さらに、統計的な稀さだけでは「たまたま直近65日がずっと静穏だった／
 # 逆にずっと活発だった」場合に基準がぶれるため、ドメイン知識に基づく
-# 絶対的な下限フィルタ（_etas_domain_floor / _bvalue_domain_floor）も
+# 絶対的な下限フィルタ（_make_etas_domain_floor / _bvalue_domain_floor / _make_stress_domain_floor）も
 # 組み合わせるハイブリッド方式にする。
 # ══════════════════════════════════════════════════════
 HIST_CALIB_LOOKBACK_DAYS = 65     # quakes.csv の保持期間(_cleanup_old_quakes)に合わせる
@@ -1263,16 +1263,24 @@ def _cellwise_median_map(pool):
         return {}
     return {k: float(np.median(v)) for k, v in pool.items() if v}
 
-def _etas_domain_floor(cell_key, raw_v, s):
-    """ドメイン知識: ETASスコアが背景地震活動(EP.MU)の何倍かを見て、
-    ごく僅かな上振れではLv4/5相当のスコアにならないよう頭打ちにする
-    （過去65日間がたまたま静穏/活発だった場合の安全弁）。倍率は経験則であり、
-    観測実績が蓄積され次第チューニングする前提の暫定値。
-    (v7.56: _hybrid_rank_mapの呼び出し規約統一のためcell_key引数を追加、未使用)"""
-    ratio = raw_v / max(EP.MU, 1e-9)
-    if ratio < 1.5: return min(s, 0.55)   # Lv3相当まで
-    if ratio < 3.0: return min(s, 0.80)   # Lv4相当まで
-    return s
+def _make_etas_domain_floor(median_map, lv3_ratio=1.5, lv4_ratio=3.0):
+    """(v7.56) ETAS用ドメイン下限フィルタ。以前(_etas_domain_floor)は全国一律の
+    固定値(EP.MU、ETASモデルの背景発生率パラメータ)を基準にしていたため、
+    三陸沖・南海トラフ・伊豆諸島のように恒常的に地震活動が活発な地域では、
+    ありふれたM4程度の地震1回でも生スコアがEP.MUの数十〜数百倍になり、
+    この下限フィルタが事実上機能していなかった(=断層/プレートと同種の
+    「全国一律の基準による空間的な下駄」がETASにも残っていた)。
+    そのセル自身の過去実績の中央値(median_map、etas_cellプール由来)を基準に
+    することで、「そのセルにとって普段よりどれだけ活発か」を測る真の絶対基準にする。
+    キャリブレーション未完了・新規セルなど中央値が無い場合は、従来通りEP.MUを
+    暫定基準として使う（立ち上げ初期の安全弁）。"""
+    def _floor(cell_key, raw_v, s):
+        base = median_map.get(cell_key, EP.MU)
+        ratio = raw_v / max(base, EP.MU, 1e-9)
+        if ratio < lv3_ratio: return min(s, 0.55)   # Lv3相当まで
+        if ratio < lv4_ratio: return min(s, 0.80)   # Lv4相当まで
+        return s
+    return _floor
 
 def _bvalue_domain_floor(cell_key, raw_v, s):
     """ドメイン知識: 地殻の平均的なb値はおよそ1.0前後とされる。0.8を下回って
@@ -3312,12 +3320,12 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid, quakes):
     # 気圧偏差・TECは過去分の履歴を保持していないため絶対評価ができず、
     # 単独でLv4/5の主因にならないよう固定の上限(PRESSURE_TEC_SCORE_CAP)を課す。
     calib = _get_historical_calibration()
-    # (v7.56) セル単位の絶対評価プール(*_cell)を使用。断層/プレートは、
-    # そのセル自身の平常時中央値に対する倍率フィルタ(_make_stress_domain_floor)も適用し、
-    # 「活断層に恒常的に近いから高スコア」ではなく「自セルの平常値から逸脱したから高スコア」
-    # という真の絶対評価にする。
-    etas_rank     = _hybrid_rank_map(etas_raw, calib.get("etas_cell"), invert=False,
-                                      log_transform=True, domain_floor_fn=_etas_domain_floor)
+    # (v7.56) セル単位の絶対評価プール(*_cell)を使用。ETAS/断層/プレートは、
+    # そのセル自身の平常時中央値に対する倍率フィルタ(_make_etas_domain_floor /
+    # _make_stress_domain_floor)を適用し、「元々活発な/近い地域だから高スコア」
+    # ではなく「自セルの平常値から逸脱したから高スコア」という真の絶対評価にする。
+    etas_rank     = _hybrid_rank_map(etas_raw, calib.get("etas_cell"), invert=False, log_transform=True,
+                                      domain_floor_fn=_make_etas_domain_floor(_cellwise_median_map(calib.get("etas_cell"))))
     bvalue_rank   = _hybrid_rank_map(bvalue_raw, calib.get("bvalue_cell"), invert=True,
                                       log_transform=False, domain_floor_fn=_bvalue_domain_floor)
     fault_rank    = _hybrid_rank_map(fault_raw, calib.get("fault_cell"), invert=False, log_transform=False,
@@ -3387,8 +3395,8 @@ def compute_risk_grid_historical(quakes, ref_time):
     # 意味がぶれないようにする。
     calib = _get_historical_calibration()
     # (v7.56) 通常版(compute_risk_grid)と同じくセル単位絶対評価プールを使用。
-    etas_rank   = _hybrid_rank_map(etas_raw, calib.get("etas_cell"), invert=False,
-                                    log_transform=True, domain_floor_fn=_etas_domain_floor)
+    etas_rank   = _hybrid_rank_map(etas_raw, calib.get("etas_cell"), invert=False, log_transform=True,
+                                    domain_floor_fn=_make_etas_domain_floor(_cellwise_median_map(calib.get("etas_cell"))))
     bvalue_rank = _hybrid_rank_map(bvalue_raw, calib.get("bvalue_cell"), invert=True,
                                     log_transform=False, domain_floor_fn=_bvalue_domain_floor)
     fault_rank  = _hybrid_rank_map(fault_raw, calib.get("fault_cell"), invert=False, log_transform=False,
@@ -4245,7 +4253,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震研究統合プラットフォーム v7.56</title>
+  <title>地震研究統合プラットフォーム v7.57</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
@@ -4290,7 +4298,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v7.56 / 研究用</div>
+      <div>v7.57 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
