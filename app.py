@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v7.55
+地震研究統合プラットフォーム v7.56
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -1133,34 +1133,14 @@ def _percentile_thresholds(values_arr):
 HIST_CALIB_LOOKBACK_DAYS = 65     # quakes.csv の保持期間(_cleanup_old_quakes)に合わせる
 HIST_CALIB_SAMPLE_HOURS  = 24     # 24時間おきにサンプリング（最大65点、計算負荷とのバランス）
 HIST_CALIB_TTL_SEC       = 6 * 3600  # 6時間ごとに再キャリブレーション（新着データを反映）
-HIST_CALIB_MIN_POOL      = 30     # プール件数がこれ未満なら未キャリブレーション扱い（相対評価にフォールバック）
+HIST_CALIB_MIN_POOL      = 30     # プール件数がこれ未満なら未キャリブレーション扱い（相対評価にフォールバック、ETASマップ用の全体プールにのみ使用）
+HIST_CALIB_MIN_CELL_SAMPLES = 20  # (v7.56) セル単位の絶対評価に必要な最低サンプル数(最大65点中)。
+                                   # これ未満のセルは自セルの履歴が薄いため、そのセルだけ相対評価にフォールバックする。
 
-# ★ Bug fix (2026-09): 従来は各サンプル時刻について「全セルの生値」をそのまま
-# プールに入れていた。これだと『格子が約600セルある中で、その瞬間たまたま
-# 一番賑わっているセル』は、日本のどこかで地震活動が続く限りほぼ毎日存在してしまい、
-# それがプール全体の上位数%に入るのは統計的にありふれた現象（多重比較・
-# look-elsewhere効果）になる。つまり「本日のホットスポットがプールの上位2%に入る」
-# ことは「本日は特別に危険」を意味せず、「約600セル同時に検定すればどれかは
-# 上位に来て当然」というだけの現象だった。これがLv4/5セルが常態的に
-# 大量発生していた主因。
-# 対策: 各サンプル時刻について、全セルではなく「その時刻に最も際立っていた
-# セル」上位HIST_CALIB_TOPK件だけをプールに採用する。こうするとプールが
-# 『日本で最も活発な地点は、過去65日間の中でどれくらいの水準まで振れてきたか』
-# という分布になり、絶対評価が正しく「今日のホットスポットは過去実績と比べて
-# 本当に稀か」を判定できるようになる（多重比較を補正した分布に対する比較）。
-HIST_CALIB_TOPK          = 3      # 各サンプル時刻からプールに採用する上位セル数
-
-_hist_calib_cache = {"ts": 0.0, "etas": None, "bvalue": None, "fault": None, "plate": None, "n_samples": 0}
+_hist_calib_cache = {"ts": 0.0, "etas": None, "bvalue": None, "fault": None, "plate": None,
+                      "etas_cell": None, "bvalue_cell": None, "fault_cell": None, "plate_cell": None,
+                      "n_samples": 0}
 _hist_calib_lock = threading.Lock()
-
-def _topk_values(raw_map, k=HIST_CALIB_TOPK, invert=False):
-    """raw_map(セル→生値)から『最も際立っている』上位k件の値だけを返す。
-    invert=Trueの場合は値が小さいほど際立っている指標（b値など）とみなし、
-    下位k件を返す。"""
-    if not raw_map:
-        return []
-    vals = sorted(raw_map.values(), reverse=not invert)
-    return list(vals[:k])
 
 def _sample_ref_times(lookback_days=HIST_CALIB_LOOKBACK_DAYS, step_hours=HIST_CALIB_SAMPLE_HOURS):
     now = datetime.now(timezone.utc)
@@ -1172,9 +1152,22 @@ def _compute_historical_calibration():
     """過去HIST_CALIB_LOOKBACK_DAYS日間を定期サンプリングし、ETAS/b値/断層・
     プレート応力それぞれの「生の値」の分布(プール)を作る。アーカイブタブの
     再計算ロジック(load_quakes_between / analyze_etas(ref_time=...) /
-    _historical_fault_plate_raw)をそのまま流用する。"""
+    _historical_fault_plate_raw)をそのまま流用する。
+
+    (v7.56) 従来は全セル・全時刻の値を1本の配列にまとめる「空間+時間混合プール」
+    (etas/bvalue/fault/plateキー。ETASマップ(Tab2)用に維持) だけを作っていたが、
+    これだと活断層が密集する地域のセルは活動量に関わらず常に生値が高いため、
+    プール全体の中での順位が恒常的に上位に張り付き、統合リスクマップのLv4/5が
+    平穏な時期でも大量発生する原因になっていた（空間的な下駄と時間的な稀少性の混同）。
+    そこで統合リスクマップ用には、セルごとに「そのセル自身の過去
+    HIST_CALIB_LOOKBACK_DAYS日間の値」だけを集めたプール(*_cellキー)を別途作る。
+    これにより絶対評価が「他の場所と比べて高いか」ではなく「そのセル自身の
+    いつもと比べて高いか」という真の時間的異常度になる。"""
+    from collections import defaultdict
     ref_times = _sample_ref_times()
     etas_pool, bvalue_pool, fault_pool, plate_pool = [], [], [], []
+    etas_cell, bvalue_cell, fault_cell, plate_cell = (defaultdict(list), defaultdict(list),
+                                                       defaultdict(list), defaultdict(list))
     ok = 0
     for rt in ref_times:
         try:
@@ -1183,27 +1176,40 @@ def _compute_historical_calibration():
             if not quakes:
                 continue
             etas_scores = analyze_etas(quakes, ref_time=rt)
-            etas_pool.extend(_topk_values(_risk_etas_raw(etas_scores), invert=False))
+            etas_raw_t = _risk_etas_raw(etas_scores)
+            etas_pool.extend(etas_raw_t.values())
+            for k, v in etas_raw_t.items(): etas_cell[k].append(v)
 
             bgrid = compute_bvalue_grid(quakes)
-            # b値は値が小さいほど高リスク（応力集中の疑い）なので、下位k件を採用する
-            bvalue_pool.extend(_topk_values(_risk_bvalue_raw(bgrid), invert=True))
+            bvalue_raw_t = _risk_bvalue_raw(bgrid)
+            bvalue_pool.extend(bvalue_raw_t.values())
+            for k, v in bvalue_raw_t.items(): bvalue_cell[k].append(v)
 
             fault_raw, plate_raw = _historical_fault_plate_raw(quakes, rt)
-            fault_pool.extend(_topk_values(fault_raw, invert=False))
-            plate_pool.extend(_topk_values(plate_raw, invert=False))
+            fault_pool.extend(fault_raw.values())
+            plate_pool.extend(plate_raw.values())
+            for k, v in fault_raw.items(): fault_cell[k].append(v)
+            for k, v in plate_raw.items(): plate_cell[k].append(v)
             ok += 1
         except Exception as e:
             print(f"[絶対基準キャリブレーション] サンプル({rt})でエラー: {e}")
             continue
     print(f"[絶対基準キャリブレーション] {ok}/{len(ref_times)}時点サンプリング完了 "
           f"(etas={len(etas_pool)} bvalue={len(bvalue_pool)} fault={len(fault_pool)} plate={len(plate_pool)})")
+    # セル単位プールは、サンプル時点数(ok)が少なすぎる(=積み上げ途中)場合は
+    # 誤ったセル基準値で誤判定するより「未キャリブレーション」扱いの方が安全なため、
+    # 十分な時点数が確保できるまではNoneのままにする。
+    cell_ready = ok >= max(10, HIST_CALIB_MIN_CELL_SAMPLES // 2)
     return {
         "ts": time.time(),
         "etas":   np.array(etas_pool)   if etas_pool   else None,
         "bvalue": np.array(bvalue_pool) if bvalue_pool else None,
         "fault":  np.array(fault_pool)  if fault_pool  else None,
         "plate":  np.array(plate_pool)  if plate_pool  else None,
+        "etas_cell":   dict(etas_cell)   if (cell_ready and etas_cell)   else None,
+        "bvalue_cell": dict(bvalue_cell) if (cell_ready and bvalue_cell) else None,
+        "fault_cell":  dict(fault_cell)  if (cell_ready and fault_cell)  else None,
+        "plate_cell":  dict(plate_cell)  if (cell_ready and plate_cell)  else None,
         "n_samples": ok,
     }
 
@@ -1224,39 +1230,74 @@ def _get_historical_calibration():
     return _hist_calib_cache
 
 def _historical_abs_rank(raw_map, pool, invert=False, log_transform=False):
-    """raw_mapの各セルの値を『過去実績分布(pool)の中での位置』(0〜1)に変換する。
-    poolが不足している(キャリブレーション未完了)場合はNoneを返す。"""
-    if not raw_map or pool is None or len(pool) < HIST_CALIB_MIN_POOL:
+    """raw_mapの各セルの値を『そのセル自身の過去実績分布(pool[cell_key])の中での
+    位置』(0〜1)に変換する(v7.56: セル単位。旧: 全セル混合の1本のプール)。
+    これにより「活断層近接セルは常に生値が高い」という空間的な特徴と、
+    「今その場所がいつもより活発かどうか」という時間的な異常度を分離する。
+    pool自体が未キャリブレーション、またはそのセルの履歴サンプルが
+    HIST_CALIB_MIN_CELL_SAMPLES未満の場合は、そのセルについてNone相当
+    (=呼び出し側で相対評価にフォールバック)として扱う。"""
+    if not raw_map or not pool:
         return None
-    ref = np.log(np.clip(pool, 0, None) + 1) if log_transform else pool
-    ref_sorted = np.sort(ref)
-    n = len(ref_sorted)
     out = {}
     for k, v in raw_map.items():
+        hist = pool.get(k)
+        if hist is None or len(hist) < HIST_CALIB_MIN_CELL_SAMPLES:
+            continue
+        hist_arr = np.asarray(hist, dtype=float)
+        ref = np.log(np.clip(hist_arr, 0, None) + 1) if log_transform else hist_arr
+        ref_sorted = np.sort(ref)
+        n = len(ref_sorted)
         x = math.log(max(v, 0) + 1) if log_transform else v
         rank = np.searchsorted(ref_sorted, x, side="right") / n
         if invert:
             rank = 1.0 - rank
         out[k] = float(np.clip(rank, 0.0, 1.0))
-    return out
+    return out if out else None
 
-def _etas_domain_floor(raw_v, s):
+def _cellwise_median_map(pool):
+    """(v7.56) セル単位履歴プール(dict: cell_key -> 値のリスト)から、
+    各セルの「平常時の中央値」を返す。断層/プレートの絶対下限フィルタで、
+    そのセル自身の平常値に対する倍率を求めるために使う。"""
+    if not pool:
+        return {}
+    return {k: float(np.median(v)) for k, v in pool.items() if v}
+
+def _etas_domain_floor(cell_key, raw_v, s):
     """ドメイン知識: ETASスコアが背景地震活動(EP.MU)の何倍かを見て、
     ごく僅かな上振れではLv4/5相当のスコアにならないよう頭打ちにする
     （過去65日間がたまたま静穏/活発だった場合の安全弁）。倍率は経験則であり、
-    観測実績が蓄積され次第チューニングする前提の暫定値。"""
+    観測実績が蓄積され次第チューニングする前提の暫定値。
+    (v7.56: _hybrid_rank_mapの呼び出し規約統一のためcell_key引数を追加、未使用)"""
     ratio = raw_v / max(EP.MU, 1e-9)
     if ratio < 1.5: return min(s, 0.55)   # Lv3相当まで
     if ratio < 3.0: return min(s, 0.80)   # Lv4相当まで
     return s
 
-def _bvalue_domain_floor(raw_v, s):
+def _bvalue_domain_floor(cell_key, raw_v, s):
     """ドメイン知識: 地殻の平均的なb値はおよそ1.0前後とされる。0.8を下回って
     初めて応力集中の可能性を疑うレベルとみなし、それより高い(平均的な)場合は
-    スコアを頭打ちにする。"""
+    スコアを頭打ちにする。
+    (v7.56: _hybrid_rank_mapの呼び出し規約統一のためcell_key引数を追加、未使用)"""
     if raw_v >= 0.9: return min(s, 0.55)
     if raw_v >= 0.8: return min(s, 0.80)
     return s
+
+def _make_stress_domain_floor(median_map, lv3_ratio=3.0, lv4_ratio=8.0, min_baseline=1e-6):
+    """(v7.56) 断層/プレート応力負荷用のドメイン知識フィルタ。
+    そのセル自身の平常時中央値(median_map)に対して現在の生値が何倍かを見て、
+    一定倍率に達していなければLv4/5相当のスコアにならないよう頭打ちにする。
+    活断層/プレート境界に恒常的に近いセルであっても、"いつも通り"の負荷では
+    高スコアにならず、直近の地震活動で自セルの平常値から明確に逸脱した場合
+    のみ高スコアを許す。倍率は経験則であり、観測実績の蓄積とともに
+    再チューニングする前提の暫定値。"""
+    def _floor(cell_key, raw_v, s):
+        base = median_map.get(cell_key, 0.0)
+        ratio = raw_v / max(base, min_baseline)
+        if ratio < lv3_ratio: return min(s, 0.55)   # Lv3相当まで
+        if ratio < lv4_ratio: return min(s, 0.80)   # Lv4相当まで
+        return s
+    return _floor
 
 # 気圧偏差・TEC(電離圏)は過去分のデータを保持しておらず絶対評価の基準を
 # 作れないため、単独でLv4/5の主因にならないようスコアに上限を設ける
@@ -1265,19 +1306,19 @@ def _bvalue_domain_floor(raw_v, s):
 PRESSURE_TEC_SCORE_CAP = 0.6
 
 def _hybrid_rank_map(raw_map, pool, invert=False, log_transform=False, domain_floor_fn=None):
-    """『今この瞬間の空間内相対順位』と『過去65日間の実績と比べた絶対順位』の
-    両方を求め、小さい方（より保守的な方）を採用する。さらにdomain_floor_fnが
-    与えられればドメイン知識による絶対下限フィルタも適用する。
+    """『今この瞬間の空間内相対順位』と『そのセル自身の過去65日間の実績と
+    比べた絶対順位』の両方を求め、小さい方（より保守的な方）を採用する。
+    さらにdomain_floor_fnが与えられればドメイン知識による絶対下限フィルタも
+    適用する。domain_floor_fnは (cell_key, raw_v, s) を受け取る形式
+    (v7.56: セル単位の絶対基準に対応するためcell_keyを渡すよう変更)。
     キャリブレーション未完了時は相対評価のみにフォールバックする。"""
     rel = _percentile_rank_map(raw_map, invert=invert)
     absr = _historical_abs_rank(raw_map, pool, invert=invert, log_transform=log_transform)
-    if absr is None:
-        return rel
     out = {}
     for k, rv in rel.items():
-        s = min(rv, absr.get(k, rv))
+        s = min(rv, absr.get(k, rv)) if absr is not None else rv
         if domain_floor_fn is not None:
-            s = domain_floor_fn(raw_map[k], s)
+            s = domain_floor_fn(k, raw_map[k], s)
         out[k] = s
     return out
 
@@ -3271,12 +3312,18 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid, quakes):
     # 気圧偏差・TECは過去分の履歴を保持していないため絶対評価ができず、
     # 単独でLv4/5の主因にならないよう固定の上限(PRESSURE_TEC_SCORE_CAP)を課す。
     calib = _get_historical_calibration()
-    etas_rank     = _hybrid_rank_map(etas_raw, calib.get("etas"), invert=False,
+    # (v7.56) セル単位の絶対評価プール(*_cell)を使用。断層/プレートは、
+    # そのセル自身の平常時中央値に対する倍率フィルタ(_make_stress_domain_floor)も適用し、
+    # 「活断層に恒常的に近いから高スコア」ではなく「自セルの平常値から逸脱したから高スコア」
+    # という真の絶対評価にする。
+    etas_rank     = _hybrid_rank_map(etas_raw, calib.get("etas_cell"), invert=False,
                                       log_transform=True, domain_floor_fn=_etas_domain_floor)
-    bvalue_rank   = _hybrid_rank_map(bvalue_raw, calib.get("bvalue"), invert=True,
+    bvalue_rank   = _hybrid_rank_map(bvalue_raw, calib.get("bvalue_cell"), invert=True,
                                       log_transform=False, domain_floor_fn=_bvalue_domain_floor)
-    fault_rank    = _hybrid_rank_map(fault_raw, calib.get("fault"), invert=False, log_transform=False)
-    plate_rank    = _hybrid_rank_map(plate_raw, calib.get("plate"), invert=False, log_transform=False)
+    fault_rank    = _hybrid_rank_map(fault_raw, calib.get("fault_cell"), invert=False, log_transform=False,
+                                      domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("fault_cell"))))
+    plate_rank    = _hybrid_rank_map(plate_raw, calib.get("plate_cell"), invert=False, log_transform=False,
+                                      domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("plate_cell"))))
     pressure_rank = {k: min(v, PRESSURE_TEC_SCORE_CAP)
                       for k, v in _percentile_rank_map(pressure_raw, invert=False).items()}
     tec_rank      = {k: min(v, PRESSURE_TEC_SCORE_CAP)
@@ -3339,12 +3386,15 @@ def compute_risk_grid_historical(quakes, ref_time):
     # 絶対比較×ドメイン知識）を適用し、アーカイブ表示と現在表示でレベルの
     # 意味がぶれないようにする。
     calib = _get_historical_calibration()
-    etas_rank   = _hybrid_rank_map(etas_raw, calib.get("etas"), invert=False,
+    # (v7.56) 通常版(compute_risk_grid)と同じくセル単位絶対評価プールを使用。
+    etas_rank   = _hybrid_rank_map(etas_raw, calib.get("etas_cell"), invert=False,
                                     log_transform=True, domain_floor_fn=_etas_domain_floor)
-    bvalue_rank = _hybrid_rank_map(bvalue_raw, calib.get("bvalue"), invert=True,
+    bvalue_rank = _hybrid_rank_map(bvalue_raw, calib.get("bvalue_cell"), invert=True,
                                     log_transform=False, domain_floor_fn=_bvalue_domain_floor)
-    fault_rank  = _hybrid_rank_map(fault_raw, calib.get("fault"), invert=False, log_transform=False)
-    plate_rank  = _hybrid_rank_map(plate_raw, calib.get("plate"), invert=False, log_transform=False)
+    fault_rank  = _hybrid_rank_map(fault_raw, calib.get("fault_cell"), invert=False, log_transform=False,
+                                    domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("fault_cell"))))
+    plate_rank  = _hybrid_rank_map(plate_raw, calib.get("plate_cell"), invert=False, log_transform=False,
+                                    domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("plate_cell"))))
 
     cells = []
     for key, (lat, lon) in _RISK_CELLS.items():
@@ -3683,11 +3733,17 @@ function computeComposite(cell){{
   if(wsum<=0) return null;
   return {{score: ssum/wsum, used: used, wsum: wsum}};
 }}
+// (v7.56) Lv5=特別警報級(年数回程度)/Lv4=危険警報級(活発期でも数日に一度程度)を
+// 目指す絶対基準。以前は0.95/0.7だったが、サーバー側の絶対評価がセル単位の
+// 空間的な下駄(活断層近接セルの恒常的な高スコア)を含んでいたため、平穏な時期
+// でもLv5が10セル前後、Lv4が100セル前後常時表示される状態だった。
+// サーバー側の絶対評価をセル自身の時系列基準に修正した上で、この最終しきい値も
+// 引き上げて二重に頭打ちにする。表示頻度は今後の実績を見ながら再チューニングする。
 function levelOf(score){{
-  if(score>=0.95) return 5;
-  if(score>=0.7) return 4;
-  if(score>=0.5) return 3;
-  if(score>=0.3) return 2;
+  if(score>=0.97) return 5;
+  if(score>=0.85) return 4;
+  if(score>=0.6) return 3;
+  if(score>=0.4) return 2;
   return 1;
 }}
 
@@ -4030,11 +4086,12 @@ function computeComposite(cell){
   if(wsum<=0) return null;
   return {score: ssum/wsum, used: used, wsum: wsum};
 }
+// (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。
 function levelOf(score){
-  if(score>=0.95) return 5;
-  if(score>=0.7) return 4;
-  if(score>=0.5) return 3;
-  if(score>=0.3) return 2;
+  if(score>=0.97) return 5;
+  if(score>=0.85) return 4;
+  if(score>=0.6) return 3;
+  if(score>=0.4) return 2;
   return 1;
 }
 
@@ -4188,7 +4245,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震研究統合プラットフォーム v7.55</title>
+  <title>地震研究統合プラットフォーム v7.56</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
@@ -4233,7 +4290,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v7.55 / 研究用</div>
+      <div>v7.56 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
