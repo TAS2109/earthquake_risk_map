@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v7.67
+地震研究統合プラットフォーム v7.68
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -3665,6 +3665,7 @@ canvas.dChart{{display:block;width:100%}}
     <span style="color:{LEVEL_COLOR[2]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv2（やや注意）<br>
     <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（平常）<br>
     <hr style="border-color:#374151;margin:5px 0">
+    <small style="color:#6b7280">Lv0（しきい値未満）のセルは地図上に表示されません</small><br>
     <small>選択データの相対順位を重み付け合成した指数<br>（発生確率を意味するものではありません）</small>
   </div>
   <div id="detailBox">
@@ -3757,12 +3758,16 @@ function computeComposite(cell){{
 // でもLv5が10セル前後、Lv4が100セル前後常時表示される状態だった。
 // サーバー側の絶対評価をセル自身の時系列基準に修正した上で、この最終しきい値も
 // 引き上げて二重に頭打ちにする。表示頻度は今後の実績を見ながら再チューニングする。
+// (v7.56) Lv0(色無し)を追加。0.2未満は「表示するほどの水準ではない」として
+// 地図上に描画しない(redraw側でlv===0を除外)。これによりマップ全体が常に
+// 色で埋め尽くされる状態を避け、実際に注意すべきセルだけが目立つようにする。
 function levelOf(score){{
   if(score>=0.97) return 5;
   if(score>=0.85) return 4;
   if(score>=0.6) return 3;
   if(score>=0.4) return 2;
-  return 1;
+  if(score>=0.2) return 1;
+  return 0;
 }}
 
 // 寄与度(浮動小数)の配列を、合計が total(整数)に一致するよう最大剰余法で丸める
@@ -3938,8 +3943,9 @@ function redraw(){{
   CELLS.forEach(function(cell){{
     var comp = computeComposite(cell);
     if(!comp) return;
-    shown++;
     var lv = levelOf(comp.score);
+    if(lv===0) return;  // (v7.56) Lv0(色無し)は地図・件数・ランキングいずれにも出さない
+    shown++;
     lastShownList.push({{cell:cell, comp:comp, lv:lv}});
     var rect = L.rectangle(
       [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
@@ -4065,6 +4071,7 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
     <span style="color:#ffe600;opacity:0.55">■</span> Lv2（やや注意）<br>
     <span style="color:#66ccff;opacity:0.55">■</span> Lv1（平常）<br>
     <hr style="border-color:#374151;margin:5px 0">
+    <small style="color:#6b7280">Lv0（しきい値未満）のセルは地図上に表示されません</small><br>
     <small>指定時点における相対リスク指数<br>（発生確率を意味するものではありません）</small>
   </div>
   <div id="detailBox">
@@ -4105,12 +4112,14 @@ function computeComposite(cell){
   return {score: ssum/wsum, used: used, wsum: wsum};
 }
 // (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。
+// (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。Lv0(色無し)も同様。
 function levelOf(score){
   if(score>=0.97) return 5;
   if(score>=0.85) return 4;
   if(score>=0.6) return 3;
   if(score>=0.4) return 2;
-  return 1;
+  if(score>=0.2) return 1;
+  return 0;
 }
 
 function roundPartsToTotal(parts, total){
@@ -4188,8 +4197,9 @@ function redraw(){
   CELLS.forEach(function(cell){
     var comp = computeComposite(cell);
     if(!comp) return;
-    shown++;
     var lv = levelOf(comp.score);
+    if(lv===0) return;  // (v7.56) Lv0(色無し)は地図・件数・ランキングいずれにも出さない
+    shown++;
     lastShownList.push({cell:cell, comp:comp, lv:lv});
     var rect = L.rectangle(
       [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
@@ -4263,7 +4273,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震研究統合プラットフォーム v7.67</title>
+  <title>地震研究統合プラットフォーム v7.68</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
@@ -4308,7 +4318,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v7.67 / 研究用</div>
+      <div>v7.68 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
