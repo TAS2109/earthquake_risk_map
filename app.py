@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v7.78
+地震研究統合プラットフォーム v7.781
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -4402,7 +4402,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震研究統合プラットフォーム v7.78</title>
+  <title>地震研究統合プラットフォーム v7.781</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
@@ -4447,7 +4447,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v7.78 / 研究用</div>
+      <div>v7.781 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -4679,6 +4679,45 @@ def gnss_status():
         "error": error,
         "lookback_days": GNSS_LOOKBACK_DAYS,
     }
+
+@app.route("/hinet/debug_raw")
+def hinet_debug_raw():
+    """
+    Hi-netログイン処理の生の応答を確認するデバッグ用エンドポイント。
+    ID/パスワードなど認証情報自体は一切返さない。
+    ローカル環境では成功するのにRender等のサーバー環境では失敗する場合、
+    データセンターIPがブロックされているのか、それとも本当にログインが
+    失敗しているのか（想定外の隠しフィールド等）を切り分けるために使う。
+    """
+    if not HINET_ENABLED:
+        return Response("HINET_USER / HINET_PASS が未設定です", status=400)
+    debug = {}
+    session = requests.Session()
+    try:
+        r1 = session.get(HINET_LOGIN_URL, headers=HINET_HEADERS, timeout=15)
+        debug["step1_get_status"] = r1.status_code
+        debug["step1_get_final_url"] = r1.url
+        debug["step1_cookies_after_get"] = list(session.cookies.keys())
+    except Exception as e:
+        debug["step1_error"] = str(e)
+        return debug
+    try:
+        r2 = session.post(
+            HINET_LOGIN_URL,
+            data={"LANG": "ja", "auth_un": HINET_USER, "auth_pw": HINET_PASS},
+            headers={**HINET_HEADERS, "Referer": HINET_LOGIN_URL},
+            timeout=15,
+        )
+        r2.encoding = "euc-jp"
+        debug["step2_post_status"] = r2.status_code
+        debug["step2_post_final_url"] = r2.url
+        debug["step2_redirect_chain_status"] = [h.status_code for h in r2.history]
+        debug["step2_cookies_after_post"] = list(session.cookies.keys())
+        debug["step2_still_shows_login_form"] = "auth_login.png" in r2.text
+        debug["step2_text_preview"] = r2.text[:400]
+    except Exception as e:
+        debug["step2_error"] = str(e)
+    return debug
 
 @app.route("/hinet/status")
 def hinet_status():
