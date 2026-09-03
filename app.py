@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v7.68
+地震研究統合プラットフォーム v7.78
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -186,6 +186,29 @@ GNSS_STATIONS = [
 
 _gnss_cache = {"data": None, "ts": 0.0, "error": None, "updating": False}
 _gnss_lock  = threading.Lock()
+
+# ── Hi-net（防災科研）微小地震データ ───────────────────────
+# JMAの公開情報（発表対象は基本的に有感地震、または一定規模以上）には出てこない
+# 無感の微小地震を含む震源リストを、Hi-net自動処理震源リスト（速報値、前日・当日分、
+# 3時間毎更新）から取得する。ユーザ登録（無料）とログインが必要。
+# 以下の環境変数を設定すると有効になる（未設定なら完全に無効＝他機能に影響なし）。
+#   HINET_USER / HINET_PASS : NIED地震観測網の登録ユーザ名・パスワード
+# ★ 実装メモ（2026-09）: サイトはEUC-JPエンコードで、Cookieセッション認証。
+# ログインはトップページ取得→POST(LANG/auth_un/auth_pw)の順で行う必要がある
+# （事前のGETでセッションCookieを受け取ってからでないとログインが通らない）。
+# データはJSON等ではなく固定カラムのテキスト（空白区切り、10トークン/行）で、
+# 気象庁発表のような場所名(place)・震度(max_int)は含まれない。
+HINET_USER = os.environ.get("HINET_USER", "").strip()
+HINET_PASS = os.environ.get("HINET_PASS", "").strip()
+HINET_ENABLED = bool(HINET_USER and HINET_PASS)
+
+HINET_LOGIN_URL    = "https://hinetwww11.bosai.go.jp/auth/?LANG=ja"
+HINET_HYPOLIST_URL = "https://hinetwww11.bosai.go.jp/auth/hinet_hypolist/?LANG=ja"
+HINET_HEADERS      = {"User-Agent": "Mozilla/5.0 (SeismoApp/5.0)"}
+
+_hinet_session      = None
+_hinet_session_lock = threading.Lock()
+_hinet_status       = {"last_success": 0.0, "last_error": None, "last_count": 0}
 
 # ── グローバルキャッシュ ──────────────────────────────
 _cache_lock        = threading.Lock()
@@ -540,6 +563,108 @@ def fetch_quakes_usgs():
     except Exception as e:
         print(f"[USGS] {e}"); return []
 
+def _hinet_login():
+    """
+    Hi-netにログインし、認証済みセッションを返す。失敗時はNoneを返す。
+    ログインフォーム表示時に発行される一時Cookieが必要なため、
+    POST前に一度トップページをGETしてセッションを開始する。
+    """
+    session = requests.Session()
+    try:
+        session.get(HINET_LOGIN_URL, headers=HINET_HEADERS, timeout=15)
+        resp = session.post(
+            HINET_LOGIN_URL,
+            data={"LANG": "ja", "auth_un": HINET_USER, "auth_pw": HINET_PASS},
+            headers={**HINET_HEADERS, "Referer": HINET_LOGIN_URL},
+            timeout=15,
+        )
+        resp.encoding = "euc-jp"
+        # ログインフォームの画像がまだ含まれている＝ログイン画面に戻された＝失敗
+        if "auth_login.png" in resp.text:
+            print("[Hi-net] ログイン失敗（認証情報を確認してください）")
+            return None
+        return session
+    except Exception as e:
+        print(f"[Hi-net] ログインエラー: {e}")
+        return None
+
+def _get_hinet_session(force_relogin=False):
+    """キャッシュ済みのHi-netセッションを返す。無い場合（または強制時）はログインし直す。"""
+    global _hinet_session
+    with _hinet_session_lock:
+        if _hinet_session is None or force_relogin:
+            _hinet_session = _hinet_login()
+        return _hinet_session
+
+_HINET_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\s")
+
+def _parse_hinet_hypolist(text):
+    """
+    Hi-net自動処理震源リストのテキストをパースする。
+    フォーマット（空白区切り、10トークン/行、JST時刻）:
+      YYYY-MM-DD HH:MM:SS.sss  OTerr  Lat  Yerr  Long  Xerr  Dep  Derr  Mag
+    JMA公開情報のような場所名・震度は含まれないため place="" / max_int="" とする。
+    """
+    quakes = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not _HINET_LINE_RE.match(line):
+            continue
+        parts = line.split()
+        if len(parts) < 10:
+            continue
+        date_str, time_str = parts[0], parts[1]
+        try:
+            ot_err, lat, yerr, lon, xerr, dep, derr, mag = (float(x) for x in parts[2:10])
+        except ValueError:
+            continue
+        try:
+            dt_jst = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M:%S.%f")
+            dt_jst = dt_jst.replace(tzinfo=timezone(timedelta(hours=9)))
+            time_iso = dt_jst.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            continue
+        quakes.append({
+            "time": time_iso, "lat": lat, "lon": lon, "mag": mag, "depth": dep,
+            "source": "hinet", "place": "", "max_int": "",
+        })
+    return quakes
+
+def fetch_quakes_hinet():
+    """
+    Hi-net自動処理震源リスト（前日・当日分、速報値）から、JMAの公開情報には
+    出てこない無感の微小地震を含む震源データを取得する。
+    HINET_USER/HINET_PASS 未設定時は完全に無効（[]を返すだけで他機能に影響なし）。
+    セッション切れ（ログイン画面に戻される）を検知した場合は1回だけ再ログインして
+    リトライする。
+    """
+    if not HINET_ENABLED:
+        return []
+    session = _get_hinet_session()
+    if session is None:
+        _hinet_status["last_error"] = "ログイン失敗"
+        return []
+    try:
+        resp = session.get(HINET_HYPOLIST_URL, headers=HINET_HEADERS, timeout=20)
+        resp.encoding = "euc-jp"
+        if "auth_login.png" in resp.text:
+            session = _get_hinet_session(force_relogin=True)
+            if session is None:
+                _hinet_status["last_error"] = "再ログイン失敗"
+                return []
+            resp = session.get(HINET_HYPOLIST_URL, headers=HINET_HEADERS, timeout=20)
+            resp.encoding = "euc-jp"
+        quakes = _parse_hinet_hypolist(resp.text)
+        _hinet_status["last_success"] = time.time()
+        _hinet_status["last_error"] = None
+        _hinet_status["last_count"] = len(quakes)
+        print(f"[Hi-net] {len(quakes)}件")
+        return quakes
+    except Exception as e:
+        print(f"[Hi-net] {e}")
+        _hinet_status["last_error"] = str(e)
+        return []
+
 def fetch_all_quakes():
     results = {}
     def _run(name, fn):
@@ -549,7 +674,8 @@ def fetch_all_quakes():
                [("p2p",     fetch_quakes_p2p),
                 ("p2p_jma", fetch_quakes_p2p_jma),
                 ("usgs",    fetch_quakes_usgs),
-                ("jma",     fetch_quakes_jma_bosai)]]
+                ("jma",     fetch_quakes_jma_bosai),
+                ("hinet",   fetch_quakes_hinet)]]
     for t in threads: t.start()
     # ★ Bug fix: p2p_jma は /jma のレート制限(10req/分)に対応するため
     # リクエスト間に約6.5秒のスリープを挟んでいる。Destination/ScaleAndDestination
@@ -561,17 +687,20 @@ def fetch_all_quakes():
     # ここのタイムアウトも240秒のままだと新しい上限まで到達する前に打ち切られて
     # 元の木阿弥になるため、余裕を持って600秒に延長する。
     for t in threads: t.join(timeout=600)
-    for name in ("p2p", "p2p_jma", "usgs", "jma"):
+    for name in ("p2p", "p2p_jma", "usgs", "jma", "hinet"):
         if name not in results:
             print(f"[fetch_all] {name} タイムアウトで未完了のためスキップ")
     all_q = (results.get("jma",[]) + results.get("p2p",[]) +
-             results.get("p2p_jma",[]) + results.get("usgs",[]))
+             results.get("p2p_jma",[]) + results.get("usgs",[]) +
+             results.get("hinet",[]))
     return _deduplicate(all_q)
 
 def _deduplicate(quakes, time_tol_min=5, dist_tol_deg=0.3):
-    # 優先度: jma_bosai > p2p > p2p_jma > usgs
+    # 優先度: jma_bosai > p2p > p2p_jma > hinet > usgs
     # p2p_jmaはJMAデータの再配信なのでjma_bosaiと重複しやすい -> 低優先度
-    prio = {"jma_bosai":0,"p2p":1,"p2p_jma":2,"usgs":3}
+    # hinetは速報値の自動処理震源（無感の微小地震を補う狙い）なので、
+    # 気象庁系データと重複する場合はそちらを優先する
+    prio = {"jma_bosai":0,"p2p":1,"p2p_jma":2,"hinet":3,"usgs":4}
     sorted_q = sorted(quakes, key=lambda q: prio.get(q["source"],9))
     kept = []
     for q in sorted_q:
@@ -4273,7 +4402,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震研究統合プラットフォーム v7.68</title>
+  <title>地震研究統合プラットフォーム v7.78</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
@@ -4318,7 +4447,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v7.68 / 研究用</div>
+      <div>v7.78 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -4549,6 +4678,20 @@ def gnss_status():
         "updating": updating,
         "error": error,
         "lookback_days": GNSS_LOOKBACK_DAYS,
+    }
+
+@app.route("/hinet/status")
+def hinet_status():
+    """Hi-net（NIED）微小地震データ取得の設定・稼働状況を返す（パスワード等は含めない）。"""
+    ts = _hinet_status["last_success"]
+    return {
+        "enabled": HINET_ENABLED,
+        "user_set": bool(HINET_USER),
+        "session_active": _hinet_session is not None,
+        "last_success": ts,
+        "last_success_str": (datetime.fromtimestamp(ts, JST).strftime("%Y-%m-%d %H:%M JST") if ts else None),
+        "last_error": _hinet_status["last_error"],
+        "last_count": _hinet_status["last_count"],
     }
 
 @app.route("/gnss/refresh_now", methods=["POST"])
