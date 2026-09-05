@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v7.781
+地震研究統合プラットフォーム v8.00
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -1598,6 +1598,7 @@ def render_quake_history(quakes, updated_str):
     felt_n = sum(1 for q in recent if q.get("max_int","").strip() not in ("","−","-"))
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -1639,6 +1640,14 @@ thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bo
 #lpReopen.show{{display:flex}}
 #lpReopen .arrow{{font-size:15px;line-height:1}}
 #lpReopen .vlabel{{writing-mode:vertical-rl;letter-spacing:1px;font-size:10px;font-weight:600}}
+
+@media (max-width:768px){{
+  #lp{{position:fixed;top:0;left:0;height:100%;width:86vw;max-width:340px;z-index:2000;
+      box-shadow:4px 0 24px rgba(0,0,0,.7)}}
+  #lp.closed{{margin-left:-86vw}}
+  #lhTop h2{{font-size:12.5px}}
+  thead th,.c1,.c2,.c3{{font-size:10.5px}}
+}}
 </style></head><body>
 <button id="lpReopen" onclick="toggleHistoryPanel()" title="地震一覧を開く">
   <span class="arrow">▶</span><span class="vlabel">地震一覧</span>
@@ -1675,6 +1684,10 @@ thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bo
   </div>
 </div>
 <script>
+if(window.innerWidth<=768){{
+  document.getElementById('lp').classList.add('closed');
+  document.getElementById('lpReopen').classList.add('show');
+}}
 var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true,zoomControl:false}});
 L.control.zoom({{position:'topright'}}).addTo(map);
 {DARK_TILE}
@@ -1792,17 +1805,23 @@ def render_etas(grid_scores, quakes, updated_str):
     recent_js = json.dumps(recent_markers)
     gs = GRID_SIZE
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
-#tb{{display:flex;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;padding:6px 10px;gap:8px;align-items:center}}
+#tb{{display:flex;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;padding:6px 10px;gap:8px;align-items:center;flex-wrap:wrap}}
 #tb span{{font-size:12px;color:#9ca3af}}
 .tog{{padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;border:none;border-radius:5px;background:#1f2937;color:#9ca3af}}
 .tog.on{{background:#2563eb;color:#fff}}
 #map{{flex:1}}
 #lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
     padding:11px 14px;border-radius:8px;border:1px solid #8800cc;font-size:12px;line-height:2;color:#f3f4f6}}
+
+@media (max-width:768px){{
+  #tb span:last-child{{margin-left:0;flex-basis:100%;order:5}}
+  #lg{{left:8px;bottom:8px;right:8px;font-size:11px;padding:9px 11px;line-height:1.7}}
+}}
 </style></head><body>
 <div id="tb">
   <span>表示レイヤー:</span>
@@ -1913,18 +1932,25 @@ def render_bvalue(bvalue_grid, quakes, updated_str):
     total_used = sum(v["n"] for v in bvalue_grid.values())
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
 #hdr{{padding:8px 14px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;
-       display:flex;align-items:center;gap:16px;font-size:12px;color:#9ca3af}}
+       display:flex;align-items:center;gap:16px;font-size:12px;color:#9ca3af;flex-wrap:wrap}}
 #hdr b{{color:#f3f4f6;font-size:13px}}
 .stat{{background:#1f2937;padding:4px 10px;border-radius:5px;font-size:11px;color:#d1d5db}}
 .stat span{{color:#60a5fa;font-weight:700}}
 #map{{flex:1}}
 #lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
     padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:2;color:#f3f4f6}}
+
+@media (max-width:768px){{
+  #hdr{{gap:8px;padding:6px 10px}}
+  #hdr>div[style*="margin-left:auto"]{{flex-basis:100%;order:5;margin-left:0!important}}
+  #lg{{left:8px;bottom:8px;right:8px;font-size:11px;padding:9px 11px;line-height:1.7}}
+}}
 </style></head><body>
 <div id="hdr">
   <b>b値マップ (Gutenberg-Richter則)</b>
@@ -2227,6 +2253,7 @@ def render_tec(updated_str):
         cells_js = json.dumps(cells, ensure_ascii=False)
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -2238,6 +2265,15 @@ body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-s
 #map{{flex:1;min-width:0}}
 #left{{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:20px;overflow-y:auto}}
 #right{{width:280px;flex-shrink:0;background:#111827;border-left:2px solid #1f2937;padding:16px;overflow-y:auto}}
+
+@media (max-width:768px){{
+  #hdr{{padding:10px 14px}}
+  #hdr p{{font-size:10px}}
+  #body{{flex-direction:column;overflow-y:auto}}
+  #map{{flex:none;height:42vh;min-height:220px}}
+  #right{{width:100%;border-left:none;border-top:2px solid #1f2937}}
+  #left{{padding:14px}}
+}}
 .card{{background:#1f2937;border:1px solid #374151;border-radius:10px;padding:16px;margin-bottom:12px;width:100%;max-width:700px}}
 .card h3{{font-size:13px;font-weight:700;color:#60a5fa;margin-bottom:8px}}
 .card p{{font-size:12px;color:#9ca3af;line-height:1.7}}
@@ -2576,17 +2612,26 @@ def render_gnss(updated_str):
         '環境変数 GSI_SFTP_USER / GSI_SFTP_PASS を設定すると実データ表示に切り替わります。</p>')
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-serif;overflow:hidden}}
-#hdr{{padding:10px 16px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;display:flex;align-items:center;gap:12px}}
+#hdr{{padding:10px 16px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;display:flex;align-items:center;gap:12px;flex-wrap:wrap}}
 #hdr h2{{font-size:14px;font-weight:700}}
 #hdr p{{font-size:11px;color:#6b7280}}
 .hbadge{{padding:3px 10px;border-radius:5px;font-size:11px;font-weight:700}}
 #content{{flex:1;display:flex;overflow:hidden}}
 #map{{flex:1}}
 #panel{{width:270px;flex-shrink:0;background:#111827;border-left:2px solid #1f2937;overflow-y:auto;padding:14px}}
+
+@media (max-width:768px){{
+  #hdr{{padding:8px 12px}}
+  #content{{flex-direction:column;overflow-y:auto}}
+  #map{{flex:none;height:42vh;min-height:220px}}
+  #panel{{width:100%;border-left:none;border-top:2px solid #1f2937}}
+  #station-list{{max-height:160px}}
+}}
 .sec{{margin-bottom:14px}}
 .sec h3{{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid #1f2937;padding-bottom:4px}}
 .sec p{{font-size:11px;color:#9ca3af;line-height:1.7}}
@@ -2811,18 +2856,25 @@ def render_pressure(updated_str):
 
     markers_js = json.dumps(markers)
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
 #hdr{{padding:8px 16px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;
-       display:flex;align-items:center;gap:14px;font-size:12px;color:#9ca3af}}
+       display:flex;align-items:center;gap:14px;font-size:12px;color:#9ca3af;flex-wrap:wrap}}
 #hdr b{{color:#f3f4f6;font-size:14px}}
 .stat{{background:#1f2937;padding:4px 10px;border-radius:5px;font-size:11px;color:#d1d5db}}
 .stat span{{color:#60a5fa;font-weight:700}}
 #map{{flex:1}}
 #lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
     padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:2;color:#f3f4f6}}
+
+@media (max-width:768px){{
+  #hdr{{gap:8px;padding:6px 10px}}
+  #hdr>div[style*="margin-left:auto"]{{flex-basis:100%;order:5;margin-left:0!important}}
+  #lg{{left:8px;bottom:8px;right:8px;font-size:11px;padding:9px 11px;line-height:1.7}}
+}}
 </style></head><body>
 <div id="hdr">
   <b>海面平均気圧マップ</b>
@@ -2957,6 +3009,7 @@ def active_faults_geojson():
 
 def render_faultmap(updated_str):
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -2972,6 +3025,13 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
     padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.9;color:#f3f4f6;max-width:260px}}
 #loadState{{position:absolute;top:14px;right:56px;z-index:1000;background:rgba(17,24,39,.92);
     padding:6px 12px;border-radius:6px;font-size:11px;color:#9ca3af}}
+
+@media (max-width:768px){{
+  #hdr{{gap:6px;padding:6px 10px}}
+  #hdr>div[style*="margin-left:auto"]{{flex-basis:100%;order:5;margin-left:0!important}}
+  #lg{{left:8px;bottom:8px;max-width:none;right:8px;font-size:10.5px;padding:9px 11px}}
+  #loadState{{right:8px;top:8px}}
+}}
 </style></head><body>
 <div id="hdr">
   <b>活断層・プレート境界マップ</b>
@@ -3647,6 +3707,7 @@ def render_riskmap(risk_cells, updated_str):
     w = RISK_DEFAULT_WEIGHTS
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -3723,6 +3784,14 @@ table.rank-table td{{padding:4px;color:#e5e7eb;border-top:1px solid #1f2937;whit
 #dPrevDay{{font-size:11.5px;margin-top:2px}}
 #dTrendState{{font-size:10px;color:#6b7280;margin-bottom:4px}}
 canvas.dChart{{display:block;width:100%}}
+
+@media (max-width:768px){{
+  #panel{{position:fixed;top:0;left:0;height:100%;width:86vw;max-width:340px;z-index:2000;
+      box-shadow:4px 0 24px rgba(0,0,0,.7)}}
+  #panel.closed{{margin-left:-86vw}}
+  #detailBox{{width:82vw;max-width:290px;right:8px;top:8px}}
+  #hdr{{font-size:10px;padding:5px 10px}}
+}}
 </style></head><body>
 <button id="panelReopen" onclick="togglePanel()" title="設定・一覧を開く">
   <span class="arrow">▶</span><span class="vlabel">設定・一覧</span>
@@ -3840,6 +3909,10 @@ var PRESETS = {{
 }};
 var selected = Object.assign({{}}, PRESETS.standard);
 
+if(window.innerWidth<=768){{
+  document.getElementById('panel').classList.add('closed');
+  document.getElementById('panelReopen').classList.add('show');
+}}
 var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
 {DARK_TILE}
 {GEOJSON_JS}
@@ -4106,6 +4179,7 @@ redraw();
 # バックエンド側の保存処理は維持している。
 def render_snapshots(updated_str):
     html = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 __LEAFLET_CDN__
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -4156,6 +4230,13 @@ body{display:flex;height:100vh;background:#0f172a;overflow:hidden;font-family:"H
 .brk-row{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;color:#d1d5db}
 .brk-val{font-weight:700;color:#f3f4f6}
 canvas.dChart{display:block;width:100%;margin-top:6px}
+
+@media (max-width:768px){
+  body{flex-direction:column;overflow-y:auto}
+  #panel{width:100%;border-right:none;border-bottom:2px solid #1f2937;max-height:46vh}
+  #mp{flex:none;height:46vh;min-height:220px}
+  #detailBox{width:82vw;max-width:270px;right:8px;top:8px}
+}
 </style></head><body>
 <div id="panel">
   <h2>過去時点マップ検索</h2>
@@ -4402,7 +4483,8 @@ SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>地震研究統合プラットフォーム v7.781</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <title>地震研究統合プラットフォーム v8.00</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
@@ -4410,7 +4492,10 @@ SHELL_HTML = """<!DOCTYPE html>
       position:fixed;top:0;left:0;width:188px;height:100%;
       background:#0d1117;border-right:2px solid #1f2937;
       display:flex;flex-direction:column;padding-top:0;z-index:100;
+      transition:transform 0.25s ease;
     }
+    #menuBtn{display:none}
+    #sbOverlay{display:none}
     .app-title{
       padding:14px 14px 12px;
       background:linear-gradient(135deg,#1e3a5f,#1a1a2e);
@@ -4441,13 +4526,38 @@ SHELL_HTML = """<!DOCTYPE html>
     #main{margin-left:188px;height:100vh;overflow:hidden}
     iframe{width:100%;height:100%;border:none;display:none}
     iframe.active{display:block}
+
+    @media (max-width:768px){
+      #menuBtn{
+        display:flex;align-items:center;justify-content:center;
+        position:fixed;top:10px;left:10px;z-index:300;
+        width:38px;height:38px;border-radius:8px;border:none;
+        background:#111827;color:#f3f4f6;font-size:18px;
+        box-shadow:0 2px 8px rgba(0,0,0,.5);
+      }
+      #sidebar{
+        width:78vw;max-width:280px;
+        transform:translateX(-100%);
+        box-shadow:2px 0 16px rgba(0,0,0,.6);
+      }
+      #sidebar.open{transform:translateX(0)}
+      #sbOverlay{
+        display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:99;
+      }
+      #sbOverlay.show{display:block}
+      #main{margin-left:0}
+      .tab-btn{padding:12px 14px 12px 16px;font-size:14px}
+      .tab-btn.active{padding-left:13px}
+    }
   </style>
 </head>
 <body>
+  <button id="menuBtn" onclick="toggleSb()">&#9776;</button>
+  <div id="sbOverlay" onclick="toggleSb()"></div>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v7.781 / 研究用</div>
+      <div>v8.00 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -4520,12 +4630,22 @@ SHELL_HTML = """<!DOCTYPE html>
         document.getElementById('f'+idx).src='/tab/'+URLS[idx];
         loaded[idx]=true;
       }
+      if(window.innerWidth<=768){closeSb()}
+    }
+    function toggleSb(){
+      document.getElementById('sidebar').classList.toggle('open');
+      document.getElementById('sbOverlay').classList.toggle('show');
+    }
+    function closeSb(){
+      document.getElementById('sidebar').classList.remove('open');
+      document.getElementById('sbOverlay').classList.remove('show');
     }
   </script>
 </body>
 </html>"""
 
 LOADING_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="5">
 <style>body{background:#0d1117;color:white;display:flex;align-items:center;justify-content:center;
 height:100vh;font-family:sans-serif;flex-direction:column;gap:16px}
