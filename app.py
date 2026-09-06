@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v8.00
+地震研究統合プラットフォーム v8.10
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -1587,9 +1587,9 @@ def render_quake_history(quakes, updated_str):
             f'<td class="c1">{place}</td>'
             f'<td class="c2">{t_str}</td>'
             f'<td class="c3" style="color:{mc}">M{mag:.1f}</td>'
-            f'<td class="c4"><span style="background:{ic};color:#000;padding:1px 5px;border-radius:3px;font-size:11px;font-weight:700">{il}</span></td>'
+            f'<td class="c4"><span style="background:{ic};color:#000;padding:1px 5px;border-radius:7px;font-size:11px;font-weight:700">{il}</span></td>'
             f'<td class="c2">{depth:.0f}km</td>'
-            f'<td class="c2"><span style="background:#1e3a5f;padding:1px 5px;border-radius:3px;font-size:10px">{src_badge}</span></td>'
+            f'<td class="c2"><span style="background:rgba(56,132,255,.25);padding:1px 5px;border-radius:7px;font-size:10px">{src_badge}</span></td>'
             f'</tr>'
         )
 
@@ -1602,41 +1602,41 @@ def render_quake_history(quakes, updated_str):
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{display:flex;height:100vh;background:#0f172a;color:#fff;font-family:"Helvetica Neue",Arial,sans-serif;overflow:hidden}}
-#lp{{width:380px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;display:flex;flex-direction:column;overflow:hidden}}
-#lh{{padding:12px 14px 8px;background:#1f2937;border-bottom:1px solid #374151;flex-shrink:0}}
+body{{display:flex;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif;overflow:hidden}}
+#lp{{width:380px;flex-shrink:0;background:rgba(255,255,255,.055);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);border-right:1px solid rgba(255,255,255,.14);display:flex;flex-direction:column;overflow:hidden}}
+#lh{{padding:12px 14px 8px;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);border-bottom:1px solid rgba(255,255,255,.18);flex-shrink:0}}
 #lh h2{{font-size:14px;color:#f3f4f6;margin-bottom:4px}}
-#lh p{{font-size:11px;color:#6b7280}}
-#fbar{{display:flex;gap:6px;padding:8px 10px;border-bottom:1px solid #1f2937;flex-shrink:0}}
+#lh p{{font-size:11px;color:rgba(235,238,245,.46)}}
+#fbar{{display:flex;gap:6px;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.14);flex-shrink:0}}
 .fb{{flex:1;padding:5px 2px;text-align:center;cursor:pointer;font-size:11px;font-weight:600;
-     color:#9ca3af;border:none;background:#1f2937;border-radius:5px}}
-.fb:hover{{color:#f3f4f6;background:#374151}}
-.fb.on{{color:#fff;background:linear-gradient(135deg,#2563eb,#7c3aed)}}
+     color:rgba(235,238,245,.62);border:none;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);border-radius:12px}}
+.fb:hover{{color:#f3f4f6;background:rgba(255,255,255,.18);backdrop-filter:blur(10px) saturate(160%);-webkit-backdrop-filter:blur(10px) saturate(160%)}}
+.fb.on{{color:#fff;background:linear-gradient(135deg,#0a84ff,#7c5cff)}}
 #ls{{flex:1;overflow-y:auto}}
 table{{width:100%;border-collapse:collapse}}
-thead tr{{background:#1f2937;position:sticky;top:0;z-index:10}}
-thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bottom:1px solid #374151;white-space:nowrap}}
-.qrow:hover{{background:#1e2d40}}
+thead tr{{background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);position:sticky;top:0;z-index:10}}
+thead th{{padding:6px 5px;font-size:10px;color:rgba(235,238,245,.62);text-align:left;border-bottom:1px solid rgba(255,255,255,.18);white-space:nowrap}}
+.qrow:hover{{background:rgba(255,255,255,.12)}}
 .c1{{padding:5px 7px;font-weight:600;color:#f3f4f6;font-size:12px}}
-.c2{{padding:5px 4px;color:#9ca3af;font-size:11px;white-space:nowrap}}
+.c2{{padding:5px 4px;color:rgba(235,238,245,.62);font-size:11px;white-space:nowrap}}
 .c3{{padding:5px 4px;text-align:center;font-weight:700;font-size:12px;white-space:nowrap}}
 .c4{{padding:5px 4px;text-align:center;white-space:nowrap}}
 .c4 span{{white-space:nowrap}}
 #mp{{flex:1;overflow:hidden;position:relative}}#map{{width:100%;height:100%}}
-#mglg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:10px 13px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.8;color:#f3f4f6}}
+#mglg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+    padding:10px 13px;border-radius:18px;border:1px solid rgba(255,255,255,.18);font-size:11px;line-height:1.8;color:#f3f4f6}}
 #mglg b{{font-size:12px}}
 #lp{{position:relative;transition:margin-left 0.2s}}
 #lp.closed{{margin-left:-380px}}
 #lhTop{{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}}
-#lpClose{{flex-shrink:0;width:22px;height:22px;border:none;border-radius:5px;background:#374151;color:#d1d5db;
+#lpClose{{flex-shrink:0;width:22px;height:22px;border:none;border-radius:12px;background:rgba(255,255,255,.18);backdrop-filter:blur(10px) saturate(160%);-webkit-backdrop-filter:blur(10px) saturate(160%);color:rgba(235,238,245,.72);
     cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center}}
-#lpClose:hover{{background:#4b5563;color:#fff}}
+#lpClose:hover{{background:rgba(255,255,255,.3);color:#fff}}
 #lpReopen{{position:absolute;top:70px;left:0;z-index:5000;width:34px;height:78px;border:none;
-    border-radius:0 8px 8px 0;background:#1f2937;color:#9ca3af;cursor:pointer;font-size:12px;
+    border-radius:0 18px 18px 0;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);color:rgba(235,238,245,.62);cursor:pointer;font-size:12px;
     display:none;flex-direction:column;align-items:center;justify-content:center;gap:6px;
     box-shadow:2px 0 8px rgba(0,0,0,.4)}}
-#lpReopen:hover{{background:#2563eb;color:#fff}}
+#lpReopen:hover{{background:rgba(10,132,255,.55);color:#fff}}
 #lpReopen.show{{display:flex}}
 #lpReopen .arrow{{font-size:15px;line-height:1}}
 #lpReopen .vlabel{{writing-mode:vertical-rl;letter-spacing:1px;font-size:10px;font-weight:600}}
@@ -1676,9 +1676,9 @@ thead th{{padding:6px 5px;font-size:10px;color:#9ca3af;text-align:left;border-bo
 <div id="mp"><div id="map"></div>
   <div id="mglg">
     <b>マップの円色（マグニチュード）</b><br>
-    <div style="width:160px;height:10px;border-radius:3px;margin:5px 0 2px;
+    <div style="width:160px;height:10px;border-radius:7px;margin:5px 0 2px;
       background:linear-gradient(to right,#94a3b8,#4ade80,#facc15,#fb923c,#ef4444,#dc2626,#ff00ff)"></div>
-    <div style="display:flex;justify-content:space-between;width:160px;font-size:10px;color:#9ca3af">
+    <div style="display:flex;justify-content:space-between;width:160px;font-size:10px;color:rgba(235,238,245,.62)">
       <span>M2以下</span><span>M8以上</span>
     </div>
   </div>
@@ -1701,7 +1701,7 @@ var lg=L.layerGroup(layers).addTo(map);
 
 function focusQ(idx,lat,lon){{
   document.querySelectorAll('.qrow').forEach(function(r){{r.style.background=''}});
-  var row=document.getElementById('qrow_'+idx); if(row)row.style.background='#1e3a5f';
+  var row=document.getElementById('qrow_'+idx); if(row)row.style.background='rgba(10,132,255,.3)';
   map.flyTo([lat,lon],8,{{duration:0.7}});
   if(layers[idx])setTimeout(function(){{layers[idx].openPopup()}},800);
 }}
@@ -1809,14 +1809,14 @@ def render_etas(grid_scores, quakes, updated_str):
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
-#tb{{display:flex;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;padding:6px 10px;gap:8px;align-items:center;flex-wrap:wrap}}
-#tb span{{font-size:12px;color:#9ca3af}}
-.tog{{padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;border:none;border-radius:5px;background:#1f2937;color:#9ca3af}}
-.tog.on{{background:#2563eb;color:#fff}}
+body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}}
+#tb{{display:flex;background:rgba(255,255,255,.06);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);border-bottom:1px solid rgba(255,255,255,.14);flex-shrink:0;padding:6px 10px;gap:8px;align-items:center;flex-wrap:wrap}}
+#tb span{{font-size:12px;color:rgba(235,238,245,.62)}}
+.tog{{padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;border:none;border-radius:12px;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);color:rgba(235,238,245,.62)}}
+.tog.on{{background:rgba(10,132,255,.55);color:#fff}}
 #map{{flex:1}}
-#lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:11px 14px;border-radius:8px;border:1px solid #8800cc;font-size:12px;line-height:2;color:#f3f4f6}}
+#lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+    padding:11px 14px;border-radius:18px;border:1px solid #8800cc;font-size:12px;line-height:2;color:#f3f4f6}}
 
 @media (max-width:768px){{
   #tb span:last-child{{margin-left:0;flex-basis:100%;order:5}}
@@ -1827,7 +1827,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
   <span>表示レイヤー:</span>
   <button class="tog on" id="togEtas" onclick="toggleLayer('etas',this)">ETASグリッド</button>
   <button class="tog" id="togRecent" onclick="toggleLayer('recent',this)">直近72h地震</button>
-  <span style="margin-left:auto;color:#6b7280;font-size:11px">更新: {updated_str}</span>
+  <span style="margin-left:auto;color:rgba(235,238,245,.46);font-size:11px">更新: {updated_str}</span>
 </div>
 <div id="map"></div>
 <div id="lg">
@@ -1837,8 +1837,8 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
   <span style="color:{LEVEL_COLOR[3]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv3（注意）<br>
   <span style="color:{LEVEL_COLOR[2]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv2（やや注意）<br>
   <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（平常）<br>
-  <small style="color:#6b7280">Lv4・5は過去65日間の実績と比べても稀な場合のみ表示されます</small>
-  <hr style="border-color:#374151;margin:5px 0">
+  <small style="color:rgba(235,238,245,.46)">Lv4・5は過去65日間の実績と比べても稀な場合のみ表示されます</small>
+  <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
   <small>JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)+src_count.get('p2p_jma',0)} USGS:{src_count.get('usgs',0)}<br>計{len(quakes)}件</small>
 </div>
 <script>
@@ -1936,15 +1936,15 @@ def render_bvalue(bvalue_grid, quakes, updated_str):
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
-#hdr{{padding:8px 14px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;
-       display:flex;align-items:center;gap:16px;font-size:12px;color:#9ca3af;flex-wrap:wrap}}
+body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}}
+#hdr{{padding:8px 14px;background:rgba(255,255,255,.06);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);border-bottom:1px solid rgba(255,255,255,.14);flex-shrink:0;
+       display:flex;align-items:center;gap:16px;font-size:12px;color:rgba(235,238,245,.62);flex-wrap:wrap}}
 #hdr b{{color:#f3f4f6;font-size:13px}}
-.stat{{background:#1f2937;padding:4px 10px;border-radius:5px;font-size:11px;color:#d1d5db}}
+.stat{{background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);padding:4px 10px;border-radius:12px;font-size:11px;color:rgba(235,238,245,.72)}}
 .stat span{{color:#60a5fa;font-weight:700}}
 #map{{flex:1}}
-#lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:2;color:#f3f4f6}}
+#lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+    padding:11px 14px;border-radius:18px;border:1px solid rgba(255,255,255,.18);font-size:12px;line-height:2;color:#f3f4f6}}
 
 @media (max-width:768px){{
   #hdr{{gap:8px;padding:6px 10px}}
@@ -1959,17 +1959,17 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
   <div class="stat">b平均: <span>{b_mean}</span></div>
   <div class="stat">b最小: <span style="color:#ef4444">{b_min}</span></div>
   <div class="stat">b最大: <span style="color:#60a5fa">{b_max}</span></div>
-  <div style="margin-left:auto;color:#6b7280">更新: {updated_str}</div>
+  <div style="margin-left:auto;color:rgba(235,238,245,.46)">更新: {updated_str}</div>
 </div>
 <div id="map"></div>
 <div id="lg">
   <b>b値カラースケール</b><br>
-  <div style="width:130px;height:10px;border-radius:3px;
+  <div style="width:130px;height:10px;border-radius:7px;
     background:linear-gradient(to right,#dc3c3c,#60a0dc);margin:5px 0 2px"></div>
-  <div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af">
+  <div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:rgba(235,238,245,.62)">
     <span>低 ({b_min})</span><span>高 ({b_max})</span>
   </div>
-  <hr style="border-color:#374151;margin:5px 0">
+  <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
   <small>低b値地域(赤) = 大地震の可能性<br>色は数値の相対順位（中央値で赤/青が半々）で決定<br>
   Mc = 1.0 / 最小5件/グリッド<br>グリッドサイズ: {BVALUE_GRID_SIZE}°</small>
 </div>
@@ -2257,35 +2257,35 @@ def render_tec(updated_str):
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}}
-#hdr{{padding:12px 20px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0}}
+body{{background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;color:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}}
+#hdr{{padding:12px 20px;background:rgba(255,255,255,.06);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);border-bottom:1px solid rgba(255,255,255,.14);flex-shrink:0}}
 #hdr h2{{font-size:15px;font-weight:700;color:#f3f4f6;margin-bottom:4px}}
-#hdr p{{font-size:11px;color:#6b7280}}
+#hdr p{{font-size:11px;color:rgba(235,238,245,.46)}}
 #body{{flex:1;display:flex;gap:0;overflow:hidden}}
 #map{{flex:1;min-width:0}}
 #left{{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:20px;overflow-y:auto}}
-#right{{width:280px;flex-shrink:0;background:#111827;border-left:2px solid #1f2937;padding:16px;overflow-y:auto}}
+#right{{width:280px;flex-shrink:0;background:rgba(255,255,255,.055);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);border-left:1px solid rgba(255,255,255,.14);padding:16px;overflow-y:auto}}
 
 @media (max-width:768px){{
   #hdr{{padding:10px 14px}}
   #hdr p{{font-size:10px}}
   #body{{flex-direction:column;overflow-y:auto}}
   #map{{flex:none;height:42vh;min-height:220px}}
-  #right{{width:100%;border-left:none;border-top:2px solid #1f2937}}
+  #right{{width:100%;border-left:none;border-top:1px solid rgba(255,255,255,.14)}}
   #left{{padding:14px}}
 }}
-.card{{background:#1f2937;border:1px solid #374151;border-radius:10px;padding:16px;margin-bottom:12px;width:100%;max-width:700px}}
+.card{{background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);border:1px solid rgba(255,255,255,.18);border-radius:20px;padding:16px;margin-bottom:12px;width:100%;max-width:700px}}
 .card h3{{font-size:13px;font-weight:700;color:#60a5fa;margin-bottom:8px}}
-.card p{{font-size:12px;color:#9ca3af;line-height:1.7}}
+.card p{{font-size:12px;color:rgba(235,238,245,.62);line-height:1.7}}
 .link-btn{{display:block;padding:10px 16px;background:linear-gradient(135deg,#1d4ed8,#7c3aed);
-           color:#fff;font-weight:700;font-size:13px;text-decoration:none;border-radius:8px;
+           color:#fff;font-weight:700;font-size:13px;text-decoration:none;border-radius:18px;
            text-align:center;margin-top:8px;transition:opacity 0.2s}}
 .link-btn:hover{{opacity:0.85}}
-.tec-img{{width:100%;border-radius:6px;border:1px solid #374151;margin-top:8px}}
+.tec-img{{width:100%;border-radius:14px;border:1px solid rgba(255,255,255,.18);margin-top:8px}}
 .badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;
-        background:#1e3a5f;color:#93c5fd;margin-right:4px;margin-bottom:4px}}
-#right h3{{font-size:13px;font-weight:700;color:#f3f4f6;margin-bottom:10px;border-bottom:1px solid #374151;padding-bottom:6px}}
-.note{{font-size:12px;color:#9ca3af;line-height:1.8;margin-bottom:12px}}
+        background:rgba(56,132,255,.25);color:#93c5fd;margin-right:4px;margin-bottom:4px}}
+#right h3{{font-size:13px;font-weight:700;color:#f3f4f6;margin-bottom:10px;border-bottom:1px solid rgba(255,255,255,.18);padding-bottom:6px}}
+.note{{font-size:12px;color:rgba(235,238,245,.62);line-height:1.8;margin-bottom:12px}}
 </style></head><body>
 <div id="hdr">
   <h2>TEC（電離圏全電子数）モニタリング</h2>
@@ -2299,7 +2299,7 @@ body{{background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-s
       <p>実データ（色逆変換）が未取得のため、参考として画像を埋め込んでいます。</p>
       <img src="{nict_url}" class="tec-img" alt="NICT TEC Map"
            onerror="this.style.display='none';document.getElementById('img-err').style.display='block'">
-      <div id="img-err" style="display:none;padding:12px;background:#1f2937;border-radius:6px;margin-top:8px;font-size:12px;color:#9ca3af">
+      <div id="img-err" style="display:none;padding:12px;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);border-radius:14px;margin-top:8px;font-size:12px;color:rgba(235,238,245,.62)">
         画像の直接読み込みができません（CORSポリシー）。下のリンクから直接確認してください。
       </div>
       <a href="https://aer-nc-web.nict.go.jp/iono/GEONET/" target="_blank" class="link-btn">
@@ -2348,7 +2348,7 @@ if (cells.length > 0) {{
   var legend = L.control({{position:'bottomleft'}});
   legend.onAdd = function() {{
     var d = L.DomUtil.create('div');
-    d.style.cssText = 'background:rgba(17,24,39,.92);padding:10px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;color:#f3f4f6;line-height:1.8';
+    d.style.cssText = 'background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);padding:10px 14px;border-radius:18px;border:1px solid rgba(255,255,255,.18);font-size:12px;color:#f3f4f6;line-height:1.8';
     d.innerHTML = '<b>TEC（色逆変換・近似値）</b><br>低 <span style="color:#6699ff">■</span> 〜 高 <span style="color:#ff6666">■</span><br><small>範囲: ' + vmin.toFixed(1) + ' 〜 ' + vmax.toFixed(1) + ' TECU相当</small>';
     return d;
   }};
@@ -2599,10 +2599,10 @@ def render_gnss(updated_str):
         badge_bg, badge_fg, badge_txt = "#064e3b", "#6ee7b7", "実データ (GEONET SFTP)"
     elif GSI_GNSS_ENABLED:
         gnss_updated_str = "取得中…"
-        badge_bg, badge_fg, badge_txt = "#1e3a5f", "#93c5fd", "実データ取得中…"
+        badge_bg, badge_fg, badge_txt = "rgba(56,132,255,.25)", "#93c5fd", "実データ取得中…"
     else:
         gnss_updated_str = "―"
-        badge_bg, badge_fg, badge_txt = "#1e3a5f", "#93c5fd", "プレースホルダー表示"
+        badge_bg, badge_fg, badge_txt = "rgba(56,132,255,.25)", "#93c5fd", "プレースホルダー表示"
 
     vectors_json = json.dumps(vectors or [], ensure_ascii=False)
     lookback_note = f"直近 {GNSS_LOOKBACK_DAYS} 日間の座標差分（短期変位ベクトル・mm単位）"
@@ -2616,33 +2616,33 @@ def render_gnss(updated_str):
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;color:#f3f4f6;font-family:"Helvetica Neue",Arial,sans-serif;overflow:hidden}}
-#hdr{{padding:10px 16px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;display:flex;align-items:center;gap:12px;flex-wrap:wrap}}
+body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;color:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif;overflow:hidden}}
+#hdr{{padding:10px 16px;background:rgba(255,255,255,.06);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);border-bottom:1px solid rgba(255,255,255,.14);flex-shrink:0;display:flex;align-items:center;gap:12px;flex-wrap:wrap}}
 #hdr h2{{font-size:14px;font-weight:700}}
-#hdr p{{font-size:11px;color:#6b7280}}
-.hbadge{{padding:3px 10px;border-radius:5px;font-size:11px;font-weight:700}}
+#hdr p{{font-size:11px;color:rgba(235,238,245,.46)}}
+.hbadge{{padding:3px 10px;border-radius:12px;font-size:11px;font-weight:700}}
 #content{{flex:1;display:flex;overflow:hidden}}
 #map{{flex:1}}
-#panel{{width:270px;flex-shrink:0;background:#111827;border-left:2px solid #1f2937;overflow-y:auto;padding:14px}}
+#panel{{width:270px;flex-shrink:0;background:rgba(255,255,255,.055);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);border-left:1px solid rgba(255,255,255,.14);overflow-y:auto;padding:14px}}
 
 @media (max-width:768px){{
   #hdr{{padding:8px 12px}}
   #content{{flex-direction:column;overflow-y:auto}}
   #map{{flex:none;height:42vh;min-height:220px}}
-  #panel{{width:100%;border-left:none;border-top:2px solid #1f2937}}
+  #panel{{width:100%;border-left:none;border-top:1px solid rgba(255,255,255,.14)}}
   #station-list{{max-height:160px}}
 }}
 .sec{{margin-bottom:14px}}
-.sec h3{{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid #1f2937;padding-bottom:4px}}
-.sec p{{font-size:11px;color:#9ca3af;line-height:1.7}}
+.sec h3{{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid rgba(255,255,255,.14);padding-bottom:4px}}
+.sec p{{font-size:11px;color:rgba(235,238,245,.62);line-height:1.7}}
 .link-btn{{display:block;padding:8px 12px;background:linear-gradient(135deg,#1d4ed8,#7c3aed);
-           color:#fff;font-weight:700;font-size:12px;text-decoration:none;border-radius:6px;
+           color:#fff;font-weight:700;font-size:12px;text-decoration:none;border-radius:14px;
            text-align:center;margin-bottom:6px;transition:opacity 0.2s}}
 .link-btn:hover{{opacity:0.85}}
-.phase{{background:#1f2937;border-left:3px solid #7c3aed;padding:6px 8px;border-radius:0 5px 5px 0;
-        margin-bottom:6px;font-size:11px;color:#d1d5db}}
-#station-list{{max-height:220px;overflow-y:auto;font-size:10px;color:#9ca3af;line-height:1.6}}
-#station-list div{{padding:2px 0;border-bottom:1px solid #1f2937}}
+.phase{{background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);border-left:3px solid #7c3aed;padding:6px 8px;border-radius:0 12px 12px 0;
+        margin-bottom:6px;font-size:11px;color:rgba(235,238,245,.72)}}
+#station-list{{max-height:220px;overflow-y:auto;font-size:10px;color:rgba(235,238,245,.62);line-height:1.6}}
+#station-list div{{padding:2px 0;border-bottom:1px solid rgba(255,255,255,.14)}}
 </style></head><body>
 <div id="hdr">
   <div>
@@ -2707,7 +2707,7 @@ if (!LIVE) {{
     L.circleMarker(p,{{radius:4,color:'#34d399',fillColor:'#34d399',fillOpacity:0.7,weight:1}})
      .bindTooltip('GEONET電子基準点（プレースホルダー）').addTo(map);
   }});
-  listEl.innerHTML = '<div style="color:#6b7280">実データ未取得のため一覧なし</div>';
+  listEl.innerHTML = '<div style="color:rgba(235,238,245,.46)">実データ未取得のため一覧なし</div>';
 }} else {{
   // 変位量(mm)を地図上で見やすくするための誇張スケール（メートル/mm）
   var SCALE_M_PER_MM = 400;
@@ -2737,28 +2737,28 @@ if (!LIVE) {{
     var wing2 = [dest[0] - ah*Math.sin(ang) - aw*ah*Math.cos(ang), dest[1] - ah*Math.cos(ang) + aw*ah*Math.sin(ang)];
     L.polygon([dest, wing1, wing2], {{color:color, fillColor:color, fillOpacity:0.9, weight:0}}).addTo(map);
 
-    listHtml += '<div><b style="color:#e5e7eb">' + v.name + '</b>（' + v.code + '）<br>'
+    listHtml += '<div><b style="color:rgba(240,242,247,.85)">' + v.name + '</b>（' + v.code + '）<br>'
       + '東西: ' + v.dE_mm.toFixed(1) + 'mm　南北: ' + v.dN_mm.toFixed(1) + 'mm　上下: ' + v.dU_mm.toFixed(1) + 'mm'
-      + '　<span style="color:#6b7280">(' + v.n_points + '点/' + v.span_days + '日)</span></div>';
+      + '　<span style="color:rgba(235,238,245,.46)">(' + v.n_points + '点/' + v.span_days + '日)</span></div>';
   }});
-  listEl.innerHTML = listHtml || '<div style="color:#6b7280">データなし</div>';
+  listEl.innerHTML = listHtml || '<div style="color:rgba(235,238,245,.46)">データなし</div>';
 }}
 
 // 凡例
 var legend=L.control({{position:'bottomleft'}});
 legend.onAdd=function(){{
   var d=L.DomUtil.create('div');
-  d.style.cssText='background:rgba(17,24,39,.92);padding:10px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;color:#f3f4f6;line-height:2';
+  d.style.cssText='background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);padding:10px 14px;border-radius:18px;border:1px solid rgba(255,255,255,.18);font-size:12px;color:#f3f4f6;line-height:2';
   if (LIVE) {{
     d.innerHTML='<b>GNSS変位ベクトル</b><br>'
       + '<span style="color:#34d399">━</span> 小（≤7mm）　'
       + '<span style="color:#fbbf24">━</span> 中（〜15mm）　'
       + '<span style="color:#f87171">━</span> 大（15mm〜）<br>'
-      + '<hr style="border-color:#374151;margin:4px 0">'
+      + '<hr style="border-color:rgba(255,255,255,.18);margin:4px 0">'
       + '<small>矢印の向き＝変位方向、長さは誇張表示</small>';
   }} else {{
     d.innerHTML='<b>GNSS 電子基準点</b><br><span style="color:#34d399">●</span> GEONET基準点（仮）<br>'
-      + '<hr style="border-color:#374151;margin:4px 0"><small>実データはSFTP設定後に表示されます</small>';
+      + '<hr style="border-color:rgba(255,255,255,.18);margin:4px 0"><small>実データはSFTP設定後に表示されます</small>';
   }}
   return d;
 }};
@@ -2860,15 +2860,15 @@ def render_pressure(updated_str):
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
-#hdr{{padding:8px 16px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;
-       display:flex;align-items:center;gap:14px;font-size:12px;color:#9ca3af;flex-wrap:wrap}}
+body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}}
+#hdr{{padding:8px 16px;background:rgba(255,255,255,.06);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);border-bottom:1px solid rgba(255,255,255,.14);flex-shrink:0;
+       display:flex;align-items:center;gap:14px;font-size:12px;color:rgba(235,238,245,.62);flex-wrap:wrap}}
 #hdr b{{color:#f3f4f6;font-size:14px}}
-.stat{{background:#1f2937;padding:4px 10px;border-radius:5px;font-size:11px;color:#d1d5db}}
+.stat{{background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);padding:4px 10px;border-radius:12px;font-size:11px;color:rgba(235,238,245,.72)}}
 .stat span{{color:#60a5fa;font-weight:700}}
 #map{{flex:1}}
-#lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:12px;line-height:2;color:#f3f4f6}}
+#lg{{position:fixed;bottom:20px;left:20px;z-index:1000;background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+    padding:11px 14px;border-radius:18px;border:1px solid rgba(255,255,255,.18);font-size:12px;line-height:2;color:#f3f4f6}}
 
 @media (max-width:768px){{
   #hdr{{gap:8px;padding:6px 10px}}
@@ -2882,24 +2882,24 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
   <div class="stat">最低: <span style="color:#c084fc">{pr_min:.1f}hPa</span></div>
   <div class="stat">最高: <span style="color:#93c5fd">{pr_max:.1f}hPa</span></div>
   <div class="stat">平均: <span>{pr_mean}hPa</span></div>
-  <div style="margin-left:auto;color:#6b7280">{time_label} / 更新: {updated_str}</div>
+  <div style="margin-left:auto;color:rgba(235,238,245,.46)">{time_label} / 更新: {updated_str}</div>
 </div>
 <div id="map"></div>
 <div id="lg">
   <b>海面気圧スケール</b><br>
-  <div style="width:130px;height:10px;border-radius:3px;
+  <div style="width:130px;height:10px;border-radius:7px;
     background:linear-gradient(to right,#b400b4,#a03cf0,#64a0ff,#c8dcff,#ffffff);margin:5px 0 2px"></div>
-  <div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:#9ca3af">
+  <div style="display:flex;justify-content:space-between;width:130px;font-size:10px;color:rgba(235,238,245,.62)">
     <span>低({pr_min:.0f})</span><span>高({pr_max:.0f})hPa</span>
   </div>
-  <hr style="border-color:#374151;margin:5px 0">
+  <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
   <small>出典: 気象庁アメダス<br>正規圧力（海面気圧）<br>{updated_str}</small>
 </div>
 <style>
 /* ★ Bug fix: 観測点の気圧値ラベル。ズームアウト時は密集して見づらいため、
    一定のズームレベル以上でのみ表示する（updateValueLabels()で制御）。*/
-.pres-val-label{{background:rgba(17,24,39,.85);border:1px solid #374151;color:#f3f4f6;
-  font-size:11px;font-weight:600;padding:1px 4px;border-radius:3px;white-space:nowrap;
+.pres-val-label{{background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);border:1px solid rgba(255,255,255,.18);color:#f3f4f6;
+  font-size:11px;font-weight:600;padding:1px 4px;border-radius:7px;white-space:nowrap;
   box-shadow:none}}
 .pres-val-label::before{{display:none}}
 </style>
@@ -3013,18 +3013,18 @@ def render_faultmap(updated_str):
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif}}
-#hdr{{padding:8px 16px;background:#111827;border-bottom:2px solid #1f2937;flex-shrink:0;
-       display:flex;align-items:center;gap:10px;font-size:12px;color:#9ca3af;flex-wrap:wrap}}
+body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}}
+#hdr{{padding:8px 16px;background:rgba(255,255,255,.06);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);border-bottom:1px solid rgba(255,255,255,.14);flex-shrink:0;
+       display:flex;align-items:center;gap:10px;font-size:12px;color:rgba(235,238,245,.62);flex-wrap:wrap}}
 #hdr b{{color:#f3f4f6;font-size:14px}}
-.tog{{padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;border:none;border-radius:5px;background:#1f2937;color:#9ca3af}}
-.tog.on{{background:#2563eb;color:#fff}}
+.tog{{padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;border:none;border-radius:12px;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);color:rgba(235,238,245,.62)}}
+.tog.on{{background:rgba(10,132,255,.55);color:#fff}}
 #mp{{flex:1;overflow:hidden;position:relative}}
 #map{{width:100%;height:100%}}
-#lg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:11px 14px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.9;color:#f3f4f6;max-width:260px}}
-#loadState{{position:absolute;top:14px;right:56px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:6px 12px;border-radius:6px;font-size:11px;color:#9ca3af}}
+#lg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+    padding:11px 14px;border-radius:18px;border:1px solid rgba(255,255,255,.18);font-size:11px;line-height:1.9;color:#f3f4f6;max-width:260px}}
+#loadState{{position:absolute;top:14px;right:56px;z-index:1000;background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+    padding:6px 12px;border-radius:14px;font-size:11px;color:rgba(235,238,245,.62)}}
 
 @media (max-width:768px){{
   #hdr{{gap:6px;padding:6px 10px}}
@@ -3037,7 +3037,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
   <b>活断層・プレート境界マップ</b>
   <button class="tog on" id="togFault" onclick="toggleFault(this)">活断層</button>
   <button class="tog on" id="togPlate" onclick="togglePlate(this)">プレート境界</button>
-  <div style="margin-left:auto;color:#6b7280">更新: {updated_str}</div>
+  <div style="margin-left:auto;color:rgba(235,238,245,.46)">更新: {updated_str}</div>
 </div>
 <div id="mp">
   <div id="map"></div>
@@ -3048,7 +3048,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:#0f172a;overflo
     <span style="color:#ff3b3b">━</span> 収束型境界(SUB/CRB)<br>
     <span style="color:#3b82f6">━</span> 発散型境界(OSR)<br>
     <span style="color:#facc15">━</span> トランスフォーム/その他<br>
-    <hr style="border-color:#374151;margin:5px 0">
+    <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
     <small>出典: GEM Global Active Faults Database（Styron &amp; Pagani, 2020）<br>
     プレート境界: Bird (2003) / fraxen/tectonicplates (Peter Bird, PB2002)</small>
   </div>
@@ -3711,78 +3711,78 @@ def render_riskmap(risk_cells, updated_str):
 {LEAFLET_CDN}
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{display:flex;height:100vh;background:#0f172a;color:#fff;font-family:"Helvetica Neue",Arial,sans-serif;overflow:hidden}}
-#panel{{width:300px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;overflow-y:auto;padding:14px;
+body{{display:flex;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif;overflow:hidden}}
+#panel{{width:300px;flex-shrink:0;background:rgba(255,255,255,.055);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);border-right:1px solid rgba(255,255,255,.14);overflow-y:auto;padding:14px;
     position:relative;transition:margin-left 0.2s}}
 #panel.closed{{margin-left:-300px}}
 #panelTop{{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:4px}}
 #panel h2{{font-size:14px;color:#f3f4f6}}
-#panelClose{{flex-shrink:0;width:22px;height:22px;border:none;border-radius:5px;background:#374151;color:#d1d5db;
+#panelClose{{flex-shrink:0;width:22px;height:22px;border:none;border-radius:12px;background:rgba(255,255,255,.18);backdrop-filter:blur(10px) saturate(160%);-webkit-backdrop-filter:blur(10px) saturate(160%);color:rgba(235,238,245,.72);
     cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center}}
-#panelClose:hover{{background:#4b5563;color:#fff}}
+#panelClose:hover{{background:rgba(255,255,255,.3);color:#fff}}
 #panelReopen{{position:absolute;top:70px;left:0;z-index:5000;width:34px;height:78px;border:none;
-    border-radius:0 8px 8px 0;background:#1f2937;color:#9ca3af;cursor:pointer;font-size:12px;
+    border-radius:0 18px 18px 0;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);color:rgba(235,238,245,.62);cursor:pointer;font-size:12px;
     display:none;flex-direction:column;align-items:center;justify-content:center;gap:6px;
     box-shadow:2px 0 8px rgba(0,0,0,.4)}}
-#panelReopen:hover{{background:#2563eb;color:#fff}}
+#panelReopen:hover{{background:rgba(10,132,255,.55);color:#fff}}
 #panelReopen.show{{display:flex}}
 #panelReopen .arrow{{font-size:15px;line-height:1}}
 #panelReopen .vlabel{{writing-mode:vertical-rl;letter-spacing:1px;font-size:10px;font-weight:600}}
-#panel p.sub{{font-size:11px;color:#6b7280;margin-bottom:12px;line-height:1.6}}
+#panel p.sub{{font-size:11px;color:rgba(235,238,245,.46);margin-bottom:12px;line-height:1.6}}
 .sec{{margin-bottom:16px}}
-.sec h3{{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid #1f2937;padding-bottom:4px;
+.sec h3{{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid rgba(255,255,255,.14);padding-bottom:4px;
     display:flex;align-items:center;justify-content:space-between}}
 .preset-row{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:4px}}
 .preset-btn{{flex:1 1 calc(50% - 6px);padding:6px 4px;font-size:11px;font-weight:600;cursor:pointer;
-    border:1px solid #374151;border-radius:6px;background:#1f2937;color:#9ca3af;text-align:center}}
-.preset-btn:hover{{background:#374151;color:#f3f4f6}}
-.preset-btn.on{{background:linear-gradient(135deg,#2563eb,#7c3aed);color:#fff;border-color:transparent}}
-.chk-row{{display:flex;align-items:center;gap:8px;padding:6px 4px;border-radius:5px;font-size:12px}}
-.chk-row:hover{{background:#161b22}}
+    border:1px solid rgba(255,255,255,.18);border-radius:14px;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);color:rgba(235,238,245,.62);text-align:center}}
+.preset-btn:hover{{background:rgba(255,255,255,.18);backdrop-filter:blur(10px) saturate(160%);-webkit-backdrop-filter:blur(10px) saturate(160%);color:#f3f4f6}}
+.preset-btn.on{{background:linear-gradient(135deg,#0a84ff,#7c5cff);color:#fff;border-color:transparent}}
+.chk-row{{display:flex;align-items:center;gap:8px;padding:6px 4px;border-radius:12px;font-size:12px}}
+.chk-row:hover{{background:rgba(255,255,255,.07)}}
 .chk-row.disabled{{opacity:0.45}}
 .chk-row input{{width:15px;height:15px;flex-shrink:0}}
-.chk-row .clabel{{flex:1;color:#e5e7eb}}
-.chk-row .cweight{{font-size:10px;color:#6b7280}}
-.chk-row .cbadge{{font-size:9px;padding:1px 5px;border-radius:3px;background:#374151;color:#9ca3af}}
-#cellCount{{font-size:11px;color:#9ca3af;margin-top:10px}}
+.chk-row .clabel{{flex:1;color:rgba(240,242,247,.85)}}
+.chk-row .cweight{{font-size:10px;color:rgba(235,238,245,.46)}}
+.chk-row .cbadge{{font-size:9px;padding:1px 5px;border-radius:7px;background:rgba(255,255,255,.18);backdrop-filter:blur(10px) saturate(160%);-webkit-backdrop-filter:blur(10px) saturate(160%);color:rgba(235,238,245,.62)}}
+#cellCount{{font-size:11px;color:rgba(235,238,245,.62);margin-top:10px}}
 #cellCount span{{color:#60a5fa;font-weight:700}}
-.note{{font-size:10.5px;color:#6b7280;line-height:1.7;margin-top:10px}}
-.tbl-toggle{{border:none;background:#1f2937;color:#9ca3af;font-size:10px;font-weight:600;
+.note{{font-size:10.5px;color:rgba(235,238,245,.46);line-height:1.7;margin-top:10px}}
+.tbl-toggle{{border:none;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);color:rgba(235,238,245,.62);font-size:10px;font-weight:600;
     padding:2px 8px;border-radius:4px;cursor:pointer;flex-shrink:0}}
-.tbl-toggle:hover{{background:#374151;color:#f3f4f6}}
-#rankWrap{{max-height:260px;overflow-y:auto;border:1px solid #1f2937;border-radius:6px}}
+.tbl-toggle:hover{{background:rgba(255,255,255,.18);backdrop-filter:blur(10px) saturate(160%);-webkit-backdrop-filter:blur(10px) saturate(160%);color:#f3f4f6}}
+#rankWrap{{max-height:260px;overflow-y:auto;border:1px solid rgba(255,255,255,.14);border-radius:14px}}
 #rankWrap.collapsed{{display:none}}
 table.rank-table{{width:100%;border-collapse:collapse;font-size:10.5px}}
-table.rank-table thead tr{{background:#1f2937;position:sticky;top:0}}
-table.rank-table th{{padding:5px 4px;color:#9ca3af;text-align:left;font-weight:600;white-space:nowrap}}
-table.rank-table td{{padding:4px;color:#e5e7eb;border-top:1px solid #1f2937;white-space:nowrap}}
+table.rank-table thead tr{{background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);position:sticky;top:0}}
+table.rank-table th{{padding:5px 4px;color:rgba(235,238,245,.62);text-align:left;font-weight:600;white-space:nowrap}}
+table.rank-table td{{padding:4px;color:rgba(240,242,247,.85);border-top:1px solid rgba(255,255,255,.14);white-space:nowrap}}
 .rrow{{cursor:pointer}}
-.rrow:hover{{background:#1e2d40}}
+.rrow:hover{{background:rgba(255,255,255,.12)}}
 #mp{{flex:1;overflow:hidden;position:relative}}
 #map{{width:100%;height:100%}}
 /* 地図タイル自体を少し明るく・彩度を落として、暗色オーバーレイとの同化を防ぐ(v7.44) */
 .leaflet-tile-pane{{filter:brightness(1.18) saturate(0.8) contrast(0.95)}}
-#lg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:10px 13px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.9;color:#f3f4f6}}
+#lg{{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+    padding:10px 13px;border-radius:18px;border:1px solid rgba(255,255,255,.18);font-size:11px;line-height:1.9;color:#f3f4f6}}
 #hdr{{position:absolute;top:14px;left:50%;transform:translateX(-50%);z-index:1000;
-    background:rgba(17,24,39,.92);padding:6px 16px;border-radius:6px;font-size:11px;color:#9ca3af}}
+    background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);padding:6px 16px;border-radius:14px;font-size:11px;color:rgba(235,238,245,.62)}}
 /* ── セル詳細パネル（クリックで表示）: 内訳/棒グラフ/前日比/推移を
    はっきり区切って表示し、ごちゃつかないようにする ── */
 #detailBox{{display:none;position:absolute;top:14px;right:14px;z-index:1500;width:290px;
-    background:rgba(17,24,39,.97);border:1px solid #374151;border-radius:10px;padding:12px 14px;
-    font-size:11px;color:#e5e7eb;max-height:calc(100% - 28px);overflow-y:auto}}
+    background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);border:1px solid rgba(255,255,255,.18);border-radius:20px;padding:12px 14px;
+    font-size:11px;color:rgba(240,242,247,.85);max-height:calc(100% - 28px);overflow-y:auto}}
 #detailBox .dHead{{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}}
 #dTitle{{font-weight:700;font-size:14px;color:#f3f4f6}}
-#dClose{{flex-shrink:0;width:20px;height:20px;border:none;border-radius:5px;background:#374151;color:#d1d5db;
+#dClose{{flex-shrink:0;width:20px;height:20px;border:none;border-radius:12px;background:rgba(255,255,255,.18);backdrop-filter:blur(10px) saturate(160%);-webkit-backdrop-filter:blur(10px) saturate(160%);color:rgba(235,238,245,.72);
     cursor:pointer;font-size:12px;line-height:1}}
-#dClose:hover{{background:#4b5563;color:#fff}}
-#dLoc{{font-size:10px;color:#6b7280;margin:2px 0 10px}}
-.dSection{{margin-top:10px;padding-top:10px;border-top:1px solid #1f2937}}
+#dClose:hover{{background:rgba(255,255,255,.3);color:#fff}}
+#dLoc{{font-size:10px;color:rgba(235,238,245,.46);margin:2px 0 10px}}
+.dSection{{margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.14)}}
 .dSection h4{{font-size:11px;font-weight:700;color:#60a5fa;margin-bottom:6px}}
-.brk-row{{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;color:#d1d5db}}
+.brk-row{{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;color:rgba(235,238,245,.72)}}
 .brk-val{{font-weight:700;color:#f3f4f6}}
 #dPrevDay{{font-size:11.5px;margin-top:2px}}
-#dTrendState{{font-size:10px;color:#6b7280;margin-bottom:4px}}
+#dTrendState{{font-size:10px;color:rgba(235,238,245,.46);margin-bottom:4px}}
 canvas.dChart{{display:block;width:100%}}
 
 @media (max-width:768px){{
@@ -3842,7 +3842,7 @@ canvas.dChart{{display:block;width:100%}}
         <tbody id="rankBody"></tbody>
       </table>
     </div>
-    <div style="font-size:10px;color:#6b7280;margin-top:4px">上位<span id="rankShown">0</span>件 / 表示中<span id="rankTotal">0</span>件中（行クリックで地図上を表示）</div>
+    <div style="font-size:10px;color:rgba(235,238,245,.46);margin-top:4px">上位<span id="rankShown">0</span>件 / 表示中<span id="rankTotal">0</span>件中（行クリックで地図上を表示）</div>
   </div>
 
   <div id="cellCount">表示中のセル数: <span id="cellN">0</span> / {n_cells}</div>
@@ -3862,8 +3862,8 @@ canvas.dChart{{display:block;width:100%}}
     <span style="color:{LEVEL_COLOR[3]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv3（注意）<br>
     <span style="color:{LEVEL_COLOR[2]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv2（やや注意）<br>
     <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（平常）<br>
-    <hr style="border-color:#374151;margin:5px 0">
-    <small style="color:#6b7280">Lv0（しきい値未満）のセルは地図上に表示されません</small><br>
+    <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
+    <small style="color:rgba(235,238,245,.46)">Lv0（しきい値未満）のセルは地図上に表示されません</small><br>
     <small>選択データの相対順位を重み付け合成した指数<br>（発生確率を意味するものではありません）</small>
   </div>
   <div id="detailBox">
@@ -4002,7 +4002,7 @@ function drawBarChart(canvas, labels, values, colors){{
     var cy = rowH*i + rowH/2;
     ctx.fillStyle = '#9ca3af';
     ctx.fillText(labels[i], 0, cy);
-    ctx.fillStyle = '#1f2937';
+    ctx.fillStyle = 'rgba(255,255,255,.12)';
     ctx.fillRect(labelW, cy-barH/2, trackW, barH);
     var w = Math.max(1, trackW * (Math.abs(values[i]) / maxV));
     ctx.fillStyle = colors[i] || '#60a5fa';
@@ -4080,7 +4080,7 @@ function showDetail(cell, comp, lv){{
         var color = diff>0 ? '#f87171' : (diff<0 ? '#4ade80' : '#9ca3af');
         document.getElementById('dPrevDay').innerHTML =
           '<span style="color:'+color+';font-weight:700">' + (diff>0?'+':'') + diff + '</span>' +
-          ' <span style="color:#6b7280">(24時間前比)</span>';
+          ' <span style="color:rgba(235,238,245,.46)">(24時間前比)</span>';
       }} else {{
         document.getElementById('dPrevDay').textContent = 'データ不足のため算出できません';
       }}
@@ -4183,57 +4183,57 @@ def render_snapshots(updated_str):
 __LEAFLET_CDN__
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{display:flex;height:100vh;background:#0f172a;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif;color:#f3f4f6}
-#panel{width:300px;flex-shrink:0;background:#111827;border-right:2px solid #1f2937;overflow-y:auto;padding:14px}
+body{display:flex;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif;color:#f3f4f6}
+#panel{width:300px;flex-shrink:0;background:rgba(255,255,255,.055);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);border-right:1px solid rgba(255,255,255,.14);overflow-y:auto;padding:14px}
 #panel h2{font-size:14px;color:#f3f4f6;margin-bottom:4px}
-#panel p.sub{font-size:11px;color:#6b7280;margin-bottom:14px;line-height:1.6}
+#panel p.sub{font-size:11px;color:rgba(235,238,245,.46);margin-bottom:14px;line-height:1.6}
 .sec{margin-bottom:16px}
-.sec h3{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid #1f2937;padding-bottom:4px}
+.sec h3{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid rgba(255,255,255,.14);padding-bottom:4px}
 .field{margin-bottom:10px}
-.field label{display:block;font-size:11px;color:#9ca3af;margin-bottom:4px}
-.field input{width:100%;padding:7px 8px;font-size:12px;background:#1f2937;border:1px solid #374151;
-    border-radius:6px;color:#f3f4f6}
+.field label{display:block;font-size:11px;color:rgba(235,238,245,.62);margin-bottom:4px}
+.field input{width:100%;padding:7px 8px;font-size:12px;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);border:1px solid rgba(255,255,255,.18);
+    border-radius:14px;color:#f3f4f6}
 .field input:focus{outline:none;border-color:#3b82f6}
 #fetchBtn{width:100%;padding:9px 0;font-size:12.5px;font-weight:700;color:#fff;cursor:pointer;
-    background:linear-gradient(135deg,#2563eb,#7c3aed);border:none;border-radius:7px;margin-top:2px}
+    background:linear-gradient(135deg,#0a84ff,#7c5cff);border:none;border-radius:16px;margin-top:2px}
 #fetchBtn:hover{filter:brightness(1.1)}
 #fetchBtn:disabled{opacity:.5;cursor:default;filter:none}
-#statusBox{font-size:11px;color:#9ca3af;line-height:1.8;margin-top:12px;padding:10px 12px;
-    background:#161b22;border-radius:7px;border:1px solid #1f2937;display:none}
+#statusBox{font-size:11px;color:rgba(235,238,245,.62);line-height:1.8;margin-top:12px;padding:10px 12px;
+    background:rgba(255,255,255,.07);border-radius:16px;border:1px solid rgba(255,255,255,.14);display:none}
 #statusBox b{color:#60a5fa}
 #statusBox.err{border-color:#7f1d1d;color:#fca5a5}
-.chk-row{display:flex;align-items:center;gap:8px;padding:5px 4px;border-radius:5px;font-size:12px}
-.chk-row:hover{background:#161b22}
+.chk-row{display:flex;align-items:center;gap:8px;padding:5px 4px;border-radius:12px;font-size:12px}
+.chk-row:hover{background:rgba(255,255,255,.07)}
 .chk-row input{width:15px;height:15px;flex-shrink:0}
-.chk-row .clabel{flex:1;color:#e5e7eb}
-.chk-row .cweight{font-size:10px;color:#6b7280}
-#cellCount{font-size:11px;color:#9ca3af;margin-top:8px}
+.chk-row .clabel{flex:1;color:rgba(240,242,247,.85)}
+.chk-row .cweight{font-size:10px;color:rgba(235,238,245,.46)}
+#cellCount{font-size:11px;color:rgba(235,238,245,.62);margin-top:8px}
 #cellCount span{color:#60a5fa;font-weight:700}
-.note{font-size:10.5px;color:#6b7280;line-height:1.7;margin-top:10px}
+.note{font-size:10.5px;color:rgba(235,238,245,.46);line-height:1.7;margin-top:10px}
 #mp{flex:1;overflow:hidden;position:relative}
 #map{width:100%;height:100%}
 /* 地図タイル自体を少し明るく・彩度を落として、暗色オーバーレイとの同化を防ぐ(v7.44) */
 .leaflet-tile-pane{filter:brightness(1.18) saturate(0.8) contrast(0.95)}
-#lg{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(17,24,39,.92);
-    padding:10px 13px;border-radius:8px;border:1px solid #374151;font-size:11px;line-height:1.9;color:#f3f4f6}
+#lg{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+    padding:10px 13px;border-radius:18px;border:1px solid rgba(255,255,255,.18);font-size:11px;line-height:1.9;color:#f3f4f6}
 #mapEmpty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-    color:#4b5563;font-size:13px;text-align:center;padding:20px}
+    color:rgba(235,238,245,.4);font-size:13px;text-align:center;padding:20px}
 #detailBox{display:none;position:absolute;top:14px;right:14px;z-index:1500;width:270px;
-    background:rgba(17,24,39,.97);border:1px solid #374151;border-radius:10px;padding:12px 14px;
-    font-size:11px;color:#e5e7eb}
+    background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);border:1px solid rgba(255,255,255,.18);border-radius:20px;padding:12px 14px;
+    font-size:11px;color:rgba(240,242,247,.85)}
 #detailBox .dHead{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
 #dTitle{font-weight:700;font-size:14px;color:#f3f4f6}
-#dClose{flex-shrink:0;width:20px;height:20px;border:none;border-radius:5px;background:#374151;color:#d1d5db;
+#dClose{flex-shrink:0;width:20px;height:20px;border:none;border-radius:12px;background:rgba(255,255,255,.18);backdrop-filter:blur(10px) saturate(160%);-webkit-backdrop-filter:blur(10px) saturate(160%);color:rgba(235,238,245,.72);
     cursor:pointer;font-size:12px;line-height:1}
-#dClose:hover{background:#4b5563;color:#fff}
-#dLoc{font-size:10px;color:#6b7280;margin:2px 0 10px}
-.brk-row{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;color:#d1d5db}
+#dClose:hover{background:rgba(255,255,255,.3);color:#fff}
+#dLoc{font-size:10px;color:rgba(235,238,245,.46);margin:2px 0 10px}
+.brk-row{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;color:rgba(235,238,245,.72)}
 .brk-val{font-weight:700;color:#f3f4f6}
 canvas.dChart{display:block;width:100%;margin-top:6px}
 
 @media (max-width:768px){
   body{flex-direction:column;overflow-y:auto}
-  #panel{width:100%;border-right:none;border-bottom:2px solid #1f2937;max-height:46vh}
+  #panel{width:100%;border-right:none;border-bottom:1px solid rgba(255,255,255,.14);max-height:46vh}
   #mp{flex:none;height:46vh;min-height:220px}
   #detailBox{width:82vw;max-width:270px;right:8px;top:8px}
 }
@@ -4280,8 +4280,8 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
     <span style="color:#ff0000;opacity:0.55">■</span> Lv3（注意）<br>
     <span style="color:#ffe600;opacity:0.55">■</span> Lv2（やや注意）<br>
     <span style="color:#66ccff;opacity:0.55">■</span> Lv1（平常）<br>
-    <hr style="border-color:#374151;margin:5px 0">
-    <small style="color:#6b7280">Lv0（しきい値未満）のセルは地図上に表示されません</small><br>
+    <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
+    <small style="color:rgba(235,238,245,.46)">Lv0（しきい値未満）のセルは地図上に表示されません</small><br>
     <small>指定時点における相対リスク指数<br>（発生確率を意味するものではありません）</small>
   </div>
   <div id="detailBox">
@@ -4360,7 +4360,7 @@ function drawBarChart(canvas, labels, values, colors){
     var cy = rowH*i + rowH/2;
     ctx.fillStyle = '#9ca3af';
     ctx.fillText(labels[i], 0, cy);
-    ctx.fillStyle = '#1f2937';
+    ctx.fillStyle = 'rgba(255,255,255,.12)';
     ctx.fillRect(labelW, cy-barH/2, trackW, barH);
     var w = Math.max(1, trackW * (Math.abs(values[i]) / maxV));
     ctx.fillStyle = colors[i] || '#60a5fa';
@@ -4484,13 +4484,13 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v8.00</title>
+  <title>地震研究統合プラットフォーム v8.10</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    html,body{height:100%;overflow:hidden;background:#0f172a;font-family:"Helvetica Neue",Arial,sans-serif}
+    html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
     #sidebar{
       position:fixed;top:0;left:0;width:188px;height:100%;
-      background:#0d1117;border-right:2px solid #1f2937;
+      background:rgba(255,255,255,.05);backdrop-filter:blur(30px) saturate(180%);-webkit-backdrop-filter:blur(30px) saturate(180%);border-right:1px solid rgba(255,255,255,.14);
       display:flex;flex-direction:column;padding-top:0;z-index:100;
       transition:transform 0.25s ease;
     }
@@ -4498,31 +4498,31 @@ SHELL_HTML = """<!DOCTYPE html>
     #sbOverlay{display:none}
     .app-title{
       padding:14px 14px 12px;
-      background:linear-gradient(135deg,#1e3a5f,#1a1a2e);
-      border-bottom:2px solid #1f2937;
+      background:linear-gradient(135deg,rgba(10,132,255,.35),rgba(124,92,255,.22));
+      border-bottom:1px solid rgba(255,255,255,.14);
     }
     .app-title div:first-child{font-size:12px;font-weight:700;color:#60a5fa;letter-spacing:0.5px}
-    .app-title div:last-child{font-size:10px;color:#4b5563;margin-top:2px}
+    .app-title div:last-child{font-size:10px;color:rgba(235,238,245,.4);margin-top:2px}
     .group-title{
       padding:10px 14px 4px;font-size:10px;font-weight:700;
-      color:#374151;text-transform:uppercase;letter-spacing:1px;
+      color:rgba(235,238,245,.32);text-transform:uppercase;letter-spacing:1px;
     }
     .tab-btn{
       width:100%;text-align:left;padding:10px 14px 10px 16px;cursor:pointer;
-      font-size:13px;font-weight:500;color:#6b7280;
+      font-size:13px;font-weight:500;color:rgba(235,238,245,.46);
       border:none;background:none;transition:0.15s;display:flex;align-items:center;gap:8px;
     }
-    .tab-btn:hover{color:#f3f4f6;background:#161b22}
+    .tab-btn:hover{color:#f3f4f6;background:rgba(255,255,255,.07)}
     .tab-btn.active{
-      color:#fff;background:linear-gradient(90deg,#162032,#0d1117);
+      color:#fff;background:linear-gradient(90deg,rgba(10,132,255,.22),rgba(124,92,255,.05));
       border-left:3px solid #3b82f6;padding-left:13px;
     }
     .tab-btn .icon{font-size:14px;flex-shrink:0}
     .tab-btn .label{flex:1}
-    .tab-btn .badge{font-size:9px;padding:1px 5px;border-radius:3px;background:#1e3a5f;color:#93c5fd;flex-shrink:0}
-    .tab-btn.active .badge{background:#2563eb}
-    .sep{height:1px;background:#1f2937;margin:6px 12px}
-    .version{margin-top:auto;padding:10px 14px;font-size:10px;color:#374151;border-top:1px solid #1f2937}
+    .tab-btn .badge{font-size:9px;padding:1px 5px;border-radius:7px;background:rgba(56,132,255,.25);color:#93c5fd;flex-shrink:0}
+    .tab-btn.active .badge{background:rgba(10,132,255,.55)}
+    .sep{height:1px;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);margin:6px 12px}
+    .version{margin-top:auto;padding:10px 14px;font-size:10px;color:rgba(235,238,245,.32);border-top:1px solid rgba(255,255,255,.14)}
     #main{margin-left:188px;height:100vh;overflow:hidden}
     iframe{width:100%;height:100%;border:none;display:none}
     iframe.active{display:block}
@@ -4531,8 +4531,8 @@ SHELL_HTML = """<!DOCTYPE html>
       #menuBtn{
         display:flex;align-items:center;justify-content:center;
         position:fixed;top:10px;left:10px;z-index:300;
-        width:38px;height:38px;border-radius:8px;border:none;
-        background:#111827;color:#f3f4f6;font-size:18px;
+        width:38px;height:38px;border-radius:18px;border:none;
+        background:rgba(255,255,255,.14);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);color:#f3f4f6;font-size:18px;
         box-shadow:0 2px 8px rgba(0,0,0,.5);
       }
       #sidebar{
@@ -4557,7 +4557,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v8.00 / 研究用</div>
+      <div>v8.10 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -4647,12 +4647,12 @@ SHELL_HTML = """<!DOCTYPE html>
 LOADING_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="5">
-<style>body{background:#0d1117;color:white;display:flex;align-items:center;justify-content:center;
+<style>body{background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;color:white;display:flex;align-items:center;justify-content:center;
 height:100vh;font-family:sans-serif;flex-direction:column;gap:16px}
-.sp{width:48px;height:48px;border:5px solid #1f2937;border-top-color:#3b82f6;border-radius:50%;animation:spin 1s linear infinite}
+.sp{width:48px;height:48px;border:4px solid rgba(255,255,255,.14);border-top-color:#0a84ff;border-radius:50%;animation:spin 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}</style></head>
 <body><div class="sp"></div><p>データを準備中...</p>
-<p style="font-size:12px;color:#4b5563">地震データ取得 → ETAS解析 → b値計算...</p></body></html>"""
+<p style="font-size:12px;color:rgba(235,238,245,.4)">地震データ取得 → ETAS解析 → b値計算...</p></body></html>"""
 
 
 # ══════════════════════════════════════════════════════
@@ -4732,7 +4732,7 @@ def index():
 def tab(name):
     with _cache_lock: data = _cached_data
     if data is None:
-        return Response("<html><body style='background:#0d1117;color:white;padding:20px'>ロード中...</body></html>", mimetype="text/html")
+        return Response("<html><body style='background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;color:white;padding:20px'>ロード中...</body></html>", mimetype="text/html")
     upd = data["updated"]
     if   name == "history":  html = render_quake_history(data["all"], upd)
     elif name == "etas":     html = render_etas(data["etas"], data["all"], upd)
