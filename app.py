@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v8.11
+地震研究統合プラットフォーム v8.12
 
 タブ構成:
-  1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
+  1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS / Hi-net)
   2. ETASマップ   - 地震発生確率 + ETAS残差（研究用）
   3. b値マップ    - グリッドごとのGutenberg-Richter b値
   4. 活断層・プレート境界 - 都市圏活断層図(GSI) + プレート境界(PB2002)
@@ -1571,7 +1571,7 @@ def render_quake_history(quakes, updated_str):
         mc     = _mag_color(mag)
         ic     = _int_color(maxi) if maxi not in ("","−","-") else "#475569"
         il     = _int_label(maxi) if maxi not in ("","−","-") else "無感"
-        src_badge = {"jma_bosai":"JMA","p2p":"P2P","p2p_jma":"P2P","usgs":"USGS"}.get(src,"?")
+        src_badge = {"jma_bosai":"JMA","p2p":"P2P","p2p_jma":"P2P","usgs":"USGS","hinet":"Hi-net"}.get(src,"?")
 
         # ★ Bug fix: マップの円はマグニチュードで色分けする。
         # 元コードは「有感→震度色、無感→マグニチュード色」という条件分岐になっていたため、
@@ -1670,6 +1670,7 @@ thead th{{padding:6px 5px;font-size:10px;color:rgba(235,238,245,.62);text-align:
     <button class="fb" onclick="filter('jma',this)">JMA</button>
     <button class="fb" onclick="filter('p2p',this)">P2P(無感含む)</button>
     <button class="fb" onclick="filter('usgs',this)">USGS</button>
+    <button class="fb" onclick="filter('hinet',this)">Hi-net(無感)</button>
   </div>
   <div id="ls"><table>
     <thead><tr><th>震源名</th><th>発生時刻</th><th>M</th><th>最大震度</th><th>深さ</th><th>ソース</th></tr></thead>
@@ -1710,7 +1711,7 @@ function focusQ(idx,lat,lon){{
 }}
 
 var allRows=Array.from(document.querySelectorAll('.qrow'));
-var MODE_MAP={{'all':function(r){{return true}},'felt':function(r){{return r.querySelector('.c4 span').style.background!='rgb(71, 85, 105)'}},'unfelt':function(r){{return r.querySelector('.c4 span').style.background==='rgb(71, 85, 105)'}},'jma':function(r){{return r.querySelector('.c2:last-child span').textContent==='JMA'}},'p2p':function(r){{return r.querySelector('.c2:last-child span').textContent==='P2P'}},'usgs':function(r){{return r.querySelector('.c2:last-child span').textContent==='USGS'}}}};
+var MODE_MAP={{'all':function(r){{return true}},'felt':function(r){{return r.querySelector('.c4 span').style.background!='rgb(71, 85, 105)'}},'unfelt':function(r){{return r.querySelector('.c4 span').style.background==='rgb(71, 85, 105)'}},'jma':function(r){{return r.querySelector('.c2:last-child span').textContent==='JMA'}},'p2p':function(r){{return r.querySelector('.c2:last-child span').textContent==='P2P'}},'usgs':function(r){{return r.querySelector('.c2:last-child span').textContent==='USGS'}},'hinet':function(r){{return r.querySelector('.c2:last-child span').textContent==='Hi-net'}}}};
 
 function filter(mode,btn){{
   document.querySelectorAll('.fb').forEach(function(b){{b.classList.remove('on')}});
@@ -1842,7 +1843,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
   <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（平常）<br>
   <small style="color:rgba(235,238,245,.46)">Lv4・5は過去65日間の実績と比べても稀な場合のみ表示されます</small>
   <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
-  <small>JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)+src_count.get('p2p_jma',0)} USGS:{src_count.get('usgs',0)}<br>計{len(quakes)}件</small>
+  <small>JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)+src_count.get('p2p_jma',0)} USGS:{src_count.get('usgs',0)} Hi-net:{src_count.get('hinet',0)}<br>計{len(quakes)}件</small>
 </div>
 <script>
 var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
@@ -4487,7 +4488,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v8.11</title>
+  <title>地震研究統合プラットフォーム v8.12</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
@@ -4560,7 +4561,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v8.11 / 研究用</div>
+      <div>v8.12 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -4570,15 +4571,15 @@ SHELL_HTML = """<!DOCTYPE html>
     </button>
     <button class="tab-btn" onclick="sw(1)">
       <span class="label">地震履歴</span>
-      <span class="badge">JMA/P2P/USGS</span>
+      <span class="badge">JMA/P2P/USGS/Hi-net</span>
     </button>
     <button class="tab-btn" onclick="sw(2)">
       <span class="label">ETASマップ</span>
-      <span class="badge">JMA/P2P/USGS</span>
+      <span class="badge">JMA/P2P/USGS/Hi-net</span>
     </button>
     <button class="tab-btn" onclick="sw(3)">
       <span class="label">b値マップ</span>
-      <span class="badge">JMA/P2P/USGS</span>
+      <span class="badge">JMA/P2P/USGS/Hi-net</span>
     </button>
     <button class="tab-btn" onclick="sw(4)">
       <span class="label">活断層・プレート境界</span>
