@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v8.10
+地震研究統合プラットフォーム v8.11
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS)
@@ -267,7 +267,10 @@ LEAFLET_CDN = """
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>"""
 
-DARK_TILE = "L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{attribution:'&copy;CartoDB',subdomains:'abcd',maxZoom:18}).addTo(map);"
+# ★ 2026-09: CARTOのdark_allタイルは無料APIキーでも月間クォータ超過等で
+# 「API KEY REQUIRED」の透かしタイルが再発するため、APIキー管理が不要な
+# Esri「World_Dark_Gray_Base」（キャンバス系ベースマップ、最初からダーク配色）に切り替え。
+DARK_TILE = "L.tileLayer('https://services.arcgisonline.com/arcgis/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',{attribution:'Esri, HERE, Garmin, &copy; OpenStreetMap contributors',maxZoom:16}).addTo(map);"
 
 GEOJSON_JS = """
     fetch('https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson')
@@ -4484,7 +4487,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v8.10</title>
+  <title>地震研究統合プラットフォーム v8.11</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
@@ -4557,7 +4560,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v8.10 / 研究用</div>
+      <div>v8.11 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
