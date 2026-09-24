@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v8.12
+地震研究統合プラットフォーム v8.13
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS / Hi-net)
@@ -2799,6 +2799,26 @@ def _fetch_amedas_latest():
     except Exception as e:
         print(f"[AMEDAS obs] {e}"); return {}, "取得失敗"
 
+def _get_amedas():
+    """(table, obs, label) を返す。取得に失敗した(空の)結果はキャッシュしない。
+    失敗時に前回成功分が残っていればそれで代用する。
+    (旧実装は失敗した空データを AMEDAS_CACHE_SEC の間キャッシュしていたため、
+     気圧タブと統合リスクマップの気圧成分が数分間まるごと欠損していた)"""
+    global _amedas_cache
+    now = time.time()
+    if _amedas_cache["data"] and now - _amedas_cache["ts"] < AMEDAS_CACHE_SEC:
+        c = _amedas_cache["data"]
+        return c["table"], c["obs"], c["label"]
+    table = _fetch_amedas_table()
+    obs_data, time_label = _fetch_amedas_latest()
+    if table and obs_data:
+        _amedas_cache = {"data": {"table": table, "obs": obs_data, "label": time_label}, "ts": now}
+        return table, obs_data, time_label
+    if _amedas_cache["data"]:
+        c = _amedas_cache["data"]
+        return c["table"], c["obs"], c["label"] + "（取得失敗のため前回分）"
+    return table, obs_data, time_label
+
 def _pres_color(val, vmin, vmax):
     ratio = max(0.0, min(1.0, (val - vmin) / max(vmax - vmin, 0.01)))
     # 低気圧(赤/紫) → 高気圧(青/白)
@@ -2814,14 +2834,7 @@ def _pres_color(val, vmin, vmax):
     return f"#{max(0,min(255,r)):02x}{max(0,min(255,g)):02x}{max(0,min(255,b)):02x}"
 
 def render_pressure(updated_str):
-    global _amedas_cache
-    now = time.time()
-    if _amedas_cache["data"] and now - _amedas_cache["ts"] < AMEDAS_CACHE_SEC:
-        cached = _amedas_cache["data"]
-        table, obs_data, time_label = cached["table"], cached["obs"], cached["label"]
-    else:
-        table = _fetch_amedas_table(); obs_data, time_label = _fetch_amedas_latest()
-        _amedas_cache = {"data":{"table":table,"obs":obs_data,"label":time_label},"ts":now}
+    table, obs_data, time_label = _get_amedas()
 
     def _gv(obs, key):
         raw = obs.get(key)
@@ -3456,14 +3469,7 @@ def _risk_bvalue_raw(bvalue_grid):
 
 def _risk_pressure_raw():
     """AMeDAS海面気圧の「地域平均からの偏差」を最寄り観測点からセルへ割り当てる。"""
-    global _amedas_cache
-    now = time.time()
-    if _amedas_cache["data"] and now - _amedas_cache["ts"] < AMEDAS_CACHE_SEC:
-        cached = _amedas_cache["data"]
-        table, obs_data = cached["table"], cached["obs"]
-    else:
-        table = _fetch_amedas_table(); obs_data, time_label = _fetch_amedas_latest()
-        _amedas_cache = {"data": {"table": table, "obs": obs_data, "label": time_label}, "ts": now}
+    table, obs_data, _label = _get_amedas()
 
     def _gv(obs, key):
         raw = obs.get(key)
@@ -4488,7 +4494,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v8.12</title>
+  <title>地震研究統合プラットフォーム v8.13</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
@@ -4526,7 +4532,23 @@ SHELL_HTML = """<!DOCTYPE html>
     .tab-btn .badge{font-size:9px;padding:1px 5px;border-radius:7px;background:rgba(56,132,255,.25);color:#93c5fd;flex-shrink:0}
     .tab-btn.active .badge{background:rgba(10,132,255,.55)}
     .sep{height:1px;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);margin:6px 12px}
-    .version{margin-top:auto;padding:10px 14px;font-size:10px;color:rgba(235,238,245,.32);border-top:1px solid rgba(255,255,255,.14)}
+    .version{margin-top:0;padding:10px 14px;font-size:10px;color:rgba(235,238,245,.32);border-top:1px solid rgba(255,255,255,.14)}
+    .recalc-box{margin-top:auto;padding:10px 12px}
+    #recalcBtn{
+      width:100%;padding:10px 10px;font-size:13px;font-weight:600;color:#fff;cursor:pointer;
+      border:1px solid rgba(255,255,255,.2);border-radius:10px;
+      background:linear-gradient(135deg,rgba(10,132,255,.45),rgba(124,92,255,.32));
+      transition:0.15s;
+    }
+    #recalcBtn:hover{filter:brightness(1.15)}
+    #recalcBtn:disabled{opacity:.55;cursor:default;filter:none}
+    #toast{
+      display:none;position:fixed;left:50%;transform:translateX(-50%);
+      bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:400;
+      max-width:88vw;padding:9px 15px;border-radius:14px;font-size:12.5px;line-height:1.5;color:#f3f4f6;
+      background:rgba(20,24,38,.86);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+      border:1px solid rgba(255,255,255,.16);box-shadow:0 4px 16px rgba(0,0,0,.5);pointer-events:none;
+    }
     #main{margin-left:188px;height:100vh;overflow:hidden}
     iframe{width:100%;height:100%;border:none;display:none}
     iframe.active{display:block}
@@ -4558,10 +4580,11 @@ SHELL_HTML = """<!DOCTYPE html>
 <body>
   <button id="menuBtn" onclick="toggleSb()">&#9776;</button>
   <div id="sbOverlay" onclick="toggleSb()"></div>
+  <div id="toast"></div>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v8.12 / 研究用</div>
+      <div>v8.13 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -4611,6 +4634,9 @@ SHELL_HTML = """<!DOCTYPE html>
       <span class="badge">USGS</span>
     </button>
 
+    <div class="recalc-box">
+      <button id="recalcBtn" onclick="recalc()">&#8635; このタブを再計算</button>
+    </div>
     <div class="version">ETAS残差研究プロジェクト</div>
   </div>
   <div id="main">
@@ -4628,6 +4654,7 @@ SHELL_HTML = """<!DOCTYPE html>
     var URLS=['riskmap','history','etas','bvalue','faultmap','tec','gnss','pressure','snapshots'];
     var loaded=[true,false,false,false,false,false,false,false,false];
     function sw(idx){
+      curTab=idx;
       document.querySelectorAll('.tab-btn').forEach(function(b,i){b.classList.toggle('active',i===idx)});
       document.querySelectorAll('iframe').forEach(function(f,i){f.classList.toggle('active',i===idx)});
       if(!loaded[idx]){
@@ -4643,6 +4670,57 @@ SHELL_HTML = """<!DOCTYPE html>
     function closeSb(){
       document.getElementById('sidebar').classList.remove('open');
       document.getElementById('sbOverlay').classList.remove('show');
+    }
+
+    // ── 各タブの「再計算」 ──
+    var TAB_LABELS=['統合リスクマップ','地震履歴','ETASマップ','b値マップ','活断層・プレート境界','TEC','GNSS変位','海面気圧','アーカイブ'];
+    var curTab=0, recalcBusy=false, toastTimer=null;
+    function showToast(msg,ms){
+      var t=document.getElementById('toast');
+      t.textContent=msg; t.style.display='block';
+      clearTimeout(toastTimer);
+      if(ms){toastTimer=setTimeout(function(){t.style.display='none'},ms)}
+    }
+    function reloadTab(idx){
+      document.getElementById('f'+idx).src='/tab/'+URLS[idx]+'?_='+Date.now();
+      loaded[idx]=true;
+    }
+    function recalc(){
+      if(recalcBusy) return;
+      var idx=curTab, name=URLS[idx], label=TAB_LABELS[idx];
+      if(window.innerWidth<=768){closeSb()}
+      if(idx===8){
+        // アーカイブは指定日時ごとの再計算UI。タブ内の取得ボタンを同じ入力で再実行する
+        var w=document.getElementById('f8').contentWindow;
+        if(w && typeof w.runFetch==='function'){ w.runFetch(); showToast('入力中の日時で再計算します',3000); }
+        else { showToast('日時を入力して「この時点のリスクマップを取得」を押してください',4000); }
+        return;
+      }
+      var btn=document.getElementById('recalcBtn');
+      var t0=Date.now();
+      recalcBusy=true; btn.disabled=true; btn.textContent='↻ 再計算中…';
+      showToast(label+' 再計算中…');
+      function finish(ok,msg){
+        recalcBusy=false; btn.disabled=false; btn.innerHTML='&#8635; このタブを再計算';
+        if(ok){ reloadTab(idx); showToast('✓ '+label+' を再計算しました（'+msg+'）',8000); }
+        else { showToast('⚠ '+label+' の再計算に失敗: '+msg,10000); }
+      }
+      function poll(){
+        fetch('/recalc/'+name+'/status').then(function(r){return r.json()}).then(function(s){
+          if(s.running){
+            showToast(label+' 再計算中… '+Math.round((Date.now()-t0)/1000)+'秒');
+            setTimeout(poll,1500);
+          } else if(s.ok===null){
+            finish(false,'状態が不明です（サーバーが再起動した可能性があります）');
+          } else {
+            finish(s.ok,s.message);
+          }
+        }).catch(function(e){ finish(false,'状態の取得に失敗: '+e.message) });
+      }
+      fetch('/recalc/'+name,{method:'POST'}).then(function(r){
+        if(!r.ok) return r.json().then(function(e){ throw new Error(e.error||('HTTPエラー '+r.status)); });
+        return r.json();
+      }).then(poll).catch(function(e){ finish(false,e.message) });
     }
   </script>
 </body>
@@ -5161,6 +5239,189 @@ def snapshot_detail(fname):
     out["etas"]   = {f"{k[0]}_{k[1]}": v for k, v in data["etas"].items()}
     out["bvalue"] = {f"{k[0]}_{k[1]}": v for k, v in data["bvalue"].items()}
     return out
+
+# ══════════════════════════════════════════════════════
+# 手動再計算（各タブの「再計算」ボタン用）
+# ══════════════════════════════════════════════════════
+# 各タブの表示は _cached_data と各種メモリキャッシュから作られるため、計算や取得が
+# 一時的に失敗して欠損すると、次の自動更新(最大10分)まで欠損したまま残る。
+# サイドバーの「再計算」ボタンから、開いているタブ分だけをその場で作り直せるようにする。
+#
+#  ・地震データのAPI再取得はしない(p2p_jmaのレート制限で最大10分かかるため)。
+#    保存済みの data/quakes.csv から再計算する。API取得は従来どおり自動更新ループの担当。
+#  ・失敗したときは表示中のキャッシュを上書きしない(空データで置き換えない)。
+#  ・処理は別スレッドで実行し、フロントは /recalc/<name>/status をポーリングする
+#    (Renderのリクエストタイムアウトを避けるため)。
+_recalc_jobs = {}
+_recalc_jobs_lock = threading.Lock()
+_recalc_core_lock = threading.Lock()
+
+def _recalc_core_cache():
+    """保存済みquakes.csvからETAS・b値を作り直して _cached_data を更新する。
+    (地震履歴 / ETAS / b値 / 統合リスクマップの共通の土台)"""
+    global _cached_data
+    with _recalc_core_lock:
+        quakes = load_quakes()
+        if not quakes:
+            raise RuntimeError("保存済みの地震データがありません（自動更新の取得完了をお待ちください）")
+        grid_scores = analyze_etas(quakes)
+        bvalue_grid = compute_bvalue_grid(quakes)
+        if not grid_scores and not bvalue_grid:
+            raise RuntimeError("ETAS・b値の計算結果が空でした（表示中のデータは変更していません）")
+        updated_str = datetime.now(JST).strftime("%Y-%m-%d %H:%M JST") + "(手動再計算)"
+        with _cache_lock:
+            _cached_data = {"all": quakes, "etas": grid_scores, "bvalue": bvalue_grid,
+                            "updated": updated_str}
+    return f"地震{len(quakes)}件・ETAS格子{len(grid_scores)}・b値格子{len(bvalue_grid)}"
+
+def _recalc_calibration():
+    """絶対基準キャリブレーション(過去65日分のセル別プール)を今すぐ作り直す。
+    通常は6時間キャッシュで、途中で失敗した結果もその間残ってしまうため。"""
+    global _hist_calib_cache
+    if not _hist_calib_lock.acquire(blocking=False):
+        raise RuntimeError("キャリブレーションが計算中です。少し待ってからもう一度お試しください")
+    try:
+        new = _compute_historical_calibration()
+        if new["etas_cell"] is None:
+            raise RuntimeError(f"キャリブレーションのサンプルが不足しています（{new['n_samples']}時点）。以前の結果を維持しました")
+        _hist_calib_cache = new
+    finally:
+        _hist_calib_lock.release()
+    return f"キャリブレーション{new['n_samples']}時点"
+
+def _recalc_geo_data(force=False):
+    """活断層(GEM)・プレート境界データを確認し、空または force のときは取得し直す。"""
+    if force or not (_fault_cache["data"] or {}).get("features"):
+        _fault_cache["fetched_at"] = None
+    if force or not (_plate_cache["data"] or {}).get("features"):
+        _plate_cache["fetched_at"] = None
+    faults = get_japan_active_faults()
+    if _fault_cache["fetched_at"] is None or not faults.get("features"):
+        raise RuntimeError("活断層データ(GEM)の取得に失敗しました")
+    plates = get_plate_boundaries()
+    if _plate_cache["fetched_at"] is None or not (plates or {}).get("features"):
+        raise RuntimeError("プレート境界データの取得に失敗しました")
+    return f"活断層{len(faults['features'])}件"
+
+def _recalc_pressure():
+    global _amedas_cache
+    table = _fetch_amedas_table()
+    obs, label = _fetch_amedas_latest()
+    if not table or not obs:
+        raise RuntimeError("AMeDASの取得に失敗しました（表示中のデータは変更していません）")
+    _amedas_cache = {"data": {"table": table, "obs": obs, "label": label}, "ts": time.time()}
+    return f"{len(obs)}観測点・{label}"
+
+def _recalc_tec():
+    with _tec_lock:
+        before = _tec_cache["ts"]
+    update_tec_cache()
+    with _tec_lock:
+        after, grid = _tec_cache["ts"], _tec_cache["grid"]
+    if after == before or not grid:
+        raise RuntimeError("TEC画像の取得またはデコードに失敗しました（未キャリブレーションの可能性もあります）")
+    return f"{len(grid)}セル"
+
+def _recalc_gnss():
+    if not GSI_GNSS_ENABLED:
+        raise RuntimeError("GNSSが無効です（GSI_SFTP_USER / GSI_SFTP_PASS 未設定、またはparamiko未インストール）")
+    with _gnss_lock:
+        if _gnss_cache["updating"]:
+            raise RuntimeError("GNSSの更新が既に実行中です。しばらくしてからもう一度お試しください")
+    _refresh_gnss_cache()
+    with _gnss_lock:
+        n = len(_gnss_cache["data"] or [])
+        err = _gnss_cache["error"]
+    if n == 0:
+        raise RuntimeError(err or "GNSSデータを取得できませんでした")
+    return f"{n}/{len(GNSS_STATIONS)}点" + (f"（{err}）" if err else "")
+
+def _recalc_etas():
+    msg = _recalc_core_cache()          # 失敗したらここで中断
+    try:
+        msg += "・" + _recalc_calibration()
+    except Exception as e:
+        msg += f"／⚠ {e}"
+    return msg
+
+def _recalc_riskmap():
+    msg = _recalc_core_cache()          # 失敗したらここで中断
+    problems = []
+    global _fault_stress_cache, _plate_stress_cache
+    _fault_stress_cache = {"grid": None, "computed_for": None}
+    _plate_stress_cache = {"grid": None, "computed_for": None}
+
+    def _step(label, fn):
+        try:
+            fn()
+        except Exception as e:
+            print(f"[再計算/riskmap] {label}: {e}")
+            problems.append(f"{label}: {e}")
+
+    _step("活断層・プレート境界", _recalc_geo_data)
+    with _cache_lock:
+        quakes = _cached_data["all"]
+    _step("活断層の応力負荷", lambda: get_fault_stress_grid(quakes))
+    _step("プレート境界の応力負荷", lambda: get_plate_stress_grid(quakes))
+    _step("気圧", _recalc_pressure)
+    if _tec_calibrated():
+        _step("TEC", _recalc_tec)
+    _step("キャリブレーション", _recalc_calibration)   # 一番重いので最後
+    if problems:
+        msg += "／⚠ " + " / ".join(problems)
+    return msg
+
+_RECALC_HANDLERS = {
+    "riskmap":  _recalc_riskmap,
+    "history":  _recalc_core_cache,
+    "etas":     _recalc_etas,
+    "bvalue":   _recalc_core_cache,
+    "faultmap": lambda: _recalc_geo_data(force=True),
+    "tec":      _recalc_tec,
+    "gnss":     _recalc_gnss,
+    "pressure": _recalc_pressure,
+}
+
+def _recalc_job_view(job):
+    end = job["finished"] or time.time()
+    return {"running": job["running"], "ok": job["ok"], "message": job["message"],
+            "elapsed": round(end - job["started"], 1)}
+
+@app.route("/recalc/<name>", methods=["POST"])
+def recalc_start(name):
+    fn = _RECALC_HANDLERS.get(name)
+    if fn is None:
+        return {"error": "このタブは再計算に対応していません"}, 404
+    with _recalc_jobs_lock:
+        job = _recalc_jobs.get(name)
+        if job and job["running"]:
+            return {"status": "already_running", **_recalc_job_view(job)}
+        job = {"running": True, "ok": None, "message": "", "started": time.time(), "finished": None}
+        _recalc_jobs[name] = job
+
+    def _run():
+        try:
+            job["message"] = fn() or "完了"
+            job["ok"] = True
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            job["message"] = str(e) or e.__class__.__name__
+            job["ok"] = False
+        finally:
+            job["finished"] = time.time()
+            job["running"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "started"}
+
+@app.route("/recalc/<name>/status")
+def recalc_status(name):
+    with _recalc_jobs_lock:
+        job = _recalc_jobs.get(name)
+        if job is None:
+            return {"running": False, "ok": None, "message": "", "elapsed": 0}
+        return _recalc_job_view(job)
+
 
 if __name__ == "__main__":
     # ★ Bug fix (2026-08): quakes.csv の復元は、バックグラウンド更新ループが
