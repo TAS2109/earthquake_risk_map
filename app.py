@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v8.13
+地震研究統合プラットフォーム v8.14
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS / Hi-net)
@@ -668,11 +668,35 @@ def fetch_quakes_hinet():
         _hinet_status["last_error"] = str(e)
         return []
 
+_fetch_source_status_lock = threading.Lock()
+_fetch_source_status = {n: {"count": None, "felt": None, "unfelt": None, "error": None, "ts": None}
+                         for n in ("p2p", "p2p_jma", "usgs", "jma", "hinet")}
+
+def _record_fetch_source(name, quakes=None, error=None):
+    with _fetch_source_status_lock:
+        st = _fetch_source_status[name]
+        st["ts"] = time.time()
+        if error is not None:
+            st["error"] = str(error)
+            # 直前が成功していた場合でも、今回は取れなかったことが分かるよう
+            # count/felt/unfeltは更新しない（前回の内訳を残したままにする）
+            return
+        st["error"] = None
+        st["count"] = len(quakes)
+        st["unfelt"] = sum(1 for q in quakes if not str(q.get("max_int", "")).strip())
+        st["felt"] = st["count"] - st["unfelt"]
+
 def fetch_all_quakes():
     results = {}
     def _run(name, fn):
-        try: results[name] = fn()
-        except Exception as e: print(f"[fetch_all] {name} {e}"); results[name] = []
+        try:
+            r = fn()
+            results[name] = r
+            _record_fetch_source(name, quakes=r)
+        except Exception as e:
+            print(f"[fetch_all] {name} {e}")
+            results[name] = []
+            _record_fetch_source(name, error=e)
     threads = [threading.Thread(target=_run, args=(n,f), daemon=True) for n,f in
                [("p2p",     fetch_quakes_p2p),
                 ("p2p_jma", fetch_quakes_p2p_jma),
@@ -693,6 +717,7 @@ def fetch_all_quakes():
     for name in ("p2p", "p2p_jma", "usgs", "jma", "hinet"):
         if name not in results:
             print(f"[fetch_all] {name} タイムアウトで未完了のためスキップ")
+            _record_fetch_source(name, error="タイムアウトで未完了")
     all_q = (results.get("jma",[]) + results.get("p2p",[]) +
              results.get("p2p_jma",[]) + results.get("usgs",[]) +
              results.get("hinet",[]))
@@ -1382,10 +1407,15 @@ def _historical_abs_rank(raw_map, pool, invert=False, log_transform=False):
 def _cellwise_median_map(pool):
     """(v7.56) セル単位履歴プール(dict: cell_key -> 値のリスト)から、
     各セルの「平常時の中央値」を返す。断層/プレートの絶対下限フィルタで、
-    そのセル自身の平常値に対する倍率を求めるために使う。"""
+    そのセル自身の平常値に対する倍率を求めるために使う。
+    (Bug fix) _historical_abs_rank と同じ HIST_CALIB_MIN_CELL_SAMPLES 未満の
+    セルは「キャリブレーション不足」として除外する。以前はサンプル1件でも
+    中央値を採用していたため、絶対評価では未キャリブレーション扱いのセルに
+    対してもドメイン下限フィルタだけが（信頼できない中央値を基準に）機能してしまい、
+    平穏期でもLv4/5が常時大量に出る一因になっていた。"""
     if not pool:
         return {}
-    return {k: float(np.median(v)) for k, v in pool.items() if v}
+    return {k: float(np.median(v)) for k, v in pool.items() if len(v) >= HIST_CALIB_MIN_CELL_SAMPLES}
 
 def _make_etas_domain_floor(median_map, lv3_ratio=1.5, lv4_ratio=3.0):
     """(v7.56) ETAS用ドメイン下限フィルタ。以前(_etas_domain_floor)は全国一律の
@@ -1399,7 +1429,12 @@ def _make_etas_domain_floor(median_map, lv3_ratio=1.5, lv4_ratio=3.0):
     キャリブレーション未完了・新規セルなど中央値が無い場合は、従来通りEP.MUを
     暫定基準として使う（立ち上げ初期の安全弁）。"""
     def _floor(cell_key, raw_v, s):
-        base = median_map.get(cell_key, EP.MU)
+        # (Bug fix) このセルの実績と比較できない(未キャリブレーション/サンプル不足)場合は、
+        # 全国一律の値(EP.MU)にフォールバックして素通りさせず、安全側でLv3相当までに
+        # 頭打ちにする。実績と比較できて初めてLv4/5への昇格を許す。
+        if cell_key not in median_map:
+            return min(s, 0.55)
+        base = median_map[cell_key]
         ratio = raw_v / max(base, EP.MU, 1e-9)
         if ratio < lv3_ratio: return min(s, 0.55)   # Lv3相当まで
         if ratio < lv4_ratio: return min(s, 0.80)   # Lv4相当まで
@@ -1424,7 +1459,10 @@ def _make_stress_domain_floor(median_map, lv3_ratio=3.0, lv4_ratio=8.0, min_base
     のみ高スコアを許す。倍率は経験則であり、観測実績の蓄積とともに
     再チューニングする前提の暫定値。"""
     def _floor(cell_key, raw_v, s):
-        base = median_map.get(cell_key, 0.0)
+        # (Bug fix) 同上: 実績と比較できないセルは安全側でLv3相当までに頭打ちにする。
+        if cell_key not in median_map:
+            return min(s, 0.55)
+        base = median_map[cell_key]
         ratio = raw_v / max(base, min_baseline)
         if ratio < lv3_ratio: return min(s, 0.55)   # Lv3相当まで
         if ratio < lv4_ratio: return min(s, 0.80)   # Lv4相当まで
@@ -4494,7 +4532,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v8.13</title>
+  <title>地震研究統合プラットフォーム v8.14</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
@@ -4584,7 +4622,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v8.13 / 研究用</div>
+      <div>v8.14 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -4857,8 +4895,26 @@ def risk_cell_trend():
 @app.route("/status")
 def status():
     with _cache_lock:
-        return {"phase":_ready_phase,"last_update":_last_update,
-                "quakes":len(_cached_data["all"]) if _cached_data else 0}
+        all_q = _cached_data["all"] if _cached_data else []
+    by_source = {}
+    for q in all_q:
+        s = q.get("source", "?")
+        d = by_source.setdefault(s, {"count": 0, "felt": 0, "unfelt": 0})
+        d["count"] += 1
+        if str(q.get("max_int", "")).strip():
+            d["felt"] += 1
+        else:
+            d["unfelt"] += 1
+    with _fetch_source_status_lock:
+        last_fetch = {k: dict(v) for k, v in _fetch_source_status.items()}
+    for v in last_fetch.values():
+        v["ts_str"] = (datetime.fromtimestamp(v["ts"], JST).strftime("%Y-%m-%d %H:%M JST")
+                       if v["ts"] else None)
+    with _cache_lock:
+        return {"phase": _ready_phase, "last_update": _last_update,
+                "quakes": len(all_q),
+                "quakes_csv_by_source": by_source,
+                "last_fetch_by_source": last_fetch}
 
 @app.route("/gnss/status")
 def gnss_status():
@@ -5275,8 +5331,10 @@ def _recalc_core_cache():
     return f"地震{len(quakes)}件・ETAS格子{len(grid_scores)}・b値格子{len(bvalue_grid)}"
 
 def _recalc_calibration():
-    """絶対基準キャリブレーション(過去65日分のセル別プール)を今すぐ作り直す。
-    通常は6時間キャッシュで、途中で失敗した結果もその間残ってしまうため。"""
+    """絶対基準キャリブレーション(過去65日分のセル別プール)を今すぐフルで作り直す。
+    過去65日分×複数指標を再サンプリングするため数分〜規模で重い。
+    ETAS/統合リスクマップの通常の再計算からは呼ばない(下の_nudge_calibration参照)。
+    どうしても強制的にやり直したい場合のための重い専用アクション。"""
     global _hist_calib_cache
     if not _hist_calib_lock.acquire(blocking=False):
         raise RuntimeError("キャリブレーションが計算中です。少し待ってからもう一度お試しください")
@@ -5288,6 +5346,19 @@ def _recalc_calibration():
     finally:
         _hist_calib_lock.release()
     return f"キャリブレーション{new['n_samples']}時点"
+
+def _nudge_calibration():
+    """(Bug fix) ETAS/統合リスクマップの再計算を「速く」保つための軽量版。
+    キャリブレーションが古ければバックグラウンドで更新を開始しつつ、
+    重い_compute_historical_calibration()の完了は待たずに現在のキャッシュ状態を
+    そのまま報告する。以前はここで毎回フルの再計算(数分規模)を待っていたため、
+    ETAS/統合リスクマップの「再計算」ボタンが非常に遅くなっていた。"""
+    calib = _get_historical_calibration()
+    if calib.get("etas_cell") is None:
+        return f"キャリブレーション未準備（{calib.get('n_samples', 0)}時点、バックグラウンドで計算中）"
+    age_min = (time.time() - calib["ts"]) / 60 if calib.get("ts") else None
+    age_str = f"{age_min:.0f}分前" if age_min is not None else "不明"
+    return f"キャリブレーション{calib.get('n_samples', 0)}時点（{age_str}時点の結果を使用）"
 
 def _recalc_geo_data(force=False):
     """活断層(GEM)・プレート境界データを確認し、空または force のときは取得し直す。"""
@@ -5338,10 +5409,7 @@ def _recalc_gnss():
 
 def _recalc_etas():
     msg = _recalc_core_cache()          # 失敗したらここで中断
-    try:
-        msg += "・" + _recalc_calibration()
-    except Exception as e:
-        msg += f"／⚠ {e}"
+    msg += "・" + _nudge_calibration()  # (Bug fix) 待たずに現状のキャリブレーションを使う
     return msg
 
 def _recalc_riskmap():
@@ -5366,12 +5434,13 @@ def _recalc_riskmap():
     _step("気圧", _recalc_pressure)
     if _tec_calibrated():
         _step("TEC", _recalc_tec)
-    _step("キャリブレーション", _recalc_calibration)   # 一番重いので最後
+    _step("キャリブレーション", _nudge_calibration)   # (Bug fix) 待たずに現状を使う
     if problems:
         msg += "／⚠ " + " / ".join(problems)
     return msg
 
 _RECALC_HANDLERS = {
+    "calibration": _recalc_calibration,   # 明示的にフル再計算したい場合の専用アクション(重い)
     "riskmap":  _recalc_riskmap,
     "history":  _recalc_core_cache,
     "etas":     _recalc_etas,
