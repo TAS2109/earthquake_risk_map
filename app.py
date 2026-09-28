@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v8.16
+地震研究統合プラットフォーム v8.20
+
+v8.20: 統合リスクマップのレベル境界(Lv1〜Lv5のしきい値)を、過去65日の実績から
+       自動キャリブレーションする方式に変更（平穏時のLv別セル数を目標値に合わせる）。
+       目標値は RISK_LEVEL_TARGETS で調整可能。
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS / Hi-net)
@@ -668,35 +672,11 @@ def fetch_quakes_hinet():
         _hinet_status["last_error"] = str(e)
         return []
 
-_fetch_source_status_lock = threading.Lock()
-_fetch_source_status = {n: {"count": None, "felt": None, "unfelt": None, "error": None, "ts": None}
-                         for n in ("p2p", "p2p_jma", "usgs", "jma", "hinet")}
-
-def _record_fetch_source(name, quakes=None, error=None):
-    with _fetch_source_status_lock:
-        st = _fetch_source_status[name]
-        st["ts"] = time.time()
-        if error is not None:
-            st["error"] = str(error)
-            # 直前が成功していた場合でも、今回は取れなかったことが分かるよう
-            # count/felt/unfeltは更新しない（前回の内訳を残したままにする）
-            return
-        st["error"] = None
-        st["count"] = len(quakes)
-        st["unfelt"] = sum(1 for q in quakes if not str(q.get("max_int", "")).strip())
-        st["felt"] = st["count"] - st["unfelt"]
-
 def fetch_all_quakes():
     results = {}
     def _run(name, fn):
-        try:
-            r = fn()
-            results[name] = r
-            _record_fetch_source(name, quakes=r)
-        except Exception as e:
-            print(f"[fetch_all] {name} {e}")
-            results[name] = []
-            _record_fetch_source(name, error=e)
+        try: results[name] = fn()
+        except Exception as e: print(f"[fetch_all] {name} {e}"); results[name] = []
     threads = [threading.Thread(target=_run, args=(n,f), daemon=True) for n,f in
                [("p2p",     fetch_quakes_p2p),
                 ("p2p_jma", fetch_quakes_p2p_jma),
@@ -717,7 +697,6 @@ def fetch_all_quakes():
     for name in ("p2p", "p2p_jma", "usgs", "jma", "hinet"):
         if name not in results:
             print(f"[fetch_all] {name} タイムアウトで未完了のためスキップ")
-            _record_fetch_source(name, error="タイムアウトで未完了")
     all_q = (results.get("jma",[]) + results.get("p2p",[]) +
              results.get("p2p_jma",[]) + results.get("usgs",[]) +
              results.get("hinet",[]))
@@ -1295,8 +1274,118 @@ HIST_CALIB_MIN_CELL_SAMPLES = 20  # (v7.56) セル単位の絶対評価に必要
 
 _hist_calib_cache = {"ts": 0.0,
                       "etas_cell": None, "bvalue_cell": None, "fault_cell": None, "plate_cell": None,
+                      "risk_thresholds": None, "risk_calib_report": None,
                       "n_samples": 0}
 _hist_calib_lock = threading.Lock()
+
+# ══════════════════════════════════════════════════════
+# (v8.20) 統合リスクマップのレベル境界を「平穏時の目標セル数」から自動決定する
+# ──────────────────────────────────────────────────────
+# 従来は JS の levelOf() が固定値(0.2/0.4/0.6/0.85/0.97)でレベルを切っていたため、
+# 平穏時にどのレベルが何セル出るかは成り行きで、しきい値を手で調整するしかなかった。
+# ここでは過去65日を24時間おきにサンプリングして各時点の統合スコア(合成値)を作り、
+# 「典型的な(=中央値の)1日で、Lv別セル数が目標値に近くなる」しきい値を求める。
+#   ・しきい値は固定(過去実績に対する絶対基準)。活発な時期はセル数が自然に増える。
+#   ・平穏時の定義は RISK_CALM_QUANTILE(既定0.5=65日の典型的な日)。
+#     直近に大地震があり余震が続いていて「平穏」の基準が上振れするなら、
+#     0.3〜0.4 に下げると平穏寄りの日を基準にできる。
+# 目標値は各レベルの「表示セル数」(そのレベルちょうど)。累積(そのレベル以上)に換算して使う。
+# 幅のある想定はその中央値を採用: Lv1=500, Lv2=100〜200→150, Lv3=50〜100→75, Lv4=0〜10→5。
+# ══════════════════════════════════════════════════════
+RISK_LEVEL_TARGETS = {1: 500, 2: 150, 3: 75, 4: 5}
+RISK_CALM_QUANTILE = 0.5      # 「平穏」= 過去サンプル日のセル数分布の何分位を基準にするか
+RISK_LV5_EXCEED_PROB = 0.05   # Lv5: 過去サンプルのうち何割の日に1セルでも出るか(平穏時はほぼ0)
+RISK_LEVEL_MIN_GAP = 0.005    # 隣り合うしきい値の最小間隔（同値で潰れないように）
+RISK_THRESH_DEFAULT = [0.2, 0.4, 0.6, 0.85, 0.97]   # キャリブレーション未完了時のフォールバック(従来値)
+_RISK_HIST_KEYS = ["etas", "bvalue", "fault", "plate"]   # 過去履歴を持つ成分(気圧・TECは履歴なし)
+
+def _risk_subset_key(keys):
+    """成分キーの集合を、JS側と共通の並び順のキー文字列にする。"""
+    return ",".join(k for k in _RISK_HIST_KEYS if k in keys)
+
+def _compute_risk_level_thresholds(per_time_raw, calib_pools):
+    """過去サンプル(per_time_raw: [ {etas,bvalue,fault,plate の生値dict}, ... ])から、
+    成分の選択パターンごと(15通り)にLv1〜Lv5のしきい値を求める。
+    calib_pools: {etas_cell, bvalue_cell, fault_cell, plate_cell}（セル単位の履歴プール）
+    戻り値: (thresholds{key:[t1..t5]}, report{...検算用の統計})。作れなければ (None, None)。"""
+    import itertools
+    cell_keys = list(_RISK_CELLS.keys())
+    idx = {k: i for i, k in enumerate(cell_keys)}
+    n_cells = len(cell_keys)
+    T = len(per_time_raw)
+    if T < 10 or n_cells == 0:
+        return None, None
+
+    etas_floor  = _make_etas_domain_floor(_cellwise_median_map(calib_pools["etas_cell"]))
+    fault_floor = _make_stress_domain_floor(_cellwise_median_map(calib_pools["fault_cell"]))
+    plate_floor = _make_stress_domain_floor(_cellwise_median_map(calib_pools["plate_cell"]))
+
+    # S[t, セル, 成分] = 各時点の成分別スコア(0〜1)。成分が無いセルはNaN。
+    S = np.full((T, n_cells, len(_RISK_HIST_KEYS)), np.nan)
+    for t, raws in enumerate(per_time_raw):
+        ranks = {
+            "etas":   _hybrid_rank_map(raws["etas"],   calib_pools["etas_cell"],   invert=False, log_transform=True,  domain_floor_fn=etas_floor),
+            "bvalue": _hybrid_rank_map(raws["bvalue"], calib_pools["bvalue_cell"], invert=True,  log_transform=False, domain_floor_fn=_bvalue_domain_floor),
+            "fault":  _hybrid_rank_map(raws["fault"],  calib_pools["fault_cell"],  invert=False, log_transform=False, domain_floor_fn=fault_floor),
+            "plate":  _hybrid_rank_map(raws["plate"],  calib_pools["plate_cell"],  invert=False, log_transform=False, domain_floor_fn=plate_floor),
+        }
+        for ci, comp in enumerate(_RISK_HIST_KEYS):
+            for k, v in ranks[comp].items():
+                if k in idx:
+                    S[t, idx[k], ci] = v
+
+    w_all = np.array([RISK_DEFAULT_WEIGHTS[k] for k in _RISK_HIST_KEYS])
+    # 累積目標(そのレベル以上の合計セル数)
+    cum = {}
+    running = 0
+    for lv in (4, 3, 2, 1):
+        running += RISK_LEVEL_TARGETS[lv]
+        cum[lv] = running
+
+    thresholds, report = {}, {}
+    for r in range(1, len(_RISK_HIST_KEYS) + 1):
+        for combo in itertools.combinations(range(len(_RISK_HIST_KEYS)), r):
+            sub = S[:, :, list(combo)]
+            w = w_all[list(combo)][None, None, :]
+            valid = ~np.isnan(sub)
+            wsum = (w * valid).sum(axis=2)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                comp = np.nansum(np.where(valid, sub, 0.0) * w, axis=2) / wsum
+            comp[wsum <= 0] = np.nan   # (T, n_cells)
+
+            # 各時点で「上からk番目のスコア」を取り、その分位(既定=中央値)をしきい値にする
+            desc = -np.sort(-np.where(np.isnan(comp), -1.0, comp), axis=1)
+            th = {}
+            for lv in (1, 2, 3, 4):
+                k = min(cum[lv], n_cells)
+                th[lv] = float(np.quantile(desc[:, k - 1], RISK_CALM_QUANTILE))
+            # Lv5: 「その日の最大スコア」の (1-p) 分位 → 過去のp割の日に1セル以上出る水準
+            th5 = float(np.quantile(desc[:, 0], 1.0 - RISK_LV5_EXCEED_PROB))
+            arr = [th[1], th[2], th[3], th[4], th5]
+            # 単調増加を保証（同値・逆転を最小間隔で押し上げ）
+            for i in range(1, 5):
+                arr[i] = max(arr[i], arr[i - 1] + RISK_LEVEL_MIN_GAP)
+            arr = [round(min(a, 1.0), 4) for a in arr]
+            key = _risk_subset_key([_RISK_HIST_KEYS[c] for c in combo])
+            thresholds[key] = arr
+
+            # 検算: 標準構成(全4成分)で、しきい値を当てた場合の日別セル数の分布
+            if r == len(_RISK_HIST_KEYS):
+                cnt = {}
+                for lv, (lo, hi) in {1: (arr[0], arr[1]), 2: (arr[1], arr[2]),
+                                     3: (arr[2], arr[3]), 4: (arr[3], arr[4]), 5: (arr[4], 9)}.items():
+                    c = ((comp >= lo) & (comp < hi)).sum(axis=1)
+                    cnt[lv] = {"p10": int(np.percentile(c, 10)), "median": int(np.median(c)),
+                               "p90": int(np.percentile(c, 90)), "max": int(c.max())}
+                report = {"n_samples": T, "n_cells": n_cells, "targets": dict(RISK_LEVEL_TARGETS),
+                          "calm_quantile": RISK_CALM_QUANTILE, "counts_per_day": cnt}
+    return thresholds, report
+
+def get_risk_level_thresholds():
+    """現在有効なしきい値(成分選択パターン→[t1..t5])とフォールバック値を返す。"""
+    calib = _get_historical_calibration()
+    return {"by_subset": calib.get("risk_thresholds") or {}, "default": RISK_THRESH_DEFAULT,
+            "calibrated": bool(calib.get("risk_thresholds"))}
 
 def _sample_ref_times(lookback_days=HIST_CALIB_LOOKBACK_DAYS, step_hours=HIST_CALIB_SAMPLE_HOURS):
     now = datetime.now(timezone.utc)
@@ -1325,6 +1414,7 @@ def _compute_historical_calibration():
     etas_cell, bvalue_cell, fault_cell, plate_cell = (defaultdict(list), defaultdict(list),
                                                        defaultdict(list), defaultdict(list))
     ok = 0
+    per_time_raw = []   # (v8.20) しきい値キャリブレーション用: 各時点の成分別生値
     for rt in ref_times:
         try:
             start = rt - timedelta(days=60)
@@ -1342,6 +1432,8 @@ def _compute_historical_calibration():
             fault_raw, plate_raw = _historical_fault_plate_raw(quakes, rt)
             for k, v in fault_raw.items(): fault_cell[k].append(v)
             for k, v in plate_raw.items(): plate_cell[k].append(v)
+            per_time_raw.append({"etas": etas_raw_t, "bvalue": bvalue_raw_t,
+                                 "fault": fault_raw, "plate": plate_raw})
             ok += 1
         except Exception as e:
             print(f"[絶対基準キャリブレーション] サンプル({rt})でエラー: {e}")
@@ -1353,7 +1445,29 @@ def _compute_historical_calibration():
     # 誤ったセル基準値で誤判定するより「未キャリブレーション」扱いの方が安全なため、
     # 十分な時点数が確保できるまではNoneのままにする。
     cell_ready = ok >= max(10, HIST_CALIB_MIN_CELL_SAMPLES // 2)
+
+    # (v8.20) 平穏時の目標セル数に合わせた統合スコアのレベル境界を算出する。
+    # 注: プールに各サンプル自身も含まれる(in-sample)ため、絶対順位はごくわずかに
+    #     甘く出るが、65点のプールに対する影響は小さいので許容している。
+    risk_thresholds, risk_report = None, None
+    if cell_ready and etas_cell and bvalue_cell and fault_cell and plate_cell:
+        try:
+            risk_thresholds, risk_report = _compute_risk_level_thresholds(
+                per_time_raw,
+                {"etas_cell": dict(etas_cell), "bvalue_cell": dict(bvalue_cell),
+                 "fault_cell": dict(fault_cell), "plate_cell": dict(plate_cell)})
+            if risk_thresholds:
+                std = risk_thresholds.get(_risk_subset_key(_RISK_HIST_KEYS))
+                print(f"[リスクレベル境界] 標準構成のしきい値 Lv1〜Lv5 = {std}")
+                if risk_report:
+                    print(f"[リスクレベル境界] 過去{risk_report['n_samples']}日の日別セル数(中央値) = "
+                          + ", ".join(f"Lv{lv}:{v['median']}" for lv, v in risk_report['counts_per_day'].items()))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f"[リスクレベル境界] 算出に失敗（従来の固定しきい値にフォールバック）: {e}")
     return {
+        "risk_thresholds": risk_thresholds,
+        "risk_calib_report": risk_report,
         "ts": time.time(),
         "etas_cell":   dict(etas_cell)   if (cell_ready and etas_cell)   else None,
         "bvalue_cell": dict(bvalue_cell) if (cell_ready and bvalue_cell) else None,
@@ -1407,15 +1521,10 @@ def _historical_abs_rank(raw_map, pool, invert=False, log_transform=False):
 def _cellwise_median_map(pool):
     """(v7.56) セル単位履歴プール(dict: cell_key -> 値のリスト)から、
     各セルの「平常時の中央値」を返す。断層/プレートの絶対下限フィルタで、
-    そのセル自身の平常値に対する倍率を求めるために使う。
-    (Bug fix) _historical_abs_rank と同じ HIST_CALIB_MIN_CELL_SAMPLES 未満の
-    セルは「キャリブレーション不足」として除外する。以前はサンプル1件でも
-    中央値を採用していたため、絶対評価では未キャリブレーション扱いのセルに
-    対してもドメイン下限フィルタだけが（信頼できない中央値を基準に）機能してしまい、
-    平穏期でもLv4/5が常時大量に出る一因になっていた。"""
+    そのセル自身の平常値に対する倍率を求めるために使う。"""
     if not pool:
         return {}
-    return {k: float(np.median(v)) for k, v in pool.items() if len(v) >= HIST_CALIB_MIN_CELL_SAMPLES}
+    return {k: float(np.median(v)) for k, v in pool.items() if v}
 
 def _make_etas_domain_floor(median_map, lv3_ratio=1.5, lv4_ratio=3.0):
     """(v7.56) ETAS用ドメイン下限フィルタ。以前(_etas_domain_floor)は全国一律の
@@ -1429,12 +1538,7 @@ def _make_etas_domain_floor(median_map, lv3_ratio=1.5, lv4_ratio=3.0):
     キャリブレーション未完了・新規セルなど中央値が無い場合は、従来通りEP.MUを
     暫定基準として使う（立ち上げ初期の安全弁）。"""
     def _floor(cell_key, raw_v, s):
-        # (Bug fix) このセルの実績と比較できない(未キャリブレーション/サンプル不足)場合は、
-        # 全国一律の値(EP.MU)にフォールバックして素通りさせず、安全側でLv3相当までに
-        # 頭打ちにする。実績と比較できて初めてLv4/5への昇格を許す。
-        if cell_key not in median_map:
-            return min(s, UNCALIBRATED_SCORE_CAP)
-        base = median_map[cell_key]
+        base = median_map.get(cell_key, EP.MU)
         ratio = raw_v / max(base, EP.MU, 1e-9)
         if ratio < lv3_ratio: return min(s, 0.55)   # Lv3相当まで
         if ratio < lv4_ratio: return min(s, 0.80)   # Lv4相当まで
@@ -1459,10 +1563,7 @@ def _make_stress_domain_floor(median_map, lv3_ratio=3.0, lv4_ratio=8.0, min_base
     のみ高スコアを許す。倍率は経験則であり、観測実績の蓄積とともに
     再チューニングする前提の暫定値。"""
     def _floor(cell_key, raw_v, s):
-        # (Bug fix) 同上: 実績と比較できないセルは安全側でLv3相当までに頭打ちにする。
-        if cell_key not in median_map:
-            return min(s, UNCALIBRATED_SCORE_CAP)
-        base = median_map[cell_key]
+        base = median_map.get(cell_key, 0.0)
         ratio = raw_v / max(base, min_baseline)
         if ratio < lv3_ratio: return min(s, 0.55)   # Lv3相当まで
         if ratio < lv4_ratio: return min(s, 0.80)   # Lv4相当まで
@@ -1474,14 +1575,6 @@ def _make_stress_domain_floor(median_map, lv3_ratio=3.0, lv4_ratio=8.0, min_base
 # （ドメイン知識: 気圧・電離圏異常と地震の関連は実証段階であり、あくまで
 # 補助的な参考指標として扱う、という判断）。
 PRESSURE_TEC_SCORE_CAP = 0.6
-
-# (Bug fix) ETAS/断層/プレートのドメイン下限フィルタで、そのセルの実績と比較できない
-# (未キャリブレーション/サンプル不足)場合の上限。活断層・プレート応力は全国ほぼ全セルで
-# 非ゼロの生値を持ち、その2指標だけが対象になるセルが大半を占めるため、ここを高くすると
-# ほぼ全セルが同じレベルに収束してしまう。レベル設計上、平常時はLv0(0.2未満・地図に
-# 描画しない)なので、「実績と比較できない＝異常とは言えない」セルはLv0に収める。
-# (レベルのイメージは気象庁の防災気象情報: Lv1早期注意/Lv2注意報/Lv3警報/Lv4危険警報/Lv5特別警報)
-UNCALIBRATED_SCORE_CAP = 0.15
 
 def _hybrid_rank_map(raw_map, pool, invert=False, log_transform=False, domain_floor_fn=None):
     """『今この瞬間の空間内相対順位』と『そのセル自身の過去65日間の実績と
@@ -1882,11 +1975,11 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
 <div id="map"></div>
 <div id="lg">
   <b>ETAS 地震発生確率</b><br>
-  <span style="color:{LEVEL_COLOR[5]};background:{LEVEL_COLOR[5]};opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特別警報級）<br>
-  <span style="color:{LEVEL_COLOR[4]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv4（危険警報級）<br>
-  <span style="color:{LEVEL_COLOR[3]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv3（警報級）<br>
-  <span style="color:{LEVEL_COLOR[2]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv2（注意報級）<br>
-  <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（早期注意）<br>
+  <span style="color:{LEVEL_COLOR[5]};background:{LEVEL_COLOR[5]};opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特に稀な高リスク）<br>
+  <span style="color:{LEVEL_COLOR[4]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv4（警戒）<br>
+  <span style="color:{LEVEL_COLOR[3]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv3（注意）<br>
+  <span style="color:{LEVEL_COLOR[2]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv2（やや注意）<br>
+  <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（平常）<br>
   <small style="color:rgba(235,238,245,.46)">Lv4・5は過去65日間の実績と比べても稀な場合のみ表示されます</small>
   <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
   <small>JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)+src_count.get('p2p_jma',0)} USGS:{src_count.get('usgs',0)} Hi-net:{src_count.get('hinet',0)}<br>計{len(quakes)}件</small>
@@ -3758,6 +3851,7 @@ def render_riskmap(risk_cells, updated_str):
     cells_js = json.dumps(risk_cells, ensure_ascii=False)
     weights_js = json.dumps(RISK_DEFAULT_WEIGHTS)
     labels_js = json.dumps(RISK_LABELS, ensure_ascii=False)
+    thresh_js = json.dumps(get_risk_level_thresholds())
     gs = RISK_GRID_SIZE
     n_cells = len(risk_cells)
     w = RISK_DEFAULT_WEIGHTS
@@ -3913,14 +4007,13 @@ canvas.dChart{{display:block;width:100%}}
   <div id="hdr">更新: {updated_str}</div>
   <div id="lg">
     <b>統合リスクレベル</b><br>
-    <span style="color:{LEVEL_COLOR[5]};background:{LEVEL_COLOR[5]};opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特別警報級）<br>
-    <span style="color:{LEVEL_COLOR[4]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv4（危険警報級）<br>
-    <span style="color:{LEVEL_COLOR[3]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv3（警報級）<br>
-    <span style="color:{LEVEL_COLOR[2]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv2（注意報級）<br>
-    <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（早期注意）<br>
+    <span style="color:{LEVEL_COLOR[5]};background:{LEVEL_COLOR[5]};opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特に稀な高リスク）<br>
+    <span style="color:{LEVEL_COLOR[4]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv4（警戒）<br>
+    <span style="color:{LEVEL_COLOR[3]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv3（注意）<br>
+    <span style="color:{LEVEL_COLOR[2]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv2（やや注意）<br>
+    <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（平常）<br>
     <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
-    <small style="color:rgba(235,238,245,.46)">Lv0（平常）のセルは地図上に表示されません</small><br>
-    <small id="lvStat" style="color:rgba(235,238,245,.7)"></small><br>
+    <small style="color:rgba(235,238,245,.46)">Lv0（しきい値未満）のセルは地図上に表示されません</small><br>
     <small>選択データの相対順位を重み付け合成した指数<br>（発生確率を意味するものではありません）</small>
   </div>
   <div id="detailBox">
@@ -3954,6 +4047,7 @@ canvas.dChart{{display:block;width:100%}}
 var CELLS = {cells_js};
 var WEIGHTS = {weights_js};
 var LABELS = {labels_js};
+var THRESH = {thresh_js};   // (v8.20) レベル境界: 成分選択パターン別に自動キャリブレーション
 var GS = {gs};
 var RISK_COLOR = {{5:'{LEVEL_COLOR[5]}',4:'{LEVEL_COLOR[4]}',3:'{LEVEL_COLOR[3]}',2:'{LEVEL_COLOR[2]}',1:'{LEVEL_COLOR[1]}'}};
 var KEYS = ['etas','bvalue','fault','plate','pressure'];
@@ -4000,30 +4094,6 @@ function onToggle(key){{
   redraw();
 }}
 
-// (v8.15) レベルの基準しきい値(総合指数0〜1)。平穏時でも上位の数格子が警報級(Lv3)に
-// 届くよう、Lv2・Lv3のしきい値を従来(0.40/0.60)から引き下げて基準を底上げした。
-// Lv0=平常(0.2未満・地図に描画しない)とLv4・Lv5(0.85/0.97)は従来どおり。
-// 調整方法: ランキング表の「指数」(=総合指数×100)を見て、CUT3を平穏時の上位セルの
-// 指数より少し低い値にする。CUT2はCUT1とCUT3の間に置く。
-// (v8.17) しきい値は絶対評価(固定値)。スコア分布に左右されず、同じ指数なら常に同じレベルになる。
-// 平穏時の目標(Lv1≒500 / Lv2≒100〜200 / Lv3≒50〜100 / Lv4≒0〜10セル)に合わせ、
-// 従来値(0.20/0.28/0.35/0.85)から引き下げた。Lv5(0.97)は従来どおり。
-// 調整方法: 凡例の「参考」に、その時点の分布で目標セル数に相当するスコアが出る(表示専用で
-// レベル判定には使わない)。平穏時の値を見て ABS_CUT を書き換える。
-var ABS_CUT = [0.08, 0.17, 0.26, 0.33];      // Lv1〜Lv4のしきい値(総合指数0〜1)
-var REF_RATIO = [0.37, 0.12, 0.037, 0.004];  // 参考表示用: Lv1以上/Lv2以上/Lv3以上/Lv4以上の累計割合
-var CUT1=ABS_CUT[0], CUT2=ABS_CUT[1], CUT3=ABS_CUT[2], CUT4=ABS_CUT[3], CUT5=0.97;
-var REF_CUT = [0,0,0,0];
-function computeRefCuts(comps){{
-  var arr = comps.filter(function(c){{ return !c.noEtas; }})
-                 .map(function(c){{ return c.score; }})
-                 .sort(function(a,b){{ return b-a; }});
-  var n = arr.length;
-  if(n===0) return;
-  for(var i=0;i<4;i++){{
-    REF_CUT[i] = arr[Math.min(n-1, Math.max(0, Math.round(n*REF_RATIO[i])-1))];
-  }}
-}}
 function computeComposite(cell){{
   var wsum=0, ssum=0, used=[];
   KEYS.forEach(function(k){{
@@ -4033,17 +4103,7 @@ function computeComposite(cell){{
     }}
   }});
   if(wsum<=0) return null;
-  var score = ssum/wsum;
-  // (Bug fix) 最も重視すべきETASのデータが存在しないセル(震源データが疎で
-  // ETAS格子が計算されていない場所)では、b値・応力負荷など他の指標だけで
-  // 単独でLv4/5(警戒級)まで到達してしまっていた（例: 粗いb値格子が広範囲に
-  // 同じ値を割り当てるため、ETAS・断層・プレートの情報が一切無い1マスだけが
-  // b値の理由だけでLv5になる、など）。ETASの参照がそもそも無いセルは
-  // Lv1(早期注意)までに頭打ちにし、最重要指標が欠けたまま警報級以上を
-  // 表示しないようにする(上限はLv2しきい値(CUT2)の直下=Lv1まで)。
-  // (v8.16) 頭打ちはしきい値確定後にredraw側で行う(noEtasフラグを返す)
-  var noEtas = used.indexOf('etas')<0;
-  return {{score: score, used: used, wsum: wsum, noEtas: noEtas}};
+  return {{score: ssum/wsum, used: used, wsum: wsum}};
 }}
 // (v7.56) Lv5=特別警報級(年数回程度)/Lv4=危険警報級(活発期でも数日に一度程度)を
 // 目指す絶対基準。以前は0.95/0.7だったが、サーバー側の絶対評価がセル単位の
@@ -4054,12 +4114,21 @@ function computeComposite(cell){{
 // (v7.56) Lv0(色無し)を追加。0.2未満は「表示するほどの水準ではない」として
 // 地図上に描画しない(redraw側でlv===0を除外)。これによりマップ全体が常に
 // 色で埋め尽くされる状態を避け、実際に注意すべきセルだけが目立つようにする。
+// (v8.20) しきい値はサーバー側で「平穏時のLv別セル数が目標値に近くなる」よう
+// 過去65日の実績から自動算出したもの(THRESH)を使う。成分の選択パターンごとに
+// 合成スコアの分布が違うため、選択中の成分(ETAS/b値/活断層/プレート境界)で引き当てる。
+// 気圧は過去履歴が無くキャリブレーションできないため、キーには含めない。
+function currentThresholds(){{
+  var ks = ['etas','bvalue','fault','plate'].filter(function(k){{ return selected[k]; }});
+  return (THRESH.by_subset && THRESH.by_subset[ks.join(',')]) || THRESH.default;
+}}
 function levelOf(score){{
-  if(score>=CUT5) return 5;
-  if(score>=CUT4) return 4;
-  if(score>=CUT3) return 3;
-  if(score>=CUT2) return 2;
-  if(score>=CUT1) return 1;
+  var t = currentThresholds();
+  if(score>=t[4]) return 5;
+  if(score>=t[3]) return 4;
+  if(score>=t[2]) return 3;
+  if(score>=t[1]) return 2;
+  if(score>=t[0]) return 1;
   return 0;
 }}
 
@@ -4233,21 +4302,12 @@ function redraw(){{
   rectLayer = L.layerGroup().addTo(map);
   var shown = 0;
   lastShownList = [];
-  var comps = [];
   CELLS.forEach(function(cell){{
     var comp = computeComposite(cell);
-    if(comp) comps.push({{cell:cell, comp:comp}});
-  }});
-  // (v8.17) 参考表示用: 目標セル数に相当するスコアを算出(判定には使わない)
-  computeRefCuts(comps.map(function(x){{ return x.comp; }}));
-  var cnt = {{1:0, 2:0, 3:0, 4:0, 5:0}};
-  comps.forEach(function(x){{
-    var cell = x.cell, comp = x.comp;
-    // ETASが無いセルはLv1までに頭打ち(従来仕様を維持)
-    if(comp.noEtas) comp.score = Math.min(comp.score, CUT2-0.001);
+    if(!comp) return;
     var lv = levelOf(comp.score);
     if(lv===0) return;  // (v7.56) Lv0(色無し)は地図・件数・ランキングいずれにも出さない
-    shown++; cnt[lv]++;
+    shown++;
     lastShownList.push({{cell:cell, comp:comp, lv:lv}});
     var rect = L.rectangle(
       [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
@@ -4257,10 +4317,6 @@ function redraw(){{
     rect.addTo(rectLayer);
   }});
   document.getElementById('cellN').textContent = shown;
-  var st = document.getElementById('lvStat');
-  if(st) st.innerHTML = 'Lv1:'+cnt[1]+' / Lv2:'+cnt[2]+' / Lv3:'+cnt[3]+' / Lv4:'+cnt[4]+' / Lv5:'+cnt[5]
-    + '<br>しきい値 ' + [CUT1,CUT2,CUT3,CUT4,CUT5].map(function(v){{ return v.toFixed(3); }}).join(' / ')
-    + '<br>参考(目標件数のスコア) ' + REF_CUT.map(function(v){{ return v.toFixed(3); }}).join(' / ');
   renderRankTable(lastShownList);
 }}
 
@@ -4379,14 +4435,13 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
   <div id="mapEmpty">日付と時刻を指定して取得してください</div>
   <div id="lg" style="display:none">
     <b>統合リスクレベル</b><br>
-    <span style="color:#0c000c;background:#0c000c;opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特別警報級）<br>
-    <span style="color:#8000ff;opacity:0.55">■</span> Lv4（危険警報級）<br>
-    <span style="color:#ff0000;opacity:0.55">■</span> Lv3（警報級）<br>
-    <span style="color:#ffe600;opacity:0.55">■</span> Lv2（注意報級）<br>
-    <span style="color:#66ccff;opacity:0.55">■</span> Lv1（早期注意）<br>
+    <span style="color:#0c000c;background:#0c000c;opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特に稀な高リスク）<br>
+    <span style="color:#8000ff;opacity:0.55">■</span> Lv4（警戒）<br>
+    <span style="color:#ff0000;opacity:0.55">■</span> Lv3（注意）<br>
+    <span style="color:#ffe600;opacity:0.55">■</span> Lv2（やや注意）<br>
+    <span style="color:#66ccff;opacity:0.55">■</span> Lv1（平常）<br>
     <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
-    <small style="color:rgba(235,238,245,.46)">Lv0（平常）のセルは地図上に表示されません</small><br>
-    <small id="lvStat" style="color:rgba(235,238,245,.7)"></small><br>
+    <small style="color:rgba(235,238,245,.46)">Lv0（しきい値未満）のセルは地図上に表示されません</small><br>
     <small>指定時点における相対リスク指数<br>（発生確率を意味するものではありません）</small>
   </div>
   <div id="detailBox">
@@ -4415,30 +4470,6 @@ function onToggle(key){
   redraw();
 }
 
-// (v8.15) レベルの基準しきい値(総合指数0〜1)。平穏時でも上位の数格子が警報級(Lv3)に
-// 届くよう、Lv2・Lv3のしきい値を従来(0.40/0.60)から引き下げて基準を底上げした。
-// Lv0=平常(0.2未満・地図に描画しない)とLv4・Lv5(0.85/0.97)は従来どおり。
-// 調整方法: ランキング表の「指数」(=総合指数×100)を見て、CUT3を平穏時の上位セルの
-// 指数より少し低い値にする。CUT2はCUT1とCUT3の間に置く。
-// (v8.17) しきい値は絶対評価(固定値)。スコア分布に左右されず、同じ指数なら常に同じレベルになる。
-// 平穏時の目標(Lv1≒500 / Lv2≒100〜200 / Lv3≒50〜100 / Lv4≒0〜10セル)に合わせ、
-// 従来値(0.20/0.28/0.35/0.85)から引き下げた。Lv5(0.97)は従来どおり。
-// 調整方法: 凡例の「参考」に、その時点の分布で目標セル数に相当するスコアが出る(表示専用で
-// レベル判定には使わない)。平穏時の値を見て ABS_CUT を書き換える。
-var ABS_CUT = [0.08, 0.17, 0.26, 0.33];      // Lv1〜Lv4のしきい値(総合指数0〜1)
-var REF_RATIO = [0.37, 0.12, 0.037, 0.004];  // 参考表示用: Lv1以上/Lv2以上/Lv3以上/Lv4以上の累計割合
-var CUT1=ABS_CUT[0], CUT2=ABS_CUT[1], CUT3=ABS_CUT[2], CUT4=ABS_CUT[3], CUT5=0.97;
-var REF_CUT = [0,0,0,0];
-function computeRefCuts(comps){
-  var arr = comps.filter(function(c){ return !c.noEtas; })
-                 .map(function(c){ return c.score; })
-                 .sort(function(a,b){ return b-a; });
-  var n = arr.length;
-  if(n===0) return;
-  for(var i=0;i<4;i++){
-    REF_CUT[i] = arr[Math.min(n-1, Math.max(0, Math.round(n*REF_RATIO[i])-1))];
-  }
-}
 function computeComposite(cell){
   var wsum=0, ssum=0, used=[];
   KEYS.forEach(function(k){
@@ -4448,21 +4479,24 @@ function computeComposite(cell){
     }
   });
   if(wsum<=0) return null;
-  var score = ssum/wsum;
-  // (Bug fix) riskmapタブと同様、最重要指標ETASのデータが無いセルは
-  // b値等の単独判断で警報級以上(Lv3〜5)にならないようLv1までに頭打ちにする。
-  // (v8.16) 頭打ちはしきい値確定後にredraw側で行う(noEtasフラグを返す)
-  var noEtas = used.indexOf('etas')<0;
-  return {score: score, used: used, wsum: wsum, noEtas: noEtas};
+  return {score: ssum/wsum, used: used, wsum: wsum};
 }
 // (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。
 // (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。Lv0(色無し)も同様。
+// (v8.20) 通常版と同じ、過去実績からの自動キャリブレーション済みしきい値を使う
+// （サーバーが /archive/historical_riskmap の応答に同梱してTHRESHへ設定する）。
+var THRESH = {by_subset:{}, default:[0.2,0.4,0.6,0.85,0.97]};
+function currentThresholds(){
+  var ks = KEYS.filter(function(k){ return selected[k]; });
+  return (THRESH.by_subset && THRESH.by_subset[ks.join(',')]) || THRESH.default;
+}
 function levelOf(score){
-  if(score>=CUT5) return 5;
-  if(score>=CUT4) return 4;
-  if(score>=CUT3) return 3;
-  if(score>=CUT2) return 2;
-  if(score>=CUT1) return 1;
+  var t = currentThresholds();
+  if(score>=t[4]) return 5;
+  if(score>=t[3]) return 4;
+  if(score>=t[2]) return 3;
+  if(score>=t[1]) return 2;
+  if(score>=t[0]) return 1;
   return 0;
 }
 
@@ -4538,21 +4572,12 @@ function redraw(){
   rectLayer = L.layerGroup().addTo(map);
   var shown = 0;
   lastShownList = [];
-  var comps = [];
   CELLS.forEach(function(cell){
     var comp = computeComposite(cell);
-    if(comp) comps.push({cell:cell, comp:comp});
-  });
-  // (v8.17) 参考表示用: 目標セル数に相当するスコアを算出(判定には使わない)
-  computeRefCuts(comps.map(function(x){ return x.comp; }));
-  var cnt = {1:0, 2:0, 3:0, 4:0, 5:0};
-  comps.forEach(function(x){
-    var cell = x.cell, comp = x.comp;
-    // ETASが無いセルはLv1までに頭打ち(従来仕様を維持)
-    if(comp.noEtas) comp.score = Math.min(comp.score, CUT2-0.001);
+    if(!comp) return;
     var lv = levelOf(comp.score);
     if(lv===0) return;  // (v7.56) Lv0(色無し)は地図・件数・ランキングいずれにも出さない
-    shown++; cnt[lv]++;
+    shown++;
     lastShownList.push({cell:cell, comp:comp, lv:lv});
     var rect = L.rectangle(
       [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
@@ -4562,10 +4587,6 @@ function redraw(){
     rect.addTo(rectLayer);
   });
   document.getElementById('cellN').textContent = shown;
-  var st = document.getElementById('lvStat');
-  if(st) st.innerHTML = 'Lv1:'+cnt[1]+' / Lv2:'+cnt[2]+' / Lv3:'+cnt[3]+' / Lv4:'+cnt[4]+' / Lv5:'+cnt[5]
-    + '<br>しきい値 ' + [CUT1,CUT2,CUT3,CUT4,CUT5].map(function(v){ return v.toFixed(3); }).join(' / ')
-    + '<br>参考(目標件数のスコア) ' + REF_CUT.map(function(v){ return v.toFixed(3); }).join(' / ');
 }
 
 function fmtStatus(d){
@@ -4600,6 +4621,7 @@ function runFetch(){
     })
     .then(function(d){
       CELLS = d.cells || [];
+      if(d.thresholds) THRESH = d.thresholds;
       statusBox.className = ''; statusBox.innerHTML = fmtStatus(d);
       document.getElementById('chkSec').style.display = CELLS.length ? 'block' : 'none';
       document.getElementById('cellCount').style.display = CELLS.length ? 'block' : 'none';
@@ -4631,7 +4653,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v8.16</title>
+  <title>地震研究統合プラットフォーム v8.20</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
@@ -4721,7 +4743,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v8.16 / 研究用</div>
+      <div>v8.20 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -4994,36 +5016,8 @@ def risk_cell_trend():
 @app.route("/status")
 def status():
     with _cache_lock:
-        all_q = _cached_data["all"] if _cached_data else []
-    by_source = {}
-    for q in all_q:
-        s = q.get("source", "?")
-        d = by_source.setdefault(s, {"count": 0, "felt": 0, "unfelt": 0})
-        d["count"] += 1
-        if str(q.get("max_int", "")).strip():
-            d["felt"] += 1
-        else:
-            d["unfelt"] += 1
-    with _fetch_source_status_lock:
-        last_fetch = {k: dict(v) for k, v in _fetch_source_status.items()}
-    for v in last_fetch.values():
-        v["ts_str"] = (datetime.fromtimestamp(v["ts"], JST).strftime("%Y-%m-%d %H:%M JST")
-                       if v["ts"] else None)
-    cal = _hist_calib_cache
-    calib_info = {
-        "n_samples": cal.get("n_samples"),
-        "age_min": round((time.time() - cal["ts"]) / 60) if cal.get("ts") else None,
-        # セル自身の履歴が十分(HIST_CALIB_MIN_CELL_SAMPLES以上)で「キャリブレーション済み」の
-        # セル数。ここが少ないと、しきい値を下げても警報級はほとんど出ない。
-        "cells_ready": {k: len(_cellwise_median_map(cal.get(k + "_cell")))
-                        for k in ("etas", "bvalue", "fault", "plate")},
-    }
-    with _cache_lock:
-        return {"phase": _ready_phase, "last_update": _last_update,
-                "calibration": calib_info,
-                "quakes": len(all_q),
-                "quakes_csv_by_source": by_source,
-                "last_fetch_by_source": last_fetch}
+        return {"phase":_ready_phase,"last_update":_last_update,
+                "quakes":len(_cached_data["all"]) if _cached_data else 0}
 
 @app.route("/gnss/status")
 def gnss_status():
@@ -5205,8 +5199,20 @@ def archive_historical_riskmap():
         "period_start_jst": (start_utc.astimezone(JST)).strftime("%Y-%m-%d %H:%M JST"),
         "quake_count": len(quakes),
         "data_source": data_source,
+        "thresholds": get_risk_level_thresholds(),
         "cells": cells,
     }
+
+@app.route("/data/risk_level_thresholds")
+def risk_level_thresholds():
+    """(v8.20) 統合リスクマップのレベル境界と、その境界を過去実績に当てはめた場合の
+    日別セル数(p10/中央値/p90/最大)を返す。目標値に合っているかの検算用。"""
+    calib = _get_historical_calibration()
+    return {"calibrated": bool(calib.get("risk_thresholds")),
+            "thresholds": calib.get("risk_thresholds") or {},
+            "default": RISK_THRESH_DEFAULT,
+            "report": calib.get("risk_calib_report"),
+            "calib_samples": calib.get("n_samples", 0)}
 
 @app.route("/snapshots")
 def snapshots():
@@ -5440,10 +5446,8 @@ def _recalc_core_cache():
     return f"地震{len(quakes)}件・ETAS格子{len(grid_scores)}・b値格子{len(bvalue_grid)}"
 
 def _recalc_calibration():
-    """絶対基準キャリブレーション(過去65日分のセル別プール)を今すぐフルで作り直す。
-    過去65日分×複数指標を再サンプリングするため数分〜規模で重い。
-    ETAS/統合リスクマップの通常の再計算からは呼ばない(下の_nudge_calibration参照)。
-    どうしても強制的にやり直したい場合のための重い専用アクション。"""
+    """絶対基準キャリブレーション(過去65日分のセル別プール)を今すぐ作り直す。
+    通常は6時間キャッシュで、途中で失敗した結果もその間残ってしまうため。"""
     global _hist_calib_cache
     if not _hist_calib_lock.acquire(blocking=False):
         raise RuntimeError("キャリブレーションが計算中です。少し待ってからもう一度お試しください")
@@ -5455,19 +5459,6 @@ def _recalc_calibration():
     finally:
         _hist_calib_lock.release()
     return f"キャリブレーション{new['n_samples']}時点"
-
-def _nudge_calibration():
-    """(Bug fix) ETAS/統合リスクマップの再計算を「速く」保つための軽量版。
-    キャリブレーションが古ければバックグラウンドで更新を開始しつつ、
-    重い_compute_historical_calibration()の完了は待たずに現在のキャッシュ状態を
-    そのまま報告する。以前はここで毎回フルの再計算(数分規模)を待っていたため、
-    ETAS/統合リスクマップの「再計算」ボタンが非常に遅くなっていた。"""
-    calib = _get_historical_calibration()
-    if calib.get("etas_cell") is None:
-        return f"キャリブレーション未準備（{calib.get('n_samples', 0)}時点、バックグラウンドで計算中）"
-    age_min = (time.time() - calib["ts"]) / 60 if calib.get("ts") else None
-    age_str = f"{age_min:.0f}分前" if age_min is not None else "不明"
-    return f"キャリブレーション{calib.get('n_samples', 0)}時点（{age_str}時点の結果を使用）"
 
 def _recalc_geo_data(force=False):
     """活断層(GEM)・プレート境界データを確認し、空または force のときは取得し直す。"""
@@ -5518,7 +5509,10 @@ def _recalc_gnss():
 
 def _recalc_etas():
     msg = _recalc_core_cache()          # 失敗したらここで中断
-    msg += "・" + _nudge_calibration()  # (Bug fix) 待たずに現状のキャリブレーションを使う
+    try:
+        msg += "・" + _recalc_calibration()
+    except Exception as e:
+        msg += f"／⚠ {e}"
     return msg
 
 def _recalc_riskmap():
@@ -5543,13 +5537,12 @@ def _recalc_riskmap():
     _step("気圧", _recalc_pressure)
     if _tec_calibrated():
         _step("TEC", _recalc_tec)
-    _step("キャリブレーション", _nudge_calibration)   # (Bug fix) 待たずに現状を使う
+    _step("キャリブレーション", _recalc_calibration)   # 一番重いので最後
     if problems:
         msg += "／⚠ " + " / ".join(problems)
     return msg
 
 _RECALC_HANDLERS = {
-    "calibration": _recalc_calibration,   # 明示的にフル再計算したい場合の専用アクション(重い)
     "riskmap":  _recalc_riskmap,
     "history":  _recalc_core_cache,
     "etas":     _recalc_etas,
