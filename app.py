@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v8.20
+地震研究統合プラットフォーム v8.21
 
 v8.20: 統合リスクマップのレベル境界(Lv1〜Lv5のしきい値)を、過去65日の実績から
        自動キャリブレーションする方式に変更（平穏時のLv別セル数を目標値に合わせる）。
        目標値は RISK_LEVEL_TARGETS で調整可能。
+v8.21: 統合リスクマップのスコアから「今この瞬間の全セル間の相対順位」を完全に除去し、
+       そのセル自身の過去実績との比較(絶対評価)のみにした。相対順位は最上位セルが必ず
+       1.0(=総合100)になる構造だったため。同時に、履歴が薄いセルの相対評価への
+       フォールバックを廃止し、キャリブレーション未完了時は表示を保留する。
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS / Hi-net)
@@ -1279,7 +1283,7 @@ _hist_calib_cache = {"ts": 0.0,
 _hist_calib_lock = threading.Lock()
 
 # ══════════════════════════════════════════════════════
-# (v8.20) 統合リスクマップのレベル境界を「平穏時の目標セル数」から自動決定する
+# (v8.21) 統合リスクマップのレベル境界を「平穏時の目標セル数」から自動決定する
 # ──────────────────────────────────────────────────────
 # 従来は JS の levelOf() が固定値(0.2/0.4/0.6/0.85/0.97)でレベルを切っていたため、
 # 平穏時にどのレベルが何セル出るかは成り行きで、しきい値を手で調整するしかなかった。
@@ -1324,10 +1328,10 @@ def _compute_risk_level_thresholds(per_time_raw, calib_pools):
     S = np.full((T, n_cells, len(_RISK_HIST_KEYS)), np.nan)
     for t, raws in enumerate(per_time_raw):
         ranks = {
-            "etas":   _hybrid_rank_map(raws["etas"],   calib_pools["etas_cell"],   invert=False, log_transform=True,  domain_floor_fn=etas_floor),
-            "bvalue": _hybrid_rank_map(raws["bvalue"], calib_pools["bvalue_cell"], invert=True,  log_transform=False, domain_floor_fn=_bvalue_domain_floor),
-            "fault":  _hybrid_rank_map(raws["fault"],  calib_pools["fault_cell"],  invert=False, log_transform=False, domain_floor_fn=fault_floor),
-            "plate":  _hybrid_rank_map(raws["plate"],  calib_pools["plate_cell"],  invert=False, log_transform=False, domain_floor_fn=plate_floor),
+            "etas":   _absolute_rank_map(raws["etas"],   calib_pools["etas_cell"],   invert=False, log_transform=True,  domain_floor_fn=etas_floor, loo=True),
+            "bvalue": _absolute_rank_map(raws["bvalue"], calib_pools["bvalue_cell"], invert=True,  log_transform=False, domain_floor_fn=_bvalue_domain_floor, loo=True),
+            "fault":  _absolute_rank_map(raws["fault"],  calib_pools["fault_cell"],  invert=False, log_transform=False, domain_floor_fn=fault_floor, loo=True),
+            "plate":  _absolute_rank_map(raws["plate"],  calib_pools["plate_cell"],  invert=False, log_transform=False, domain_floor_fn=plate_floor, loo=True),
         }
         for ci, comp in enumerate(_RISK_HIST_KEYS):
             for k, v in ranks[comp].items():
@@ -1349,9 +1353,12 @@ def _compute_risk_level_thresholds(per_time_raw, calib_pools):
             w = w_all[list(combo)][None, None, :]
             valid = ~np.isnan(sub)
             wsum = (w * valid).sum(axis=2)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                comp = np.nansum(np.where(valid, sub, 0.0) * w, axis=2) / wsum
-            comp[wsum <= 0] = np.nan   # (T, n_cells)
+            # (v8.21) 選択した成分のうちそのセルに無いものは中立値0.5として扱う（JS側と同じ）。
+            # 成分が1つしか無いセルの総合値がその成分の順位そのままになり、極端値
+            # (上限99など)に張り付いて「必ず最上位が出る」状態になるのを防ぐ。
+            filled = np.where(valid, sub, RISK_NEUTRAL_SCORE)
+            comp = (filled * w).sum(axis=2) / w.sum()
+            comp[wsum <= 0] = np.nan   # 1成分も評価できないセルは対象外  (T, n_cells)
 
             # 各時点で「上からk番目のスコア」を取り、その分位(既定=中央値)をしきい値にする
             desc = -np.sort(-np.where(np.isnan(comp), -1.0, comp), axis=1)
@@ -1365,7 +1372,7 @@ def _compute_risk_level_thresholds(per_time_raw, calib_pools):
             # 単調増加を保証（同値・逆転を最小間隔で押し上げ）
             for i in range(1, 5):
                 arr[i] = max(arr[i], arr[i - 1] + RISK_LEVEL_MIN_GAP)
-            arr = [round(min(a, 1.0), 4) for a in arr]
+            arr = [round(min(a, RISK_SCORE_MAX), 4) for a in arr]
             key = _risk_subset_key([_RISK_HIST_KEYS[c] for c in combo])
             thresholds[key] = arr
 
@@ -1385,7 +1392,8 @@ def get_risk_level_thresholds():
     """現在有効なしきい値(成分選択パターン→[t1..t5])とフォールバック値を返す。"""
     calib = _get_historical_calibration()
     return {"by_subset": calib.get("risk_thresholds") or {}, "default": RISK_THRESH_DEFAULT,
-            "calibrated": bool(calib.get("risk_thresholds"))}
+            "calibrated": bool(calib.get("risk_thresholds")),
+            "n_samples": calib.get("n_samples", 0)}
 
 def _sample_ref_times(lookback_days=HIST_CALIB_LOOKBACK_DAYS, step_hours=HIST_CALIB_SAMPLE_HOURS):
     now = datetime.now(timezone.utc)
@@ -1414,7 +1422,7 @@ def _compute_historical_calibration():
     etas_cell, bvalue_cell, fault_cell, plate_cell = (defaultdict(list), defaultdict(list),
                                                        defaultdict(list), defaultdict(list))
     ok = 0
-    per_time_raw = []   # (v8.20) しきい値キャリブレーション用: 各時点の成分別生値
+    per_time_raw = []   # (v8.21) しきい値キャリブレーション用: 各時点の成分別生値
     for rt in ref_times:
         try:
             start = rt - timedelta(days=60)
@@ -1446,7 +1454,7 @@ def _compute_historical_calibration():
     # 十分な時点数が確保できるまではNoneのままにする。
     cell_ready = ok >= max(10, HIST_CALIB_MIN_CELL_SAMPLES // 2)
 
-    # (v8.20) 平穏時の目標セル数に合わせた統合スコアのレベル境界を算出する。
+    # (v8.21) 平穏時の目標セル数に合わせた統合スコアのレベル境界を算出する。
     # 注: プールに各サンプル自身も含まれる(in-sample)ため、絶対順位はごくわずかに
     #     甘く出るが、65点のプールに対する影響は小さいので許容している。
     risk_thresholds, risk_report = None, None
@@ -1592,6 +1600,80 @@ def _hybrid_rank_map(raw_map, pool, invert=False, log_transform=False, domain_fl
             s = domain_floor_fn(k, raw_map[k], s)
         out[k] = s
     return out
+
+
+# ══════════════════════════════════════════════════════
+# (v8.21) 統合リスクマップ用: 純粋な絶対評価スコア
+# ──────────────────────────────────────────────────────
+# 旧 _hybrid_rank_map は min(今の全セル間の相対順位, 自セル履歴に対する絶対順位) を
+# 採っていた。相対順位は定義上「最上位セルが必ず1.0」になるため、成分(ETAS・b値・
+# 活断層・プレート)の最上位が同じセルに重なると、絶対評価のはずの総合値が
+# 平穏時でも常に100のセルが出てしまっていた。また、履歴が薄いセルは相対順位に
+# フォールバックしていたため、そこでも必ず1.0が出る構造だった。
+# ここでは相対順位を一切使わず、「そのセル自身の過去実績の中での位置」だけを使う。
+#   ・順位は (件数+0.5)/(n+1) のプロッティングポジション。過去65点では最大でも
+#     約0.992で、1.0には決してならない（65点の経験分布では『確実に史上最大』とは
+#     言い切れないため）。さらに RISK_SCORE_MAX で頭打ちにする。
+#   ・過去値と同値のときは中央順位(タイは半分)で扱い、変化が無いのに高スコアに
+#     張り付くことを防ぐ。
+#   ・履歴が HIST_CALIB_MIN_CELL_SAMPLES 件未満のセル・成分は評価せず除外する
+#     （総合スコアは残りの成分で再正規化される）。
+#   ・過去サンプル自身のスコアを求めるとき(loo=True)は、そのサンプルをプールから
+#     除いて(leave-one-out)順位を出す。ライブの値はプールに含まれないため、
+#     境界の算出時とライブ表示時で条件を揃えるため。
+# ══════════════════════════════════════════════════════
+RISK_SCORE_MAX = 0.99
+RISK_NEUTRAL_SCORE = 0.5   # 履歴のあるはずの成分がそのセルに無い場合に補う中立スコア
+
+def _abs_rank_value(hist, v, invert, log_transform, loo=False):
+    """1セル分: 履歴(hist)に対する値vの絶対順位(0〜RISK_SCORE_MAX)。作れなければNone。"""
+    n = len(hist)
+    if loo:
+        n -= 1
+    if n < HIST_CALIB_MIN_CELL_SAMPLES:
+        return None
+    hist_arr = np.asarray(hist, dtype=float)
+    ref = np.log(np.clip(hist_arr, 0, None) + 1) if log_transform else hist_arr
+    ref_sorted = np.sort(ref)
+    x = math.log(max(v, 0) + 1) if log_transform else v
+    lo = np.searchsorted(ref_sorted, x, side="left")
+    hi = np.searchsorted(ref_sorted, x, side="right")
+    c = (lo + hi - 1) / 2.0 if loo else (lo + hi) / 2.0    # タイは中央順位
+    rank = (c + 0.5) / (n + 1)
+    if invert:
+        rank = 1.0 - rank
+    return float(min(max(rank, 0.0), RISK_SCORE_MAX))
+
+def _absolute_rank_map(raw_map, pool, invert=False, log_transform=False,
+                       domain_floor_fn=None, loo=False):
+    """raw_mapの各セルを『そのセル自身の過去実績の中での位置』(絶対評価)のみでスコア化する。
+    履歴の無い/薄いセルは結果に含めない(=相対評価へのフォールバックはしない)。"""
+    out = {}
+    if not raw_map or not pool:
+        return out
+    for k, v in raw_map.items():
+        hist = pool.get(k)
+        if hist is None:
+            continue
+        s = _abs_rank_value(hist, v, invert, log_transform, loo=loo)
+        if s is None:
+            continue
+        if domain_floor_fn is not None:
+            s = domain_floor_fn(k, v, s)
+        out[k] = min(s, RISK_SCORE_MAX)
+    return out
+
+def _abs_score_single(cell_key, v, pool, invert, log_transform, floor_maker):
+    """1セル・1値だけの絶対スコア（推移グラフ用。全セル計算を避ける）。"""
+    if not pool or cell_key not in pool:
+        return None
+    s = _abs_rank_value(pool[cell_key], v, invert, log_transform)
+    if s is None:
+        return None
+    if floor_maker is not None:
+        med = {cell_key: float(np.median(pool[cell_key]))}
+        s = floor_maker(med)(cell_key, v, s)
+    return min(s, RISK_SCORE_MAX)
 
 
 # ══════════════════════════════════════════════════════
@@ -3654,6 +3736,10 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid, quakes):
     """統合リスクマップ用に、各データソースのセルごとの正規化スコア(0〜1)と
     元データ値をまとめたセル一覧を返す。重み付け合成はフロントエンド(JS)側で行い、
     チェックボックスの選択変更に即座に反映できるようにする。"""
+    # (v8.21) 絶対基準(過去65日のセル別実績)が未完成のときは相対評価で代用せず、
+    # 表示を保留する（相対評価は最上位セルが必ず100になるため）。
+    if not _get_historical_calibration().get("risk_thresholds"):
+        return []
     etas_raw     = _risk_etas_raw(etas_grid_scores)
     bvalue_raw   = _risk_bvalue_raw(bvalue_grid)
     fault_raw    = get_fault_stress_grid(quakes)
@@ -3672,13 +3758,13 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid, quakes):
     # そのセル自身の平常時中央値に対する倍率フィルタ(_make_etas_domain_floor /
     # _make_stress_domain_floor)を適用し、「元々活発な/近い地域だから高スコア」
     # ではなく「自セルの平常値から逸脱したから高スコア」という真の絶対評価にする。
-    etas_rank     = _hybrid_rank_map(etas_raw, calib.get("etas_cell"), invert=False, log_transform=True,
+    etas_rank     = _absolute_rank_map(etas_raw, calib.get("etas_cell"), invert=False, log_transform=True,
                                       domain_floor_fn=_make_etas_domain_floor(_cellwise_median_map(calib.get("etas_cell"))))
-    bvalue_rank   = _hybrid_rank_map(bvalue_raw, calib.get("bvalue_cell"), invert=True,
+    bvalue_rank   = _absolute_rank_map(bvalue_raw, calib.get("bvalue_cell"), invert=True,
                                       log_transform=False, domain_floor_fn=_bvalue_domain_floor)
-    fault_rank    = _hybrid_rank_map(fault_raw, calib.get("fault_cell"), invert=False, log_transform=False,
+    fault_rank    = _absolute_rank_map(fault_raw, calib.get("fault_cell"), invert=False, log_transform=False,
                                       domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("fault_cell"))))
-    plate_rank    = _hybrid_rank_map(plate_raw, calib.get("plate_cell"), invert=False, log_transform=False,
+    plate_rank    = _absolute_rank_map(plate_raw, calib.get("plate_cell"), invert=False, log_transform=False,
                                       domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("plate_cell"))))
     pressure_rank = {k: min(v, PRESSURE_TEC_SCORE_CAP)
                       for k, v in _percentile_rank_map(pressure_raw, invert=False).items()}
@@ -3700,7 +3786,9 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid, quakes):
             comp["pressure"] = {"s": round(pressure_rank[key], 4), "r": round(pressure_raw[key], 2)}
         if key in tec_rank:
             comp["tec"] = {"s": round(tec_rank[key], 4), "r": round(tec_raw[key], 2)}
-        if comp:
+        # 過去履歴に基づく成分(ETAS/b値/活断層/プレート)が1つも無いセルは、絶対評価が
+        # できないため出さない（気圧・TECだけでは表示しない）
+        if any(k in comp for k in _RISK_HIST_KEYS):
             cells.append({"lat": round(lat, 3), "lon": round(lon, 3), "c": comp})
     return cells
 
@@ -3743,13 +3831,13 @@ def compute_risk_grid_historical(quakes, ref_time):
     # 意味がぶれないようにする。
     calib = _get_historical_calibration()
     # (v7.56) 通常版(compute_risk_grid)と同じくセル単位絶対評価プールを使用。
-    etas_rank   = _hybrid_rank_map(etas_raw, calib.get("etas_cell"), invert=False, log_transform=True,
+    etas_rank   = _absolute_rank_map(etas_raw, calib.get("etas_cell"), invert=False, log_transform=True,
                                     domain_floor_fn=_make_etas_domain_floor(_cellwise_median_map(calib.get("etas_cell"))))
-    bvalue_rank = _hybrid_rank_map(bvalue_raw, calib.get("bvalue_cell"), invert=True,
+    bvalue_rank = _absolute_rank_map(bvalue_raw, calib.get("bvalue_cell"), invert=True,
                                     log_transform=False, domain_floor_fn=_bvalue_domain_floor)
-    fault_rank  = _hybrid_rank_map(fault_raw, calib.get("fault_cell"), invert=False, log_transform=False,
+    fault_rank  = _absolute_rank_map(fault_raw, calib.get("fault_cell"), invert=False, log_transform=False,
                                     domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("fault_cell"))))
-    plate_rank  = _hybrid_rank_map(plate_raw, calib.get("plate_cell"), invert=False, log_transform=False,
+    plate_rank  = _absolute_rank_map(plate_raw, calib.get("plate_cell"), invert=False, log_transform=False,
                                     domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("plate_cell"))))
 
     cells = []
@@ -3791,13 +3879,21 @@ def compute_risk_trend_for_cell(gi, gj, selected_keys):
     # 過去168時点それぞれについて全地震データを再フィルタ・再計算するのは重いため、
     # ここでは従来と同様に「現在の応力負荷」を全期間の推移に使い回す簡易実装とする
     # （推移グラフ上のfault/plate成分は常に最新値になる）。
-    fault_rank_all = plate_rank_all = {}
+    # (v8.21) マップ本体と同じ「そのセル自身の過去実績に対する絶対評価」に統一する
+    # (旧: 全セル間の相対順位。最上位セルが常に100になる原因の一つだった)。
+    calib = _get_historical_calibration()
+    key = (gi, gj)
+    fault_score = plate_score = None
     if "fault" in selected or "plate" in selected:
         quakes_now = load_quakes()
     if "fault" in selected:
-        fault_rank_all = _percentile_rank_map(get_fault_stress_grid(quakes_now), invert=False)
+        fv = get_fault_stress_grid(quakes_now).get(key)
+        if fv is not None:
+            fault_score = _abs_score_single(key, fv, calib.get("fault_cell"), False, False, _make_stress_domain_floor)
     if "plate" in selected:
-        plate_rank_all = _percentile_rank_map(get_plate_stress_grid(quakes_now), invert=False)
+        pv = get_plate_stress_grid(quakes_now).get(key)
+        if pv is not None:
+            plate_score = _abs_score_single(key, pv, calib.get("plate_cell"), False, False, _make_stress_domain_floor)
 
     fnames = list_snapshots()  # 新しい順
     fnames = list(reversed(fnames[:RISK_TREND_MAX_POINTS]))  # 古い→新しい、直近分のみ
@@ -3809,21 +3905,27 @@ def compute_risk_trend_for_cell(gi, gj, selected_keys):
             continue
         comp = {}
         if "etas" in selected:
-            etas_rank = _percentile_rank_map(_risk_etas_raw(snap["etas"]), invert=False)
-            if (gi, gj) in etas_rank:
-                comp["etas"] = etas_rank[(gi, gj)]
+            ev = _risk_etas_raw(snap["etas"]).get(key)
+            if ev is not None:
+                s = _abs_score_single(key, ev, calib.get("etas_cell"), False, True, _make_etas_domain_floor)
+                if s is not None:
+                    comp["etas"] = s
         if "bvalue" in selected:
-            bvalue_rank = _percentile_rank_map(_risk_bvalue_raw(snap["bvalue"]), invert=True)
-            if (gi, gj) in bvalue_rank:
-                comp["bvalue"] = bvalue_rank[(gi, gj)]
-        if (gi, gj) in fault_rank_all:
-            comp["fault"] = fault_rank_all[(gi, gj)]
-        if (gi, gj) in plate_rank_all:
-            comp["plate"] = plate_rank_all[(gi, gj)]
+            bv = _risk_bvalue_raw(snap["bvalue"]).get(key)
+            if bv is not None:
+                s = _abs_score_single(key, bv, calib.get("bvalue_cell"), True, False,
+                                      lambda med: _bvalue_domain_floor)
+                if s is not None:
+                    comp["bvalue"] = s
+        if fault_score is not None:
+            comp["fault"] = fault_score
+        if plate_score is not None:
+            comp["plate"] = plate_score
         if not comp:
             continue
-        wsum = sum(RISK_DEFAULT_WEIGHTS[k] for k in comp)
-        score = sum(RISK_DEFAULT_WEIGHTS[k] * v for k, v in comp.items()) / wsum
+        sel_hist = [k for k in selected if k in _RISK_HIST_KEYS]
+        wsum = sum(RISK_DEFAULT_WEIGHTS[k] for k in sel_hist)
+        score = sum(RISK_DEFAULT_WEIGHTS[k] * comp.get(k, RISK_NEUTRAL_SCORE) for k in sel_hist) / wsum
         points.append({"t": snap.get("timestamp_jst", ""), "score": round(score, 4)})
 
     prev_day_score = None
@@ -3951,7 +4053,7 @@ canvas.dChart{{display:block;width:100%}}
     <h2>統合リスクマップ <span style="font-size:10px;color:#fbbf24">β</span></h2>
     <button id="panelClose" onclick="togglePanel()" title="パネルを閉じる">✕</button>
   </div>
-  <p class="sub">複数の地震関連データを統合した相対的な地震リスク指数です。地震の発生確率ではなく、地域ごとのリスクの高低を比較するための指標です。</p>
+  <p class="sub">複数の地震関連データを統合した地震リスク指数です。各セルを「そのセル自身の過去65日の実績と比べてどれだけ普段と違うか」で絶対評価しています。地震の発生確率ではありません。</p>
 
   <div class="sec">
     <h3>プリセット</h3>
@@ -3995,7 +4097,10 @@ canvas.dChart{{display:block;width:100%}}
     <div style="font-size:10px;color:rgba(235,238,245,.46);margin-top:4px">上位<span id="rankShown">0</span>件 / 表示中<span id="rankTotal">0</span>件中（行クリックで地図上を表示）</div>
   </div>
 
+  <div id="calibBanner" style="display:none;font-size:11px;color:#fbbf24;background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.35);border-radius:10px;padding:8px 10px;margin-bottom:10px;line-height:1.6"></div>
   <div id="cellCount">表示中のセル数: <span id="cellN">0</span> / {n_cells}</div>
+  <div id="lvCounts" style="font-size:10.5px;color:rgba(235,238,245,.62);margin-top:3px"></div>
+  <div style="font-size:10px;color:rgba(235,238,245,.46);margin-top:2px">平穏時の目安: Lv1 {RISK_LEVEL_TARGETS[1]} / Lv2 {RISK_LEVEL_TARGETS[2]} / Lv3 {RISK_LEVEL_TARGETS[3]} / Lv4 {RISK_LEVEL_TARGETS[4]} セル</div>
   <div class="note">
     重みは選択されたデータのみを使い自動的に再正規化されます。<br>
     セルをクリックすると統合リスク指数と各データの寄与度（内訳）を表示します。<br>
@@ -4047,7 +4152,7 @@ canvas.dChart{{display:block;width:100%}}
 var CELLS = {cells_js};
 var WEIGHTS = {weights_js};
 var LABELS = {labels_js};
-var THRESH = {thresh_js};   // (v8.20) レベル境界: 成分選択パターン別に自動キャリブレーション
+var THRESH = {thresh_js};   // (v8.21) レベル境界: 成分選択パターン別に自動キャリブレーション
 var GS = {gs};
 var RISK_COLOR = {{5:'{LEVEL_COLOR[5]}',4:'{LEVEL_COLOR[4]}',3:'{LEVEL_COLOR[3]}',2:'{LEVEL_COLOR[2]}',1:'{LEVEL_COLOR[1]}'}};
 var KEYS = ['etas','bvalue','fault','plate','pressure'];
@@ -4094,16 +4199,20 @@ function onToggle(key){{
   redraw();
 }}
 
+// (v8.21) 過去履歴のある成分(ETAS/b値/活断層/プレート)がそのセルに無い場合は中立0.5で補う。
+// 成分が少ないセルの総合値が極端値に張り付くのを防ぐ（サーバー側のしきい値算出と同じ扱い）。
+var HIST_KEYS = ['etas','bvalue','fault','plate'];
 function computeComposite(cell){{
-  var wsum=0, ssum=0, used=[];
+  var wsum=0, ssum=0, used=[], wmiss=0;
   KEYS.forEach(function(k){{
-    if(selected[k] && cell.c[k]){{
-      var wk = WEIGHTS[k];
-      wsum += wk; ssum += wk*cell.c[k].s; used.push(k);
-    }}
+    if(!selected[k]) return;
+    var wk = WEIGHTS[k];
+    if(cell.c[k]){{ wsum += wk; ssum += wk*cell.c[k].s; used.push(k); }}
+    else if(HIST_KEYS.indexOf(k) >= 0){{ wmiss += wk; }}
   }});
   if(wsum<=0) return null;
-  return {{score: ssum/wsum, used: used, wsum: wsum}};
+  var wall = wsum + wmiss;
+  return {{score: (ssum + 0.5*wmiss)/wall, used: used, wsum: wall, wmiss: wmiss}};
 }}
 // (v7.56) Lv5=特別警報級(年数回程度)/Lv4=危険警報級(活発期でも数日に一度程度)を
 // 目指す絶対基準。以前は0.95/0.7だったが、サーバー側の絶対評価がセル単位の
@@ -4114,7 +4223,7 @@ function computeComposite(cell){{
 // (v7.56) Lv0(色無し)を追加。0.2未満は「表示するほどの水準ではない」として
 // 地図上に描画しない(redraw側でlv===0を除外)。これによりマップ全体が常に
 // 色で埋め尽くされる状態を避け、実際に注意すべきセルだけが目立つようにする。
-// (v8.20) しきい値はサーバー側で「平穏時のLv別セル数が目標値に近くなる」よう
+// (v8.21) しきい値はサーバー側で「平穏時のLv別セル数が目標値に近くなる」よう
 // 過去65日の実績から自動算出したもの(THRESH)を使う。成分の選択パターンごとに
 // 合成スコアの分布が違うため、選択中の成分(ETAS/b値/活断層/プレート境界)で引き当てる。
 // 気圧は過去履歴が無くキャリブレーションできないため、キーには含めない。
@@ -4217,10 +4326,15 @@ function showDetail(cell, comp, lv){{
     contribFloat.push(nw * d.s * 100);
     colors.push(COMP_COLOR[k] || '#60a5fa');
   }});
+  var names = comp.used.map(function(k){{ return LABELS[k]; }});
+  if(comp.wmiss > 0){{   // データの無い成分は中立0.5として合計に入っている
+    names.push('データ無し(中立)'); labels.push('データ無し'); colors.push('#6b7280');
+    contribFloat.push(0.5 * comp.wmiss / comp.wsum * 100);
+  }}
   var contribInt = roundPartsToTotal(contribFloat, total);
 
-  document.getElementById('dBreakdown').innerHTML = comp.used.map(function(k, i){{
-    return '<div class="brk-row"><span>' + LABELS[k] + '</span>' +
+  document.getElementById('dBreakdown').innerHTML = names.map(function(nm, i){{
+    return '<div class="brk-row"><span>' + nm + '</span>' +
       '<span class="brk-val">' + (contribInt[i]>=0?'+':'') + contribInt[i] + '</span></div>';
   }}).join('');
   drawBarChart(document.getElementById('dBarCanvas'), labels, contribInt, colors);
@@ -4230,7 +4344,7 @@ function showDetail(cell, comp, lv){{
   document.getElementById('dTrendState').textContent = '取得中…';
   drawLineChart(document.getElementById('dTrendCanvas'), []);
 
-  var sel = comp.used.join(',');
+  var sel = KEYS.filter(function(k){{ return selected[k]; }}).join(',');   // 欠けた成分も中立扱いで推移に反映するため、選択中の成分を渡す
   fetch('/data/risk_cell_trend?lat=' + cell.lat + '&lon=' + cell.lon + '&sel=' + encodeURIComponent(sel))
     .then(function(r){{ return r.json(); }})
     .then(function(res){{
@@ -4301,13 +4415,14 @@ function redraw(){{
   if(rectLayer) map.removeLayer(rectLayer);
   rectLayer = L.layerGroup().addTo(map);
   var shown = 0;
+  var lvN = {{1:0,2:0,3:0,4:0,5:0}};
   lastShownList = [];
   CELLS.forEach(function(cell){{
     var comp = computeComposite(cell);
     if(!comp) return;
     var lv = levelOf(comp.score);
     if(lv===0) return;  // (v7.56) Lv0(色無し)は地図・件数・ランキングいずれにも出さない
-    shown++;
+    shown++; lvN[lv]++;
     lastShownList.push({{cell:cell, comp:comp, lv:lv}});
     var rect = L.rectangle(
       [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
@@ -4317,10 +4432,20 @@ function redraw(){{
     rect.addTo(rectLayer);
   }});
   document.getElementById('cellN').textContent = shown;
+  document.getElementById('lvCounts').textContent =
+    '現在: Lv1 '+lvN[1]+' / Lv2 '+lvN[2]+' / Lv3 '+lvN[3]+' / Lv4 '+lvN[4]+' / Lv5 '+lvN[5];
   renderRankTable(lastShownList);
 }}
 
 redraw();
+if(!THRESH.calibrated){{
+  var cb = document.getElementById('calibBanner');
+  cb.style.display = 'block';
+  cb.textContent = '絶対基準（過去65日の実績）を計算中、または過去データが不足しています。'
+    + '完了するまでリスクは表示しません（相対評価での代用はしません）。1分ごとに自動で再読み込みします。'
+    + '（取得済みサンプル数: ' + (THRESH.n_samples||0) + '）';
+  setTimeout(function(){{ location.reload(); }}, 60000);
+}}
 </script></body></html>"""
 
 
@@ -4470,20 +4595,22 @@ function onToggle(key){
   redraw();
 }
 
+// (v8.21) 通常版と同じ: 履歴のある成分がそのセルに無い場合は中立0.5で補う
 function computeComposite(cell){
-  var wsum=0, ssum=0, used=[];
+  var wsum=0, ssum=0, used=[], wmiss=0;
   KEYS.forEach(function(k){
-    if(selected[k] && cell.c[k]){
-      var wk = WEIGHTS[k];
-      wsum += wk; ssum += wk*cell.c[k].s; used.push(k);
-    }
+    if(!selected[k]) return;
+    var wk = WEIGHTS[k];
+    if(cell.c[k]){ wsum += wk; ssum += wk*cell.c[k].s; used.push(k); }
+    else { wmiss += wk; }
   });
   if(wsum<=0) return null;
-  return {score: ssum/wsum, used: used, wsum: wsum};
+  var wall = wsum + wmiss;
+  return {score: (ssum + 0.5*wmiss)/wall, used: used, wsum: wall, wmiss: wmiss};
 }
 // (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。
 // (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。Lv0(色無し)も同様。
-// (v8.20) 通常版と同じ、過去実績からの自動キャリブレーション済みしきい値を使う
+// (v8.21) 通常版と同じ、過去実績からの自動キャリブレーション済みしきい値を使う
 // （サーバーが /archive/historical_riskmap の応答に同梱してTHRESHへ設定する）。
 var THRESH = {by_subset:{}, default:[0.2,0.4,0.6,0.85,0.97]};
 function currentThresholds(){
@@ -4551,9 +4678,14 @@ function showDetail(cell, comp, lv){
     var nw = WEIGHTS[k] / comp.wsum;
     labels.push(LABELS[k]); contribFloat.push(nw * d.s * 100); colors.push(COMP_COLOR[k] || '#60a5fa');
   });
+  var names = comp.used.map(function(k){ return LABELS[k]; });
+  if(comp.wmiss > 0){
+    names.push('データ無し(中立)'); labels.push('データ無し'); colors.push('#6b7280');
+    contribFloat.push(0.5 * comp.wmiss / comp.wsum * 100);
+  }
   var contribInt = roundPartsToTotal(contribFloat, total);
-  document.getElementById('dBreakdown').innerHTML = comp.used.map(function(k, i){
-    return '<div class="brk-row"><span>' + LABELS[k] + '</span>' +
+  document.getElementById('dBreakdown').innerHTML = names.map(function(nm, i){
+    return '<div class="brk-row"><span>' + nm + '</span>' +
       '<span class="brk-val">' + (contribInt[i]>=0?'+':'') + contribInt[i] + '</span></div>';
   }).join('');
   drawBarChart(document.getElementById('dBarCanvas'), labels, contribInt, colors);
@@ -4653,7 +4785,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v8.20</title>
+  <title>地震研究統合プラットフォーム v8.21</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
@@ -4743,7 +4875,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v8.20 / 研究用</div>
+      <div>v8.21 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -5188,6 +5320,9 @@ def archive_historical_riskmap():
         except Exception as e:
             return {"error": f"過去データ(USGS)の取得に失敗しました: {e}"}, 500
 
+    if not get_risk_level_thresholds()["calibrated"]:
+        return {"error": "絶対基準(過去65日の実績)を計算中です。数分後にもう一度お試しください。"}, 503
+
     try:
         cells = compute_risk_grid_historical(quakes, ref_time_utc)
     except Exception as e:
@@ -5205,7 +5340,7 @@ def archive_historical_riskmap():
 
 @app.route("/data/risk_level_thresholds")
 def risk_level_thresholds():
-    """(v8.20) 統合リスクマップのレベル境界と、その境界を過去実績に当てはめた場合の
+    """(v8.21) 統合リスクマップのレベル境界と、その境界を過去実績に当てはめた場合の
     日別セル数(p10/中央値/p90/最大)を返す。目標値に合っているかの検算用。"""
     calib = _get_historical_calibration()
     return {"calibrated": bool(calib.get("risk_thresholds")),
