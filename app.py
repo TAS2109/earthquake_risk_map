@@ -3999,6 +3999,12 @@ function onToggle(key){{
   redraw();
 }}
 
+// (v8.15) レベルの基準しきい値(総合指数0〜1)。平穏時でも上位の数格子が警報級(Lv3)に
+// 届くよう、Lv2・Lv3のしきい値を従来(0.40/0.60)から引き下げて基準を底上げした。
+// Lv0=平常(0.2未満・地図に描画しない)とLv4・Lv5(0.85/0.97)は従来どおり。
+// 調整方法: ランキング表の「指数」(=総合指数×100)を見て、CUT3を平穏時の上位セルの
+// 指数より少し低い値にする。CUT2はCUT1とCUT3の間に置く。
+var CUT1=0.20, CUT2=0.28, CUT3=0.35, CUT4=0.85, CUT5=0.97;
 function computeComposite(cell){{
   var wsum=0, ssum=0, used=[];
   KEYS.forEach(function(k){{
@@ -4015,9 +4021,9 @@ function computeComposite(cell){{
   // 同じ値を割り当てるため、ETAS・断層・プレートの情報が一切無い1マスだけが
   // b値の理由だけでLv5になる、など）。ETASの参照がそもそも無いセルは
   // Lv1(早期注意)までに頭打ちにし、最重要指標が欠けたまま警報級以上を
-  // 表示しないようにする(0.6はちょうどLv3のしきい値なので使わない)。
+  // 表示しないようにする(上限はLv2しきい値(CUT2)の直下=Lv1まで)。
   if(used.indexOf('etas')<0){{
-    score = Math.min(score, 0.39);
+    score = Math.min(score, CUT2-0.01);
   }}
   return {{score: score, used: used, wsum: wsum}};
 }}
@@ -4031,11 +4037,11 @@ function computeComposite(cell){{
 // 地図上に描画しない(redraw側でlv===0を除外)。これによりマップ全体が常に
 // 色で埋め尽くされる状態を避け、実際に注意すべきセルだけが目立つようにする。
 function levelOf(score){{
-  if(score>=0.97) return 5;
-  if(score>=0.85) return 4;
-  if(score>=0.6) return 3;
-  if(score>=0.4) return 2;
-  if(score>=0.2) return 1;
+  if(score>=CUT5) return 5;
+  if(score>=CUT4) return 4;
+  if(score>=CUT3) return 3;
+  if(score>=CUT2) return 2;
+  if(score>=CUT1) return 1;
   return 0;
 }}
 
@@ -4377,6 +4383,12 @@ function onToggle(key){
   redraw();
 }
 
+// (v8.15) レベルの基準しきい値(総合指数0〜1)。平穏時でも上位の数格子が警報級(Lv3)に
+// 届くよう、Lv2・Lv3のしきい値を従来(0.40/0.60)から引き下げて基準を底上げした。
+// Lv0=平常(0.2未満・地図に描画しない)とLv4・Lv5(0.85/0.97)は従来どおり。
+// 調整方法: ランキング表の「指数」(=総合指数×100)を見て、CUT3を平穏時の上位セルの
+// 指数より少し低い値にする。CUT2はCUT1とCUT3の間に置く。
+var CUT1=0.20, CUT2=0.28, CUT3=0.35, CUT4=0.85, CUT5=0.97;
 function computeComposite(cell){
   var wsum=0, ssum=0, used=[];
   KEYS.forEach(function(k){
@@ -4390,18 +4402,18 @@ function computeComposite(cell){
   // (Bug fix) riskmapタブと同様、最重要指標ETASのデータが無いセルは
   // b値等の単独判断で警報級以上(Lv3〜5)にならないようLv1までに頭打ちにする。
   if(used.indexOf('etas')<0){
-    score = Math.min(score, 0.39);
+    score = Math.min(score, CUT2-0.01);
   }
   return {score: score, used: used, wsum: wsum};
 }
 // (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。
 // (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。Lv0(色無し)も同様。
 function levelOf(score){
-  if(score>=0.97) return 5;
-  if(score>=0.85) return 4;
-  if(score>=0.6) return 3;
-  if(score>=0.4) return 2;
-  if(score>=0.2) return 1;
+  if(score>=CUT5) return 5;
+  if(score>=CUT4) return 4;
+  if(score>=CUT3) return 3;
+  if(score>=CUT2) return 2;
+  if(score>=CUT1) return 1;
   return 0;
 }
 
@@ -4935,8 +4947,18 @@ def status():
     for v in last_fetch.values():
         v["ts_str"] = (datetime.fromtimestamp(v["ts"], JST).strftime("%Y-%m-%d %H:%M JST")
                        if v["ts"] else None)
+    cal = _hist_calib_cache
+    calib_info = {
+        "n_samples": cal.get("n_samples"),
+        "age_min": round((time.time() - cal["ts"]) / 60) if cal.get("ts") else None,
+        # セル自身の履歴が十分(HIST_CALIB_MIN_CELL_SAMPLES以上)で「キャリブレーション済み」の
+        # セル数。ここが少ないと、しきい値を下げても警報級はほとんど出ない。
+        "cells_ready": {k: len(_cellwise_median_map(cal.get(k + "_cell")))
+                        for k in ("etas", "bvalue", "fault", "plate")},
+    }
     with _cache_lock:
         return {"phase": _ready_phase, "last_update": _last_update,
+                "calibration": calib_info,
                 "quakes": len(all_q),
                 "quakes_csv_by_source": by_source,
                 "last_fetch_by_source": last_fetch}
