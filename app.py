@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v8.15
+地震研究統合プラットフォーム v8.16
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS / Hi-net)
@@ -3920,6 +3920,7 @@ canvas.dChart{{display:block;width:100%}}
     <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（早期注意）<br>
     <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
     <small style="color:rgba(235,238,245,.46)">Lv0（平常）のセルは地図上に表示されません</small><br>
+    <small id="lvStat" style="color:rgba(235,238,245,.7)"></small><br>
     <small>選択データの相対順位を重み付け合成した指数<br>（発生確率を意味するものではありません）</small>
   </div>
   <div id="detailBox">
@@ -4004,7 +4005,25 @@ function onToggle(key){{
 // Lv0=平常(0.2未満・地図に描画しない)とLv4・Lv5(0.85/0.97)は従来どおり。
 // 調整方法: ランキング表の「指数」(=総合指数×100)を見て、CUT3を平穏時の上位セルの
 // 指数より少し低い値にする。CUT2はCUT1とCUT3の間に置く。
-var CUT1=0.20, CUT2=0.28, CUT3=0.35, CUT4=0.85, CUT5=0.97;
+// (v8.17) しきい値は絶対評価(固定値)。スコア分布に左右されず、同じ指数なら常に同じレベルになる。
+// 平穏時の目標(Lv1≒500 / Lv2≒100〜200 / Lv3≒50〜100 / Lv4≒0〜10セル)に合わせ、
+// 従来値(0.20/0.28/0.35/0.85)から引き下げた。Lv5(0.97)は従来どおり。
+// 調整方法: 凡例の「参考」に、その時点の分布で目標セル数に相当するスコアが出る(表示専用で
+// レベル判定には使わない)。平穏時の値を見て ABS_CUT を書き換える。
+var ABS_CUT = [0.08, 0.17, 0.26, 0.33];      // Lv1〜Lv4のしきい値(総合指数0〜1)
+var REF_RATIO = [0.37, 0.12, 0.037, 0.004];  // 参考表示用: Lv1以上/Lv2以上/Lv3以上/Lv4以上の累計割合
+var CUT1=ABS_CUT[0], CUT2=ABS_CUT[1], CUT3=ABS_CUT[2], CUT4=ABS_CUT[3], CUT5=0.97;
+var REF_CUT = [0,0,0,0];
+function computeRefCuts(comps){{
+  var arr = comps.filter(function(c){{ return !c.noEtas; }})
+                 .map(function(c){{ return c.score; }})
+                 .sort(function(a,b){{ return b-a; }});
+  var n = arr.length;
+  if(n===0) return;
+  for(var i=0;i<4;i++){{
+    REF_CUT[i] = arr[Math.min(n-1, Math.max(0, Math.round(n*REF_RATIO[i])-1))];
+  }}
+}}
 function computeComposite(cell){{
   var wsum=0, ssum=0, used=[];
   KEYS.forEach(function(k){{
@@ -4022,10 +4041,9 @@ function computeComposite(cell){{
   // b値の理由だけでLv5になる、など）。ETASの参照がそもそも無いセルは
   // Lv1(早期注意)までに頭打ちにし、最重要指標が欠けたまま警報級以上を
   // 表示しないようにする(上限はLv2しきい値(CUT2)の直下=Lv1まで)。
-  if(used.indexOf('etas')<0){{
-    score = Math.min(score, CUT2-0.01);
-  }}
-  return {{score: score, used: used, wsum: wsum}};
+  // (v8.16) 頭打ちはしきい値確定後にredraw側で行う(noEtasフラグを返す)
+  var noEtas = used.indexOf('etas')<0;
+  return {{score: score, used: used, wsum: wsum, noEtas: noEtas}};
 }}
 // (v7.56) Lv5=特別警報級(年数回程度)/Lv4=危険警報級(活発期でも数日に一度程度)を
 // 目指す絶対基準。以前は0.95/0.7だったが、サーバー側の絶対評価がセル単位の
@@ -4215,12 +4233,21 @@ function redraw(){{
   rectLayer = L.layerGroup().addTo(map);
   var shown = 0;
   lastShownList = [];
+  var comps = [];
   CELLS.forEach(function(cell){{
     var comp = computeComposite(cell);
-    if(!comp) return;
+    if(comp) comps.push({{cell:cell, comp:comp}});
+  }});
+  // (v8.17) 参考表示用: 目標セル数に相当するスコアを算出(判定には使わない)
+  computeRefCuts(comps.map(function(x){{ return x.comp; }}));
+  var cnt = {{1:0, 2:0, 3:0, 4:0, 5:0}};
+  comps.forEach(function(x){{
+    var cell = x.cell, comp = x.comp;
+    // ETASが無いセルはLv1までに頭打ち(従来仕様を維持)
+    if(comp.noEtas) comp.score = Math.min(comp.score, CUT2-0.001);
     var lv = levelOf(comp.score);
     if(lv===0) return;  // (v7.56) Lv0(色無し)は地図・件数・ランキングいずれにも出さない
-    shown++;
+    shown++; cnt[lv]++;
     lastShownList.push({{cell:cell, comp:comp, lv:lv}});
     var rect = L.rectangle(
       [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
@@ -4230,6 +4257,10 @@ function redraw(){{
     rect.addTo(rectLayer);
   }});
   document.getElementById('cellN').textContent = shown;
+  var st = document.getElementById('lvStat');
+  if(st) st.innerHTML = 'Lv1:'+cnt[1]+' / Lv2:'+cnt[2]+' / Lv3:'+cnt[3]+' / Lv4:'+cnt[4]+' / Lv5:'+cnt[5]
+    + '<br>しきい値 ' + [CUT1,CUT2,CUT3,CUT4,CUT5].map(function(v){{ return v.toFixed(3); }}).join(' / ')
+    + '<br>参考(目標件数のスコア) ' + REF_CUT.map(function(v){{ return v.toFixed(3); }}).join(' / ');
   renderRankTable(lastShownList);
 }}
 
@@ -4355,6 +4386,7 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
     <span style="color:#66ccff;opacity:0.55">■</span> Lv1（早期注意）<br>
     <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
     <small style="color:rgba(235,238,245,.46)">Lv0（平常）のセルは地図上に表示されません</small><br>
+    <small id="lvStat" style="color:rgba(235,238,245,.7)"></small><br>
     <small>指定時点における相対リスク指数<br>（発生確率を意味するものではありません）</small>
   </div>
   <div id="detailBox">
@@ -4388,7 +4420,25 @@ function onToggle(key){
 // Lv0=平常(0.2未満・地図に描画しない)とLv4・Lv5(0.85/0.97)は従来どおり。
 // 調整方法: ランキング表の「指数」(=総合指数×100)を見て、CUT3を平穏時の上位セルの
 // 指数より少し低い値にする。CUT2はCUT1とCUT3の間に置く。
-var CUT1=0.20, CUT2=0.28, CUT3=0.35, CUT4=0.85, CUT5=0.97;
+// (v8.17) しきい値は絶対評価(固定値)。スコア分布に左右されず、同じ指数なら常に同じレベルになる。
+// 平穏時の目標(Lv1≒500 / Lv2≒100〜200 / Lv3≒50〜100 / Lv4≒0〜10セル)に合わせ、
+// 従来値(0.20/0.28/0.35/0.85)から引き下げた。Lv5(0.97)は従来どおり。
+// 調整方法: 凡例の「参考」に、その時点の分布で目標セル数に相当するスコアが出る(表示専用で
+// レベル判定には使わない)。平穏時の値を見て ABS_CUT を書き換える。
+var ABS_CUT = [0.08, 0.17, 0.26, 0.33];      // Lv1〜Lv4のしきい値(総合指数0〜1)
+var REF_RATIO = [0.37, 0.12, 0.037, 0.004];  // 参考表示用: Lv1以上/Lv2以上/Lv3以上/Lv4以上の累計割合
+var CUT1=ABS_CUT[0], CUT2=ABS_CUT[1], CUT3=ABS_CUT[2], CUT4=ABS_CUT[3], CUT5=0.97;
+var REF_CUT = [0,0,0,0];
+function computeRefCuts(comps){
+  var arr = comps.filter(function(c){ return !c.noEtas; })
+                 .map(function(c){ return c.score; })
+                 .sort(function(a,b){ return b-a; });
+  var n = arr.length;
+  if(n===0) return;
+  for(var i=0;i<4;i++){
+    REF_CUT[i] = arr[Math.min(n-1, Math.max(0, Math.round(n*REF_RATIO[i])-1))];
+  }
+}
 function computeComposite(cell){
   var wsum=0, ssum=0, used=[];
   KEYS.forEach(function(k){
@@ -4401,10 +4451,9 @@ function computeComposite(cell){
   var score = ssum/wsum;
   // (Bug fix) riskmapタブと同様、最重要指標ETASのデータが無いセルは
   // b値等の単独判断で警報級以上(Lv3〜5)にならないようLv1までに頭打ちにする。
-  if(used.indexOf('etas')<0){
-    score = Math.min(score, CUT2-0.01);
-  }
-  return {score: score, used: used, wsum: wsum};
+  // (v8.16) 頭打ちはしきい値確定後にredraw側で行う(noEtasフラグを返す)
+  var noEtas = used.indexOf('etas')<0;
+  return {score: score, used: used, wsum: wsum, noEtas: noEtas};
 }
 // (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。
 // (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。Lv0(色無し)も同様。
@@ -4489,12 +4538,21 @@ function redraw(){
   rectLayer = L.layerGroup().addTo(map);
   var shown = 0;
   lastShownList = [];
+  var comps = [];
   CELLS.forEach(function(cell){
     var comp = computeComposite(cell);
-    if(!comp) return;
+    if(comp) comps.push({cell:cell, comp:comp});
+  });
+  // (v8.17) 参考表示用: 目標セル数に相当するスコアを算出(判定には使わない)
+  computeRefCuts(comps.map(function(x){ return x.comp; }));
+  var cnt = {1:0, 2:0, 3:0, 4:0, 5:0};
+  comps.forEach(function(x){
+    var cell = x.cell, comp = x.comp;
+    // ETASが無いセルはLv1までに頭打ち(従来仕様を維持)
+    if(comp.noEtas) comp.score = Math.min(comp.score, CUT2-0.001);
     var lv = levelOf(comp.score);
     if(lv===0) return;  // (v7.56) Lv0(色無し)は地図・件数・ランキングいずれにも出さない
-    shown++;
+    shown++; cnt[lv]++;
     lastShownList.push({cell:cell, comp:comp, lv:lv});
     var rect = L.rectangle(
       [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
@@ -4504,6 +4562,10 @@ function redraw(){
     rect.addTo(rectLayer);
   });
   document.getElementById('cellN').textContent = shown;
+  var st = document.getElementById('lvStat');
+  if(st) st.innerHTML = 'Lv1:'+cnt[1]+' / Lv2:'+cnt[2]+' / Lv3:'+cnt[3]+' / Lv4:'+cnt[4]+' / Lv5:'+cnt[5]
+    + '<br>しきい値 ' + [CUT1,CUT2,CUT3,CUT4,CUT5].map(function(v){ return v.toFixed(3); }).join(' / ')
+    + '<br>参考(目標件数のスコア) ' + REF_CUT.map(function(v){ return v.toFixed(3); }).join(' / ');
 }
 
 function fmtStatus(d){
@@ -4569,7 +4631,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v8.15</title>
+  <title>地震研究統合プラットフォーム v8.16</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
@@ -4659,7 +4721,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v8.15 / 研究用</div>
+      <div>v8.16 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
