@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v8.14
+地震研究統合プラットフォーム v8.15
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS / Hi-net)
@@ -1433,7 +1433,7 @@ def _make_etas_domain_floor(median_map, lv3_ratio=1.5, lv4_ratio=3.0):
         # 全国一律の値(EP.MU)にフォールバックして素通りさせず、安全側でLv3相当までに
         # 頭打ちにする。実績と比較できて初めてLv4/5への昇格を許す。
         if cell_key not in median_map:
-            return min(s, 0.55)
+            return min(s, UNCALIBRATED_SCORE_CAP)
         base = median_map[cell_key]
         ratio = raw_v / max(base, EP.MU, 1e-9)
         if ratio < lv3_ratio: return min(s, 0.55)   # Lv3相当まで
@@ -1461,7 +1461,7 @@ def _make_stress_domain_floor(median_map, lv3_ratio=3.0, lv4_ratio=8.0, min_base
     def _floor(cell_key, raw_v, s):
         # (Bug fix) 同上: 実績と比較できないセルは安全側でLv3相当までに頭打ちにする。
         if cell_key not in median_map:
-            return min(s, 0.55)
+            return min(s, UNCALIBRATED_SCORE_CAP)
         base = median_map[cell_key]
         ratio = raw_v / max(base, min_baseline)
         if ratio < lv3_ratio: return min(s, 0.55)   # Lv3相当まで
@@ -1474,6 +1474,14 @@ def _make_stress_domain_floor(median_map, lv3_ratio=3.0, lv4_ratio=8.0, min_base
 # （ドメイン知識: 気圧・電離圏異常と地震の関連は実証段階であり、あくまで
 # 補助的な参考指標として扱う、という判断）。
 PRESSURE_TEC_SCORE_CAP = 0.6
+
+# (Bug fix) ETAS/断層/プレートのドメイン下限フィルタで、そのセルの実績と比較できない
+# (未キャリブレーション/サンプル不足)場合の上限。活断層・プレート応力は全国ほぼ全セルで
+# 非ゼロの生値を持ち、その2指標だけが対象になるセルが大半を占めるため、ここを高くすると
+# ほぼ全セルが同じレベルに収束してしまう。レベル設計上、平常時はLv0(0.2未満・地図に
+# 描画しない)なので、「実績と比較できない＝異常とは言えない」セルはLv0に収める。
+# (レベルのイメージは気象庁の防災気象情報: Lv1早期注意/Lv2注意報/Lv3警報/Lv4危険警報/Lv5特別警報)
+UNCALIBRATED_SCORE_CAP = 0.15
 
 def _hybrid_rank_map(raw_map, pool, invert=False, log_transform=False, domain_floor_fn=None):
     """『今この瞬間の空間内相対順位』と『そのセル自身の過去65日間の実績と
@@ -1874,11 +1882,11 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
 <div id="map"></div>
 <div id="lg">
   <b>ETAS 地震発生確率</b><br>
-  <span style="color:{LEVEL_COLOR[5]};background:{LEVEL_COLOR[5]};opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特に稀な高リスク）<br>
-  <span style="color:{LEVEL_COLOR[4]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv4（警戒）<br>
-  <span style="color:{LEVEL_COLOR[3]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv3（注意）<br>
-  <span style="color:{LEVEL_COLOR[2]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv2（やや注意）<br>
-  <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（平常）<br>
+  <span style="color:{LEVEL_COLOR[5]};background:{LEVEL_COLOR[5]};opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特別警報級）<br>
+  <span style="color:{LEVEL_COLOR[4]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv4（危険警報級）<br>
+  <span style="color:{LEVEL_COLOR[3]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv3（警報級）<br>
+  <span style="color:{LEVEL_COLOR[2]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv2（注意報級）<br>
+  <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（早期注意）<br>
   <small style="color:rgba(235,238,245,.46)">Lv4・5は過去65日間の実績と比べても稀な場合のみ表示されます</small>
   <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
   <small>JMA:{src_count.get('jma_bosai',0)} P2P:{src_count.get('p2p',0)+src_count.get('p2p_jma',0)} USGS:{src_count.get('usgs',0)} Hi-net:{src_count.get('hinet',0)}<br>計{len(quakes)}件</small>
@@ -3905,13 +3913,13 @@ canvas.dChart{{display:block;width:100%}}
   <div id="hdr">更新: {updated_str}</div>
   <div id="lg">
     <b>統合リスクレベル</b><br>
-    <span style="color:{LEVEL_COLOR[5]};background:{LEVEL_COLOR[5]};opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特に稀な高リスク）<br>
-    <span style="color:{LEVEL_COLOR[4]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv4（警戒）<br>
-    <span style="color:{LEVEL_COLOR[3]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv3（注意）<br>
-    <span style="color:{LEVEL_COLOR[2]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv2（やや注意）<br>
-    <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（平常）<br>
+    <span style="color:{LEVEL_COLOR[5]};background:{LEVEL_COLOR[5]};opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特別警報級）<br>
+    <span style="color:{LEVEL_COLOR[4]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv4（危険警報級）<br>
+    <span style="color:{LEVEL_COLOR[3]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv3（警報級）<br>
+    <span style="color:{LEVEL_COLOR[2]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv2（注意報級）<br>
+    <span style="color:{LEVEL_COLOR[1]};opacity:{LEVEL_FILL_OPACITY}">■</span> Lv1（早期注意）<br>
     <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
-    <small style="color:rgba(235,238,245,.46)">Lv0（しきい値未満）のセルは地図上に表示されません</small><br>
+    <small style="color:rgba(235,238,245,.46)">Lv0（平常）のセルは地図上に表示されません</small><br>
     <small>選択データの相対順位を重み付け合成した指数<br>（発生確率を意味するものではありません）</small>
   </div>
   <div id="detailBox">
@@ -4000,7 +4008,18 @@ function computeComposite(cell){{
     }}
   }});
   if(wsum<=0) return null;
-  return {{score: ssum/wsum, used: used, wsum: wsum}};
+  var score = ssum/wsum;
+  // (Bug fix) 最も重視すべきETASのデータが存在しないセル(震源データが疎で
+  // ETAS格子が計算されていない場所)では、b値・応力負荷など他の指標だけで
+  // 単独でLv4/5(警戒級)まで到達してしまっていた（例: 粗いb値格子が広範囲に
+  // 同じ値を割り当てるため、ETAS・断層・プレートの情報が一切無い1マスだけが
+  // b値の理由だけでLv5になる、など）。ETASの参照がそもそも無いセルは
+  // Lv1(早期注意)までに頭打ちにし、最重要指標が欠けたまま警報級以上を
+  // 表示しないようにする(0.6はちょうどLv3のしきい値なので使わない)。
+  if(used.indexOf('etas')<0){{
+    score = Math.min(score, 0.39);
+  }}
+  return {{score: score, used: used, wsum: wsum}};
 }}
 // (v7.56) Lv5=特別警報級(年数回程度)/Lv4=危険警報級(活発期でも数日に一度程度)を
 // 目指す絶対基準。以前は0.95/0.7だったが、サーバー側の絶対評価がセル単位の
@@ -4323,13 +4342,13 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
   <div id="mapEmpty">日付と時刻を指定して取得してください</div>
   <div id="lg" style="display:none">
     <b>統合リスクレベル</b><br>
-    <span style="color:#0c000c;background:#0c000c;opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特に稀な高リスク）<br>
-    <span style="color:#8000ff;opacity:0.55">■</span> Lv4（警戒）<br>
-    <span style="color:#ff0000;opacity:0.55">■</span> Lv3（注意）<br>
-    <span style="color:#ffe600;opacity:0.55">■</span> Lv2（やや注意）<br>
-    <span style="color:#66ccff;opacity:0.55">■</span> Lv1（平常）<br>
+    <span style="color:#0c000c;background:#0c000c;opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特別警報級）<br>
+    <span style="color:#8000ff;opacity:0.55">■</span> Lv4（危険警報級）<br>
+    <span style="color:#ff0000;opacity:0.55">■</span> Lv3（警報級）<br>
+    <span style="color:#ffe600;opacity:0.55">■</span> Lv2（注意報級）<br>
+    <span style="color:#66ccff;opacity:0.55">■</span> Lv1（早期注意）<br>
     <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
-    <small style="color:rgba(235,238,245,.46)">Lv0（しきい値未満）のセルは地図上に表示されません</small><br>
+    <small style="color:rgba(235,238,245,.46)">Lv0（平常）のセルは地図上に表示されません</small><br>
     <small>指定時点における相対リスク指数<br>（発生確率を意味するものではありません）</small>
   </div>
   <div id="detailBox">
@@ -4367,7 +4386,13 @@ function computeComposite(cell){
     }
   });
   if(wsum<=0) return null;
-  return {score: ssum/wsum, used: used, wsum: wsum};
+  var score = ssum/wsum;
+  // (Bug fix) riskmapタブと同様、最重要指標ETASのデータが無いセルは
+  // b値等の単独判断で警報級以上(Lv3〜5)にならないようLv1までに頭打ちにする。
+  if(used.indexOf('etas')<0){
+    score = Math.min(score, 0.39);
+  }
+  return {score: score, used: used, wsum: wsum};
 }
 // (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。
 // (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。Lv0(色無し)も同様。
@@ -4532,7 +4557,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v8.14</title>
+  <title>地震研究統合プラットフォーム v8.15</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
@@ -4622,7 +4647,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v8.14 / 研究用</div>
+      <div>v8.15 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
