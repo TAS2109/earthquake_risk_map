@@ -4956,6 +4956,11 @@ SHELL_HTML = """<!DOCTYPE html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
   <title>地震研究統合プラットフォーム v8.22</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+  <link rel="shortcut icon" href="/favicon.ico">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <meta name="theme-color" content="#05070d">
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
@@ -5188,6 +5193,11 @@ SHELL_HTML = """<!DOCTYPE html>
 </html>"""
 
 LOADING_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="shortcut icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#05070d">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="5">
 <style>body{background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;color:white;display:flex;align-items:center;justify-content:center;
@@ -5260,6 +5270,94 @@ def _update_data():
             first_run = False
 
         time.sleep(FETCH_INTERVAL_SEC)
+
+
+# ══════════════════════════════════════════════════════
+# ウェブサイトアイコン（ファビコン）
+#   地震計の波形をモチーフにしたアイコンをコードだけで生成する（画像ファイル不要）。
+#   /favicon.svg … モダンブラウザ用（ベクター）
+#   /favicon-32.png, /favicon.ico, /apple-touch-icon.png … PNG（numpy + zlibで生成）
+# ══════════════════════════════════════════════════════
+_ICON_WAVE = [(6,34),(18,34),(22,28),(27,46),(33,12),(39,52),(44,30),(48,34),(58,34)]  # 64x64座標系
+_ICON_CACHE = {}
+
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+    '<stop offset="0" stop-color="#233560"/><stop offset="1" stop-color="#3a2560"/>'
+    '</linearGradient></defs>'
+    '<rect width="64" height="64" rx="14" fill="url(#g)"/>'
+    '<polyline points="' + " ".join(f"{x},{y}" for x, y in _ICON_WAVE) + '" fill="none" '
+    'stroke="#5ee0ff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>'
+    '</svg>'
+)
+
+def _render_icon_png(size, rounded=True):
+    """アイコンをsize×sizeのRGBA PNGとして描画してbytesで返す。"""
+    import zlib, struct
+    key = ("png", size, rounded)
+    if key in _ICON_CACHE: return _ICON_CACHE[key]
+    k = 64.0 / size
+    ys, xs = np.mgrid[0:size, 0:size]
+    px = (xs + 0.5) * k; py = (ys + 0.5) * k          # 64座標系のピクセル中心
+    # 背景グラデーション（#233560 → #3a2560）
+    t = ((px + py) / 128.0)[..., None]
+    c0 = np.array([0x23, 0x35, 0x60], float); c1 = np.array([0x3a, 0x25, 0x60], float)
+    rgb = c0 + (c1 - c0) * t
+    # 角丸マスク（半径14）。iOSのapple-touch-iconは自前でマスクするので角丸なし
+    if rounded:
+        r = 14.0
+        qx = np.abs(px - 32) - (32 - r); qy = np.abs(py - 32) - (32 - r)
+        dist = np.hypot(np.maximum(qx, 0), np.maximum(qy, 0)) + np.minimum(np.maximum(qx, qy), 0) - r
+        alpha = np.clip(0.5 - dist / k, 0, 1)
+    else:
+        alpha = np.ones((size, size))
+    # 波形（太さ4の丸端ポリライン）との距離でアンチエイリアス
+    d = np.full((size, size), 1e9)
+    for (x0, y0), (x1, y1) in zip(_ICON_WAVE[:-1], _ICON_WAVE[1:]):
+        vx, vy = x1 - x0, y1 - y0
+        u = np.clip(((px - x0) * vx + (py - y0) * vy) / (vx * vx + vy * vy), 0, 1)
+        d = np.minimum(d, np.hypot(px - (x0 + u * vx), py - (y0 + u * vy)))
+    line = np.clip((2.0 - d) / k + 0.5, 0, 1)[..., None]
+    rgb = rgb * (1 - line) + np.array([0x5e, 0xe0, 0xff], float) * line
+    img = np.dstack([rgb, alpha[..., None] * 255]).clip(0, 255).astype(np.uint8)
+    raw = b"".join(b"\x00" + img[i].tobytes() for i in range(size))
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    _ICON_CACHE[key] = png
+    return png
+
+def _render_icon_ico():
+    """48x48のPNGを埋め込んだ .ico（/favicon.ico を直接取りに来る古いブラウザ用）。"""
+    import struct
+    if "ico" in _ICON_CACHE: return _ICON_CACHE["ico"]
+    png = _render_icon_png(48)
+    hdr = struct.pack("<HHH", 0, 1, 1)
+    ent = struct.pack("<BBBBHHII", 48, 48, 0, 0, 1, 32, len(png), 22)
+    _ICON_CACHE["ico"] = hdr + ent + png
+    return _ICON_CACHE["ico"]
+
+_ICON_HEADERS = {"Cache-Control": "public, max-age=86400"}
+
+@app.route("/favicon.svg")
+def favicon_svg():
+    return Response(FAVICON_SVG, mimetype="image/svg+xml", headers=_ICON_HEADERS)
+
+@app.route("/favicon-32.png")
+def favicon_png32():
+    return Response(_render_icon_png(32), mimetype="image/png", headers=_ICON_HEADERS)
+
+@app.route("/favicon.ico")
+def favicon_ico():
+    return Response(_render_icon_ico(), mimetype="image/x-icon", headers=_ICON_HEADERS)
+
+@app.route("/apple-touch-icon.png")
+@app.route("/apple-touch-icon-precomposed.png")
+def apple_touch_icon():
+    return Response(_render_icon_png(180, rounded=False), mimetype="image/png", headers=_ICON_HEADERS)
 
 
 # ══════════════════════════════════════════════════════
