@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v8.21
+地震研究統合プラットフォーム v8.22
 
 v8.20: 統合リスクマップのレベル境界(Lv1〜Lv5のしきい値)を、過去65日の実績から
        自動キャリブレーションする方式に変更（平穏時のLv別セル数を目標値に合わせる）。
@@ -9,6 +9,10 @@ v8.21: 統合リスクマップのスコアから「今この瞬間の全セル�
        そのセル自身の過去実績との比較(絶対評価)のみにした。相対順位は最上位セルが必ず
        1.0(=総合100)になる構造だったため。同時に、履歴が薄いセルの相対評価への
        フォールバックを廃止し、キャリブレーション未完了時は表示を保留する。
+v8.22: アーカイブタブの「60日より古い期間」のデータソースに、気象庁一元化震源カタログ
+       （地震月報(カタログ編)の年別ファイル h2023 など）を追加。サーバーに該当年のファイルが
+       あり、かつ指定期間を覆っている場合はこちらを使い、無い場合は従来どおりUSGSへ
+       自動フォールバックする。ファイルは data/jma_catalog/ に置く（zipのままでも可）。
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS / Hi-net)
@@ -20,7 +24,8 @@ v8.21: 統合リスクマップのスコアから「今この瞬間の全セル�
   7. GNSS         - 地殻変動 (GEONET SFTP実データ変位ベクトル、未設定時はプレースホルダー)
   8. 海面気圧     - アメダス海面気圧マップ
   9. アーカイブ     - 日時指定で過去1か月分の地震データから統合リスクマップを再計算
-                  （直近60日以内はJMA/P2P統合データ、それより古い日時はUSGS過去カタログを都度取得）
+                  （直近60日以内はJMA/P2P統合データ、それより古い日時は気象庁一元化震源カタログ
+                    (data/jma_catalog/ のファイル)、無ければUSGS過去カタログを都度取得）
 
 コード内目次（"# ══" 区切りの主要セクション。おおよその行番号）:
   178  ETASパラメータ (Ogata 1998)
@@ -566,6 +571,163 @@ def fetch_quakes_usgs_range(start_utc, end_utc, timeout=30):
     print(f"[USGS/range] {start_utc.date()}〜{end_utc.date()} {len(quakes)}件")
     return quakes
 
+# ── 気象庁一元化震源カタログ（地震月報(カタログ編)の年別ファイル）────────────
+# アーカイブタブで「60日より古い期間」を指定したときに、USGSより先に使うソース。
+# 気象庁が配布している年別の固定長テキスト（96桁/行。h2023 など。zipで配布）を
+#     data/jma_catalog/h2023   （h2023.txt / h2023.zip のままでも可）
+# に置くと自動で読み込む。ファイルが無い年や、ファイルに収録済みの期間を超える期間を
+# 指定した場合は None を返し、呼び出し側がUSGSへフォールバックする。
+#
+# 桁位置（1始まり。実ファイル h2023 で検証済み）:
+#     1      レコード種別  J=日本付近（使用） / U=海外（読み飛ばす）
+#     2-13   発震時 年(4)月日時分 ※JST
+#     14-17  秒(0.01秒単位)
+#     22-24  緯度(度)   25-28 緯度(分, 0.01分単位)
+#     33-36  経度(度)   37-40 経度(分, 0.01分単位)
+#     45-49  深さ: 末尾2桁が空白なら整数km（固定深さ等）、そうでなければ0.01km単位
+#     53-54  M1  ※空白=マグニチュード未決定。負値は "-6"(=-0.6) / "A0"(=-1.0) 形式
+#     62     最大震度  1-4 / A=5弱 B=5強 C=6弱 D=6強 / 7
+#     69-92  震央地名（英語表記）
+JMA_CATALOG_DIR = os.environ.get("JMA_CATALOG_DIR", "data/jma_catalog")
+try:
+    # 下限マグニチュード。カタログにはM<1の微小地震が年間10万件以上含まれ、ETAS計算
+    # (イベント数に比例して重くなる)やb値の前提(通常データはM2前後以上が中心)と
+    # 合わなくなるため、既定ではM2.0以上だけを使う。環境変数で調整可能。
+    JMA_CATALOG_MIN_MAG = float(os.environ.get("JMA_CATALOG_MIN_MAG", "2.0"))
+except ValueError:
+    JMA_CATALOG_MIN_MAG = 2.0
+# ファイル先頭・末尾の記録と指定期間の端がこの時間以内のズレなら「覆っている」とみなす
+_JMA_CATALOG_EDGE_TOL = timedelta(hours=3)
+_JMA_CATALOG_MAXI = {"1": "1", "2": "2", "3": "3", "4": "4",
+                     "A": "5-", "B": "5+", "C": "6-", "D": "6+", "7": "7"}
+_jma_catalog_span_cache = {}   # path -> ((mtime, size), first_utc, last_utc)
+
+def _jma_catalog_find(year):
+    """JMA_CATALOG_DIR 内の年別ファイルのパスを返す（展開済み優先、無ければzip）。無ければ None。"""
+    base = os.path.join(JMA_CATALOG_DIR, f"h{year}")
+    for path in (base, base + ".txt", base + ".zip"):
+        if os.path.isfile(path):
+            return path
+    return None
+
+def _jma_catalog_iter_lines(path):
+    """年別ファイルを1行ずつ読む（zipの場合は中の最初のファイルを展開せずに読む）。"""
+    if path.lower().endswith(".zip"):
+        with zipfile.ZipFile(path) as zf:
+            names = [n for n in zf.namelist() if not n.endswith("/")]
+            if not names:
+                return
+            with zf.open(names[0]) as raw:
+                for line in io.TextIOWrapper(raw, encoding="ascii", errors="replace"):
+                    yield line.rstrip("\r\n")
+    else:
+        with open(path, encoding="ascii", errors="replace") as f:
+            for line in f:
+                yield line.rstrip("\r\n")
+
+def _jma_catalog_time(line):
+    """発震時(JST)をUTCのdatetimeにして返す。"""
+    t_jst = datetime(int(line[1:5]), int(line[5:7]), int(line[7:9]),
+                     int(line[9:11]), int(line[11:13]), tzinfo=JST) \
+            + timedelta(seconds=int(line[13:17]) / 100.0)
+    return t_jst.astimezone(timezone.utc)
+
+def _jma_catalog_mag(line):
+    """M1を数値にして返す。未決定(空白)は None。"""
+    tok = line[52:54]
+    if not tok.strip():
+        return None
+    c = tok[0]
+    if c == "-":
+        return -int(tok[1]) / 10.0
+    if c in "ABC" and tok[1].isdigit():          # A0=-1.0, B0=-2.0, C0=-3.0 ...
+        return -((ord(c) - 64) + int(tok[1]) / 10.0)
+    return int(tok) / 10.0
+
+def _parse_jma_catalog_line(line, min_mag=None):
+    """カタログ1行 -> (UTC datetime, 地震dict)。使えない行（海外・M未決定・M下限未満・
+    桁崩れ）は None。地震dictの形は quakes.csv / fetch_quakes_usgs_range と同じ。"""
+    if len(line) < 62 or line[0] != "J":
+        return None
+    try:
+        mag = _jma_catalog_mag(line)
+        if mag is None or (min_mag is not None and mag < min_mag):
+            return None
+        lat = int(line[21:24]) + int(line[24:28]) / 6000.0
+        lon = int(line[32:36]) + int(line[36:40]) / 6000.0
+        dep = line[44:49]
+        depth = float(int(dep[:3])) if dep[3:5] == "  " else int(dep) / 100.0
+        t = _jma_catalog_time(line)
+    except (ValueError, IndexError):
+        return None
+    return t, {"time": t.isoformat(), "lat": lat, "lon": lon, "mag": mag, "depth": depth,
+               "source": "jma_catalog", "place": line[68:92].strip(),
+               "max_int": _JMA_CATALOG_MAXI.get(line[61], "")}
+
+def _jma_catalog_span(path):
+    """年別ファイルに収録されている最初・最後の記録時刻(UTC)を返す。ファイルの更新が
+    無い限り結果をキャッシュする。"""
+    st = os.stat(path)
+    key = (st.st_mtime, st.st_size)
+    hit = _jma_catalog_span_cache.get(path)
+    if hit and hit[0] == key:
+        return hit[1], hit[2]
+    first_line = last_line = None
+    for line in _jma_catalog_iter_lines(path):
+        if line[:1] == "J" and len(line) >= 17:
+            if first_line is None:
+                first_line = line
+            last_line = line
+    first = _jma_catalog_time(first_line) if first_line else None
+    last = _jma_catalog_time(last_line) if last_line else None
+    _jma_catalog_span_cache[path] = (key, first, last)
+    return first, last
+
+def fetch_quakes_jma_catalog_range(start_utc, end_utc, min_mag=None):
+    """指定したUTC期間 [start_utc, end_utc] の地震を、気象庁一元化震源カタログの年別ファイル
+    (JMA_CATALOG_DIR) から読み込む。
+
+    戻り値:
+      list : 読み込めた地震（該当期間に0件ならば空リスト）
+      None : カタログが期間を覆っていない（該当年のファイルが無い／ファイルの収録期間が
+             指定期間より短い）。呼び出し側はUSGSなど別ソースへフォールバックすること。
+    ★ place は英語表記の震央地名。
+    ★ 震度は最大震度のみ（観測点別は含まれない）。
+    """
+    min_mag = JMA_CATALOG_MIN_MAG if min_mag is None else min_mag
+    s_jst = start_utc.astimezone(JST)
+    e_jst = end_utc.astimezone(JST)
+    paths = []
+    for year in range(s_jst.year, e_jst.year + 1):
+        path = _jma_catalog_find(year)
+        if path is None:
+            return None
+        paths.append(path)
+    first = _jma_catalog_span(paths[0])[0]
+    last = _jma_catalog_span(paths[-1])[1]
+    if first is None or last is None:
+        return None
+    if start_utc < first - _JMA_CATALOG_EDGE_TOL or end_utc > last + _JMA_CATALOG_EDGE_TOL:
+        return None
+    # 行頭の「年月日時分(JST)」を文字列のまま比較して、対象外の行を安く読み飛ばす
+    lo = (s_jst - timedelta(minutes=1)).strftime("%Y%m%d%H%M")
+    hi = (e_jst + timedelta(minutes=1)).strftime("%Y%m%d%H%M")
+    found = []
+    for path in paths:
+        for line in _jma_catalog_iter_lines(path):
+            if line[:1] != "J" or not (lo <= line[1:13] <= hi):
+                continue
+            parsed = _parse_jma_catalog_line(line, min_mag)
+            if parsed is None:
+                continue
+            t, q = parsed
+            if t < start_utc or t > end_utc or not in_etas_region(q["lat"], q["lon"]):
+                continue
+            found.append(q)
+    found.sort(key=lambda q: q["time"])
+    print(f"[JMAカタログ] {start_utc.date()}〜{end_utc.date()} {len(found)}件 (M>={min_mag})")
+    return found
+
 def fetch_quakes_usgs():
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=90)
@@ -803,8 +965,9 @@ def load_quakes_between(start_utc, end_utc):
     再解析（アーカイブタブの日時指定検索）用にこちらを使う。
     ★ quakes.csv は_cleanup_old_quakes(keep_days=65)により65日より古いデータが
     削除されるため、65日より前の期間を指定した場合はヒットしない点に注意。
-    アーカイブタブではこの関数の代わりに fetch_quakes_usgs_range() を使うことで
-    65日より古い期間（数年前まで）にも対応している（archive_historical_riskmap参照）。"""
+    アーカイブタブでは、65日より古い期間は代わりに fetch_quakes_jma_catalog_range()
+    （気象庁一元化震源カタログ）または fetch_quakes_usgs_range() を使うことで
+    数年前まで対応している（archive_historical_riskmap参照）。"""
     if not os.path.exists(DATA_FILE): return []
     data = []
     with open(DATA_FILE, encoding="utf-8") as f:
@@ -4551,8 +4714,9 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
   <div class="note">
     気圧偏差・TECは過去分のデータを保持していないため、この検索には含まれません。<br>
     直近60日以内は気象庁(JMA)・P2P地震情報を統合した高精度データを使用します。<br>
-    それより古い日時はUSGSの過去カタログから都度取得します（数年前まで指定可能）。
-    ただし国内のごく小規模な地震が漏れる場合があり、震度情報も含まれません。
+    それより古い日時は、サーバーに気象庁一元化震源カタログの年別ファイルがある期間ならそれを使います。
+    無い期間はUSGSの過去カタログから都度取得します（数年前まで指定可能）。
+    ただしUSGSは国内のごく小規模な地震が漏れる場合があり、震度情報も含まれません。
   </div>
 </div>
 <div id="mp">
@@ -4722,9 +4886,15 @@ function redraw(){
 }
 
 function fmtStatus(d){
-  var srcLabel = d.data_source === 'usgs_historical'
-    ? 'USGS過去カタログ（60日超のため。震度情報なし・小規模地震が漏れる場合あり）'
-    : 'JMA/P2P統合データ（直近60日）';
+  var srcLabel;
+  if(d.data_source === 'jma_catalog'){
+    srcLabel = '気象庁一元化震源カタログ（60日超のため。M' +
+               (d.min_mag != null ? Number(d.min_mag).toFixed(1) : '') + '以上のみ使用）';
+  } else if(d.data_source === 'usgs_historical'){
+    srcLabel = 'USGS過去カタログ（60日超のため。震度情報なし・小規模地震が漏れる場合あり）';
+  } else {
+    srcLabel = 'JMA/P2P統合データ（直近60日）';
+  }
   return '基準時刻: <b>' + d.ref_time_jst + '</b><br>' +
          '取得期間: ' + d.period_start_jst + ' 〜 ' + d.ref_time_jst + '<br>' +
          'データソース: <b>' + srcLabel + '</b><br>' +
@@ -4785,7 +4955,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v8.21</title>
+  <title>地震研究統合プラットフォーム v8.22</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
@@ -4875,7 +5045,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v8.21 / 研究用</div>
+      <div>v8.22 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -4922,7 +5092,7 @@ SHELL_HTML = """<!DOCTYPE html>
     <div class="group-title">ログ</div>
     <button class="tab-btn" onclick="sw(8)">
       <span class="label">アーカイブ</span>
-      <span class="badge">USGS</span>
+      <span class="badge">JMA/USGS</span>
     </button>
 
     <div class="recalc-box">
@@ -5274,7 +5444,8 @@ def gnss_raw_sample():
 
 # quakes.csv（JMA/P2P/USGS統合データ）はkeep_days=HIST_CALIB_LOOKBACK_DAYS(65)より
 # 古いデータを保持していない。アーカイブ検索の対象期間がこの保持範囲より古い場合は
-# ローカルCSVではなくUSGSの過去カタログ(fetch_quakes_usgs_range)から都度取得する。
+# ローカルCSVではなく、気象庁一元化震源カタログ(fetch_quakes_jma_catalog_range)、
+# それが期間を覆っていなければUSGSの過去カタログ(fetch_quakes_usgs_range)から取得する。
 # 保持日数ギリギリではなく少し早めに切り替えることで、バックグラウンド更新の
 # タイミング次第で「本来は残っているはずのデータが直前に削除されていた」ケースを避ける。
 ARCHIVE_LOCAL_SAFE_DAYS = HIST_CALIB_LOOKBACK_DAYS - 5   # = 60日
@@ -5291,8 +5462,11 @@ def archive_historical_riskmap():
       - 取得期間の開始が直近 ARCHIVE_LOCAL_SAFE_DAYS 日以内に収まる場合は、
         従来どおりローカルのquakes.csv（JMA/P2P/USGS統合・重複排除済み）を使う。
       - それより古い期間を含む場合は、quakes.csvには既に無いため、
-        USGSの過去カタログAPIから期間全体を都度取得する（数年前でも取得可能）。
-        期間の一部だけをUSGSに差し替えると検知下限マグニチュードの違いで
+        (1) 気象庁一元化震源カタログ(JMA_CATALOG_DIR の年別ファイル)が期間全体を
+            覆っていればそれを使う（data_source="jma_catalog"。M下限は JMA_CATALOG_MIN_MAG）。
+        (2) 覆っていなければ（該当年のファイル無し・収録期間外）、USGSの過去カタログAPIから
+            期間全体を都度取得する（data_source="usgs_historical"。数年前でも取得可能）。
+        期間の一部だけ別ソースに差し替えると検知下限マグニチュードの違いで
         b値等の計算が歪むため、期間全体を同一ソースに揃えている。
     """
     dt_str = request.args.get("datetime", "")
@@ -5314,11 +5488,20 @@ def archive_historical_riskmap():
         data_source = "local"
         quakes = load_quakes_between(start_utc, ref_time_utc)
     else:
-        data_source = "usgs_historical"
+        quakes = None
         try:
-            quakes = fetch_quakes_usgs_range(start_utc, ref_time_utc)
+            quakes = fetch_quakes_jma_catalog_range(start_utc, ref_time_utc)
         except Exception as e:
-            return {"error": f"過去データ(USGS)の取得に失敗しました: {e}"}, 500
+            import traceback; traceback.print_exc()
+            print(f"[archive] JMAカタログの読み込みに失敗。USGSへフォールバックします: {e}")
+        if quakes is not None:
+            data_source = "jma_catalog"
+        else:
+            data_source = "usgs_historical"
+            try:
+                quakes = fetch_quakes_usgs_range(start_utc, ref_time_utc)
+            except Exception as e:
+                return {"error": f"過去データ(USGS)の取得に失敗しました: {e}"}, 500
 
     if not get_risk_level_thresholds()["calibrated"]:
         return {"error": "絶対基準(過去65日の実績)を計算中です。数分後にもう一度お試しください。"}, 503
@@ -5334,6 +5517,7 @@ def archive_historical_riskmap():
         "period_start_jst": (start_utc.astimezone(JST)).strftime("%Y-%m-%d %H:%M JST"),
         "quake_count": len(quakes),
         "data_source": data_source,
+        "min_mag": JMA_CATALOG_MIN_MAG if data_source == "jma_catalog" else None,
         "thresholds": get_risk_level_thresholds(),
         "cells": cells,
     }
