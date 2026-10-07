@@ -51,7 +51,7 @@ v8.22: アーカイブタブの「60日より古い期間」のデータソー�
 """
 
 from flask import Flask, Response, send_file, request
-import requests, csv, os, math, re, json, threading, time, zipfile, io, bisect, tempfile, base64
+import requests, csv, os, math, re, json, threading, time, zipfile, io, bisect, tempfile, base64, gzip
 from datetime import datetime, timezone, timedelta
 import numpy as np
 
@@ -2776,30 +2776,27 @@ def _parse_pos_file(text):
     GEONET「電子基準点日々の座標値」posファイル(1観測点1年分)をパースし、
     [(date, X, Y, Z), ...] （ECEF座標, 単位m）のリストを返す。
 
-    ★ 注意: GSIの一次資料からは正確な列定義を確認できていない暫定パーサー。
-    ヘッダ行（'*'や'#'始まり、非数値始まりの行）を読み飛ばし、
-    「先頭列が8桁日付(yyyymmdd)、続く3列がECEFのX,Y,Z(概ね10^6〜10^7 m オーダー)」
-    というパターンに一致する行だけを抽出する。想定と異なるフォーマットの場合は
-    黙って0件になるだけなので、/gnss/raw_sample で実物を確認して調整すること。
+    実ファイルの形式（F5.1解で確認済み）:
+      +SITE/INF ... -SITE/INF, +SOLVER/INF ... -SOLVER/INF のヘッダ部のあと
+      +DATA
+      *yyyy mm dd HH:MM:SS  X (m)  Y (m)  Z (m)  Lat.  Lon.  Height
+       2026 01 01 12:00:00 -3.5228455513E+06 2.7771438743E+06 4.5189589316E+06 4.54E+01 1.41E+02 7.46E+01
+      -DATA
+    日付は「年 月 日」の3列に分かれ、4列目が時刻、5〜7列目がECEFのX,Y,Z。
     """
     rows = []
     for line in text.splitlines():
         line = line.strip()
-        if not line or line[0] in ("*", "#"):
+        if not line or line[0] in "*+-#":
             continue
-        parts = line.replace(",", " ").split()
-        if len(parts) < 4:
+        p = line.split()
+        if len(p) < 7:
             continue
-        date_tok = parts[0]
         try:
-            if len(date_tok) == 8 and date_tok.isdigit():
-                d = datetime.strptime(date_tok, "%Y%m%d")
-            else:
-                continue
-            x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+            d = datetime(int(p[0]), int(p[1]), int(p[2]))
+            x, y, z = float(p[4]), float(p[5]), float(p[6])
         except (ValueError, IndexError):
             continue
-        # ECEF座標として妥当な範囲（地球半径オーダー）か簡易チェック
         if not (1e5 < abs(x) < 1e8 and 1e5 < abs(y) < 1e8 and 1e5 < abs(z) < 1e8):
             continue
         rows.append((d, x, y, z))
@@ -2815,23 +2812,28 @@ def _gsi_sftp_connect():
     return sftp, transport
 
 
-# 日々の座標値の格納ディレクトリ候補。2026年4月にF5.1解へ移行中のため両方試す。
-_GNSS_POS_DIR_CANDIDATES = ("/data/coordinates_F5.1/GPS", "/data/coordinates_F5/GPS")
+# 日々の座標値の格納場所（実機のSFTPで確認済み）:
+#   /data/coordinates_F5.1/<年>/<観測点ID6文字>.<年下2桁>.pos.gz   （gzip圧縮）
+# 以前の "…/GPS/<年>/…" という階層は存在しない。
+_GNSS_POS_DIR_CANDIDATES = ("/data/coordinates_F5.1", "/data/coordinates_F5")
 
 
 def _fetch_station_pos_text(sftp, code, year):
-    """指定観測点・年のposファイル本文を取得する。見つからなければNone。"""
+    """指定観測点・年のposファイル本文（gzipは解凍済み）を取得する。見つからなければ(None, None)。"""
     yy = str(year)[2:]
-    fname = f"{code}.{yy}.pos"
     for base in _GNSS_POS_DIR_CANDIDATES:
-        path = f"{base}/{year}/{fname}"
-        try:
-            with sftp.open(path, "r") as f:
-                return f.read().decode("utf-8", errors="ignore"), path
-        except FileNotFoundError:
-            continue
-        except Exception as e:
-            print(f"[GNSS] {code} {path} 取得エラー: {e}")
+        for ext in (".pos.gz", ".pos"):
+            path = f"{base}/{year}/{code}.{yy}{ext}"
+            try:
+                with sftp.open(path, "rb") as f:
+                    raw = f.read()
+                if ext.endswith(".gz"):
+                    raw = gzip.decompress(raw)
+                return raw.decode("utf-8", errors="ignore"), path
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                print(f"[GNSS] {code} {path} 取得エラー: {e}")
     return None, None
 
 
@@ -2841,15 +2843,15 @@ def _fetch_station_positions(sftp, code, lookback_days=GNSS_LOOKBACK_DAYS):
     posファイルは1年分がまとまっているため、年をまたぐ場合は前年分も取得する。
     """
     today = datetime.now(timezone.utc).date()
-    years = [today.year]
-    if today.timetuple().tm_yday <= lookback_days + 5:
-        years.append(today.year - 1)
+    need = lookback_days + 5
 
     all_rows = []
-    for year in years:
+    for year in (today.year, today.year - 1):
         text, _path = _fetch_station_pos_text(sftp, code, year)
         if text:
             all_rows.extend(_parse_pos_file(text))
+        if len(all_rows) >= need:
+            break
 
     dedup = {d: (x, y, z) for d, x, y, z in all_rows}  # 同一日付は後勝ちで統一
     rows = sorted((d, x, y, z) for d, (x, y, z) in dedup.items())
@@ -2901,7 +2903,8 @@ def _compute_station_displacement(rows, lookback_days=GNSS_LOOKBACK_DAYS):
     de = _slope(ts, es) * span * 1000.0  # m → mm
     dn = _slope(ts, ns) * span * 1000.0
     du = _slope(ts, us) * span * 1000.0
-    return {"dE_mm": de, "dN_mm": dn, "dU_mm": du, "n_points": len(recent), "span_days": span}
+    return {"dE_mm": de, "dN_mm": dn, "dU_mm": du, "n_points": len(recent), "span_days": span,
+            "last_date": recent[-1][0].strftime("%Y-%m-%d")}
 
 
 def _refresh_gnss_cache():
@@ -2994,7 +2997,7 @@ def render_gnss(updated_str):
 
     vectors_json = json.dumps(vectors or [], ensure_ascii=False)
     lookback_note = f"直近 {GNSS_LOOKBACK_DAYS} 日間の座標差分（短期変位ベクトル・mm単位）"
-    error_html = f'<p style="color:#f87171">⚠ {gnss_error}</p>' if (live and gnss_error) else ""
+    error_html = f'<p style="color:#f87171">⚠ {gnss_error}</p>' if (GSI_GNSS_ENABLED and gnss_error) else ""
     not_configured_html = ("" if GSI_GNSS_ENABLED else
         '<p style="color:#fbbf24">SFTP未設定のためプレースホルダー表示です。'
         '環境変数 GSI_SFTP_USER / GSI_SFTP_PASS を設定すると実データ表示に切り替わります。</p>')
@@ -5493,6 +5496,17 @@ def hinet_status():
         "last_error": _hinet_status["last_error"],
         "last_count": _hinet_status["last_count"],
     }
+
+@app.route("/gnss/net_test")
+def gnss_net_test():
+    """サーバーからGSIのSFTPポートへTCP接続できるかだけを確認する（認証はしない）。"""
+    import socket
+    try:
+        sock = socket.create_connection((GSI_SFTP_HOST, GSI_SFTP_PORT), timeout=10)
+        sock.close()
+        return {"ok": True, "host": GSI_SFTP_HOST, "port": GSI_SFTP_PORT}
+    except Exception as e:
+        return {"ok": False, "host": GSI_SFTP_HOST, "port": GSI_SFTP_PORT, "error": repr(e)}
 
 @app.route("/gnss/refresh_now", methods=["POST"])
 def gnss_refresh_now():
