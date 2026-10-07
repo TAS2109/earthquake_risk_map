@@ -147,7 +147,10 @@ GSI_SFTP_HOST    = os.environ.get("GSI_SFTP_HOST", "terras.gsi.go.jp").strip() o
 GSI_SFTP_PORT    = int(os.environ.get("GSI_SFTP_PORT", "22") or "22")
 GSI_SFTP_USER    = os.environ.get("GSI_SFTP_USER", "").strip()
 GSI_SFTP_PASS    = os.environ.get("GSI_SFTP_PASS", "").strip()
-GSI_GNSS_ENABLED = bool(_PARAMIKO_AVAILABLE and GSI_SFTP_USER and GSI_SFTP_PASS)
+# Renderから直接SFTPできない場合の代替: 別環境(PC/GitHub Actions)で作った変位JSONのURLを指定
+#   例: https://raw.githubusercontent.com/<owner>/<repo>/main/gnss_vectors.json
+GNSS_JSON_URL    = os.environ.get("GNSS_JSON_URL", "").strip()
+GSI_GNSS_ENABLED = bool(GNSS_JSON_URL or (_PARAMIKO_AVAILABLE and GSI_SFTP_USER and GSI_SFTP_PASS))
 
 GNSS_LOOKBACK_DAYS = 7          # 変位ベクトル計算に使う直近日数（短期変位）
 GNSS_CACHE_SEC     = 6 * 3600   # 座標値は日次更新なので数時間キャッシュで十分
@@ -2914,6 +2917,20 @@ def _refresh_gnss_cache():
             return
         _gnss_cache["updating"] = True
     try:
+        if GNSS_JSON_URL:
+            try:
+                r = requests.get(GNSS_JSON_URL, timeout=20); r.raise_for_status()
+                st = r.json().get("stations", [])
+                with _gnss_lock:
+                    if st:
+                        _gnss_cache["data"] = st; _gnss_cache["error"] = None
+                    else:
+                        _gnss_cache["error"] = "GNSS JSONに観測点データがありません"
+                    _gnss_cache["ts"] = time.time()
+            except Exception as e:
+                with _gnss_lock:
+                    _gnss_cache["error"] = f"GNSS JSON取得エラー: {e}"; _gnss_cache["ts"] = time.time()
+            return
         try:
             sftp, transport = _gsi_sftp_connect()
         except Exception as e:
