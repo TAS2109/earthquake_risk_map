@@ -2241,14 +2241,6 @@ def render_etas(grid_scores, quakes, updated_str):
     cells_js = json.dumps(cells)
     recent_js = json.dumps(recent_markers)
     gs = GRID_SIZE
-    _gnss_name_table()
-    if _gnss_names_info["error"]:
-        names_html = f'<p style="color:#f87171">⚠ 地点名ファイルの読込エラー: {_gnss_names_info["error"]}</p>'
-    elif not _gnss_names_info["path"]:
-        names_html = ('<p style="color:#fbbf24">地点名ファイル(gnss_station_names.json)が見つからないため、'
-                      '一部の観測点はIDのまま表示されます。詳細は /gnss/status の names_file を参照。</p>')
-    else:
-        names_html = ""
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
@@ -3367,6 +3359,14 @@ def render_gnss(updated_str):
         '<p style="color:#fbbf24">SFTP未設定のためプレースホルダー表示です。'
         '環境変数 GSI_SFTP_USER / GSI_SFTP_PASS を設定すると実データ表示に切り替わります。</p>')
 
+    _gnss_name_table()
+    if _gnss_names_info["error"]:
+        names_html = f'<p style="color:#f87171">⚠ 地点名ファイルの読込エラー: {_gnss_names_info["error"]}</p>'
+    elif not _gnss_names_info["path"]:
+        names_html = ('<p style="color:#fbbf24">地点名ファイル(gnss_station_names.json)が見つからないため、'
+                      '一部の観測点はIDのまま表示されます。詳細は /gnss/status の names_file を参照。</p>')
+    else:
+        names_html = ""
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
