@@ -21,6 +21,10 @@ v9.00: GNSS変位（GEONET電子基準点の短期変位）を統合リスクマ
        ・標準プリセットは従来どおり(GNSSなし)。「全データ」「地殻変動」プリセットにGNSSを含める。
        ・GNSS変位タブの各観測点に名称ラベルを常時表示（表示ON/OFF切替つき）。
        ・成分の選択パターンが増えたため(15→31通り)、レベル境界の自動算出対象もGNSS込みに拡張。
+v9.01: GNSS変位タブの観測点ID(070809など)→地点名(韮崎など)置換を強化。先頭ゼロの欠落(70809)・空白・全角数字の表記ゆれでも
+       対応表(上書き表 / data/gnss_station_names.json / GNSS_STATIONS)に当たるようにした。
+       局番号の下4桁(全国で重複しない連番)でも照合する(070809と970809は同じ韮崎)。名称表はキャッシュ化。
+       GNSS_STATIONSの局番号3件を修正(与那国950497→950499、西表島950498→950500、長野950266→950267)。
 
 タブ構成:
   1. 地震履歴     - 有感・無感統合 (JMA / P2P / USGS / Hi-net)
@@ -181,8 +185,8 @@ GNSS_STATIONS = [
     ("021096", "那覇",     26.2124, 127.6809),
     ("960749", "石垣１",   24.3448, 124.1572),
     ("960750", "石垣２",   24.3500, 124.2000),
-    ("950497", "与那国",   24.4667, 123.0100),
-    ("950498", "西表島",   24.3711, 123.7828),
+    ("950499", "与那国",   24.4667, 123.0100),
+    ("950500", "西表島",   24.3711, 123.7828),
     ("940100", "玉城",     26.1500, 127.7667),
     # ― 九州・四国・中国 ―
     ("940097", "鹿児島１", 31.5966, 130.5571),
@@ -201,7 +205,7 @@ GNSS_STATIONS = [
     ("93054",  "浜松",     34.7108, 137.7261),
     ("93013",  "大宮",     35.9068, 139.6236),
     ("132009", "石岡",     36.1893, 140.2825),
-    ("950266", "長野",     36.6513, 138.1810),
+    ("950267", "長野",     36.6513, 138.1810),
     # ― 東北・北海道 ―
     ("950128", "札幌",     43.0642, 141.3469),
     ("960521", "帯広",     42.9180, 143.2040),
@@ -3100,28 +3104,67 @@ def _refresh_gnss_cache():
 # ({"070809": "韮崎", ...} 形式。追加はこのファイルに書くだけで反映) ④GNSS_STATIONSの名称 ⑤ID。
 GNSS_NAME_OVERRIDES = {"070809": "韮崎"}
 GNSS_NAMES_FILE = os.environ.get("GNSS_NAMES_FILE", "data/gnss_station_names.json")
-_gnss_names_cache = {"mtime": None, "table": {}}
+def _gnss_code_variants(code):
+    """(v9.01) 観測点IDの表記ゆれ（先頭ゼロの有無・空白・全角数字）を吸収するための照合キー群。"""
+    c = str(code if code is not None else "").strip()
+    c = c.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    out = [c]
+    if c.isdigit():
+        if len(c) < 6: out.append(c.zfill(6))      # 70809 → 070809
+        z = c.lstrip("0")
+        if z and z != c: out.append(z)             # 070809 → 70809
+    return out
+
+def _gnss_serial_key(code):
+    """(v9.01) 局番号の下4桁（全国で重複しない連番）。上2桁が違う表記（070809と970809）でも同じ局に当てる。"""
+    c = "".join(_gnss_code_variants(code)[:1])
+    return ("#" + c[-4:]) if (c.isdigit() and len(c) >= 4) else None
+
+_gnss_names_cache = {"mtime": None, "built": None}
 
 def _gnss_name_table():
-    table = {str(c): n for c, n, _la, _lo in GNSS_STATIONS}
-    table.update(GNSS_NAME_OVERRIDES)
+    """ID→地点名の対応表（キャッシュ付き。名称ファイルが更新されたときだけ作り直す）。
+    優先順位（後ろほど優先）: GNSS_STATIONS < data/gnss_station_names.json < GNSS_NAME_OVERRIDES"""
     try:
         mt = os.path.getmtime(GNSS_NAMES_FILE)
-        if _gnss_names_cache["mtime"] != mt:
-            with open(GNSS_NAMES_FILE, encoding="utf-8") as f:
-                _gnss_names_cache["table"] = {str(k): str(v) for k, v in json.load(f).items()}
-            _gnss_names_cache["mtime"] = mt
-        table.update(_gnss_names_cache["table"])
     except Exception:
-        pass
+        mt = None
+    if _gnss_names_cache["built"] is not None and _gnss_names_cache["mtime"] == mt:
+        return _gnss_names_cache["built"]
+    table = {}
+    def _add(src):
+        for k, v in src.items():
+            v = str(v).strip()
+            if not v: continue
+            for kk in _gnss_code_variants(k): table[kk] = v
+            sk = _gnss_serial_key(k)
+            if sk: table[sk] = v
+    _add({str(c): n for c, n, _la, _lo in GNSS_STATIONS})
+    if mt is not None:
+        try:
+            with open(GNSS_NAMES_FILE, encoding="utf-8") as f:
+                _add({str(k): str(v) for k, v in json.load(f).items()})
+        except Exception as e:
+            print(f"[GNSS] 名称ファイル読込エラー: {e}")
+    _add(GNSS_NAME_OVERRIDES)
+    _gnss_names_cache["mtime"] = mt
+    _gnss_names_cache["built"] = table
     return table
 
 def _gnss_display_name(code, name=None):
-    """観測点の表示名。nameがIDのまま(数字のみ/codeと同一)なら対応表で地点名に置き換える。"""
-    code = str(code); nm = str(name or "")
-    if nm and nm != code and not nm.isdigit():
+    """観測点の表示名。nameがID（数字のみ・codeと同一）なら対応表で地点名に置き換える。
+    (v9.01) 先頭ゼロの欠落・空白・全角数字の表記ゆれ、および局番号の上2桁違い(070809/970809)でも当たる。"""
+    code = str(code if code is not None else "").strip()
+    nm = str(name if name is not None else "").strip()
+    nm_is_id = (not nm) or nm == code or nm.isdigit() or set(_gnss_code_variants(nm)) & set(_gnss_code_variants(code))
+    if not nm_is_id:
         return nm
-    return _gnss_name_table().get(code) or nm or code
+    table = _gnss_name_table()
+    for k in _gnss_code_variants(code):
+        if table.get(k): return table[k]
+    sk = _gnss_serial_key(code)
+    if sk and table.get(sk): return table[sk]
+    return nm or code
 
 def get_gnss_vectors():
     """
