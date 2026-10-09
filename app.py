@@ -21,6 +21,8 @@ v9.00: GNSS変位（GEONET電子基準点の短期変位）を統合リスクマ
        ・標準プリセットは従来どおり(GNSSなし)。「全データ」「地殻変動」プリセットにGNSSを含める。
        ・GNSS変位タブの各観測点に名称ラベルを常時表示（表示ON/OFF切替つき）。
        ・成分の選択パターンが増えたため(15→31通り)、レベル境界の自動算出対象もGNSS込みに拡張。
+v9.02: 地点名表は別ファイル(gnss_station_names.json)のまま、探す場所を増やし(data/ やapp本体と同じ場所、Renderの/etc/secrets)、
+       読み込み結果をログ・/gnss/status・GNSSタブに表示するようにした(置き忘れ/置き場所違いに気づける)。
 v9.01: GNSS変位タブの観測点ID(070809など)→地点名(韮崎など)置換を強化。先頭ゼロの欠落(70809)・空白・全角数字の表記ゆれでも
        対応表(上書き表 / data/gnss_station_names.json / GNSS_STATIONS)に当たるようにした。
        局番号の下4桁(全国で重複しない連番)でも照合する(070809と970809は同じ韮崎)。名称表はキャッシュ化。
@@ -2239,6 +2241,14 @@ def render_etas(grid_scores, quakes, updated_str):
     cells_js = json.dumps(cells)
     recent_js = json.dumps(recent_markers)
     gs = GRID_SIZE
+    _gnss_name_table()
+    if _gnss_names_info["error"]:
+        names_html = f'<p style="color:#f87171">⚠ 地点名ファイルの読込エラー: {_gnss_names_info["error"]}</p>'
+    elif not _gnss_names_info["path"]:
+        names_html = ('<p style="color:#fbbf24">地点名ファイル(gnss_station_names.json)が見つからないため、'
+                      '一部の観測点はIDのまま表示されます。詳細は /gnss/status の names_file を参照。</p>')
+    else:
+        names_html = ""
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
@@ -3120,13 +3130,39 @@ def _gnss_serial_key(code):
     c = "".join(_gnss_code_variants(code)[:1])
     return ("#" + c[-4:]) if (c.isdigit() and len(c) >= 4) else None
 
+_gnss_names_info = {"path": None, "count": 0, "tried": [], "error": None, "logged": False}
+
+def _gnss_names_candidates():
+    here = os.path.dirname(os.path.abspath(__file__))
+    names = [GNSS_NAMES_FILE, "data/gnss_station_names.json", "gnss_station_names.json"]
+    out = []
+    for n in names:
+        if os.path.isabs(n):
+            out.append(n)
+        else:
+            out += [os.path.abspath(n), os.path.join(here, n)]   # カレントディレクトリ基準 / app本体と同じ場所基準
+    out.append("/etc/secrets/gnss_station_names.json")             # Renderの Secret Files 置き場
+    seen, res = set(), []
+    for p in out:
+        if p not in seen: seen.add(p); res.append(p)
+    return res
+
+def _gnss_names_path():
+    """名称ファイル(別ファイル)の場所。複数の候補から最初に見つかったものを使う。無ければNone。"""
+    cands = _gnss_names_candidates()
+    _gnss_names_info["tried"] = cands
+    for p in cands:
+        if os.path.isfile(p): return p
+    return None
+
 _gnss_names_cache = {"mtime": None, "built": None}
 
 def _gnss_name_table():
     """ID→地点名の対応表（キャッシュ付き。名称ファイルが更新されたときだけ作り直す）。
     優先順位（後ろほど優先）: GNSS_STATIONS < data/gnss_station_names.json < GNSS_NAME_OVERRIDES"""
+    path = _gnss_names_path()
     try:
-        mt = os.path.getmtime(GNSS_NAMES_FILE)
+        mt = (path, os.path.getmtime(path)) if path else None
     except Exception:
         mt = None
     if _gnss_names_cache["built"] is not None and _gnss_names_cache["mtime"] == mt:
@@ -3140,12 +3176,23 @@ def _gnss_name_table():
             sk = _gnss_serial_key(k)
             if sk: table[sk] = v
     _add({str(c): n for c, n, _la, _lo in GNSS_STATIONS})
-    if mt is not None:
+    _gnss_names_info.update(path=path, count=0, error=None)
+    if path:
         try:
-            with open(GNSS_NAMES_FILE, encoding="utf-8") as f:
-                _add({str(k): str(v) for k, v in json.load(f).items()})
+            with open(path, encoding="utf-8") as f:
+                loaded = {str(k): str(v) for k, v in json.load(f).items()}
+            _add(loaded)
+            _gnss_names_info["count"] = len(loaded)
         except Exception as e:
-            print(f"[GNSS] 名称ファイル読込エラー: {e}")
+            _gnss_names_info["error"] = f"{type(e).__name__}: {e}"
+    if not _gnss_names_info["logged"] or _gnss_names_info["error"]:
+        _gnss_names_info["logged"] = True
+        if _gnss_names_info["error"]:
+            print(f"[GNSS] 名称ファイルの読込エラー ({path}): {_gnss_names_info['error']}")
+        elif path:
+            print(f"[GNSS] 名称ファイルを読み込みました: {path} ({_gnss_names_info['count']}件)")
+        else:
+            print("[GNSS] 名称ファイルが見つかりません。探した場所: " + ", ".join(_gnss_names_info["tried"]))
     _add(GNSS_NAME_OVERRIDES)
     _gnss_names_cache["mtime"] = mt
     _gnss_names_cache["built"] = table
@@ -3390,6 +3437,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
       </p>
       {error_html}
       {not_configured_html}
+      {names_html}
     </div>
     <div class="sec">
       <h3>表示設定</h3>
@@ -5825,6 +5873,10 @@ def gnss_status():
         "history_stations": len(_gnss_cache.get("hist") or {}),      # (v9.00) 日次履歴を持つ観測点数
         "history_range": _gnss_hist_range(),                         # (v9.00) 履歴の日付範囲
         "risk_pool_ready": bool(_hist_calib_cache.get("gnss_cell")), # (v9.00) リスクマップの基準にGNSSが入っているか
+        "names_file": (_gnss_name_table() and {                      # (v9.02) 地点名ファイルの読込状況
+            "found": bool(_gnss_names_info["path"]), "path": _gnss_names_info["path"],
+            "entries": _gnss_names_info["count"], "error": _gnss_names_info["error"],
+            "searched": _gnss_names_info["tried"]}),
     }
 
 @app.route("/hinet/debug_raw")
