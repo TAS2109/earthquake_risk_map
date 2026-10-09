@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v9.00
+地震研究統合プラットフォーム v9.04
 
+v9.04: GNSS変位タブの矢印を見やすく刷新。表示倍率を 400→1500 m/mm（約3.8倍）に引き上げ、さらに
+       「大きい変位を強調」（変位が大きいほど長さを非線形に上乗せ）を既定ONにして、変位の大きい観測点が目立つようにした。
+       ・倍率スライダー(×0.3〜×4.0 相当)と強調ON/OFFを地図右上に追加。凡例の「10mm＝何km」も連動して更新。
+       ・矢頭をズームに依存しないピクセルサイズにし（旧: 度単位固定でズームすると潰れた/巨大化した）、線の太さに連動。
+       ・変位に応じて太さ・不透明度・色(4段階: ノイズ≤3/小/中/大)を変え、黒縁取りで暗い地図上でも視認性を確保。
+       ・変位の大きい点(>7mm)は観測点名ONでなくても「名称＋mm」ラベルを常時表示、15mm超は強調リング付き。
+       ・大きい変位ほど最前面に描画。観測点リストを変位の大きい順にし、棒グラフ・サマリーを追加。
 v8.20: 統合リスクマップのレベル境界(Lv1〜Lv5のしきい値)を、過去65日の実績から
        自動キャリブレーションする方式に変更（平穏時のLv別セル数を目標値に合わせる）。
        目標値は RISK_LEVEL_TARGETS で調整可能。
@@ -3386,7 +3393,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
   #content{{flex-direction:column;overflow-y:auto}}
   #map{{flex:none;height:42vh;min-height:220px}}
   #panel{{width:100%;border-left:none;border-top:1px solid rgba(255,255,255,.14)}}
-  #station-list{{max-height:160px}}
+  #station-list{{max-height:240px}}
 }}
 .sec{{margin-bottom:14px}}
 .sec h3{{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid rgba(255,255,255,.14);padding-bottom:4px}}
@@ -3397,12 +3404,34 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
 .link-btn:hover{{opacity:0.85}}
 .phase{{background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);border-left:3px solid #7c3aed;padding:6px 8px;border-radius:0 12px 12px 0;
         margin-bottom:6px;font-size:11px;color:rgba(235,238,245,.72)}}
-#station-list{{max-height:220px;overflow-y:auto;font-size:10px;color:rgba(235,238,245,.62);line-height:1.6}}
+#station-list{{max-height:46vh;overflow-y:auto;font-size:10px;color:rgba(235,238,245,.62);line-height:1.6}}
 #station-list div{{padding:2px 0;border-bottom:1px solid rgba(255,255,255,.14)}}
 /* (v9.00) 観測点名ラベル: 地図上に常時表示（背景なし・縁取り文字で地図上でも読める） */
 .gnss-label{{background:transparent!important;border:none!important;box-shadow:none!important;color:#f3f4f6;font-size:10px;font-weight:600;padding:0 2px;text-shadow:0 0 3px #000,0 0 3px #000,0 0 2px #000;pointer-events:none}}
 .gnss-label:before{{display:none!important}}
-#map.hide-names .gnss-label{{display:none}}
+#map.hide-names .gnss-label:not(.gnss-label-big){{display:none}}
+/* (v9.04) 大きい変位の観測点は名称＋mmを常時表示 */
+.gnss-label.gnss-label-big{{font-size:11px;font-weight:700}}
+.gnss-label.gnss-label-big b{{font-weight:800}}
+.gctl{{background:rgba(26,29,44,.62);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);padding:10px 12px;border-radius:16px;border:1px solid rgba(255,255,255,.18);font-size:11px;color:#f3f4f6;width:196px;line-height:1.5}}
+.gctl .row{{display:flex;justify-content:space-between;align-items:baseline;gap:6px}}
+.gctl .ttl{{font-weight:700;font-size:12px}}
+.gctl .val{{color:#93c5fd;font-weight:700;font-variant-numeric:tabular-nums}}
+.gctl input[type=range]{{width:100%;margin:6px 0 4px;accent-color:#60a5fa}}
+.gctl label{{display:flex;align-items:center;gap:6px;cursor:pointer;color:rgba(240,242,247,.88)}}
+.gctl label input{{width:14px;height:14px}}
+.gctl small{{display:block;color:rgba(235,238,245,.5);margin-top:4px;font-size:10px;line-height:1.5}}
+#gsum{{font-size:11px;color:rgba(240,242,247,.85);line-height:1.7;margin-bottom:8px;padding:6px 8px;background:rgba(255,255,255,.07);border-radius:10px}}
+#gsum b{{font-variant-numeric:tabular-nums}}
+.st-row{{padding:4px 0!important;cursor:pointer}}
+.st-row:hover{{background:rgba(255,255,255,.06)}}
+.st-head{{display:flex;align-items:baseline;gap:6px}}
+.st-head .nm{{font-weight:700;color:rgba(240,242,247,.92);font-size:11px}}
+.st-head .cd{{color:rgba(235,238,245,.36);font-size:9px}}
+.st-head .mg{{margin-left:auto;font-weight:800;font-size:11px;font-variant-numeric:tabular-nums}}
+.st-bar{{height:4px;border-radius:2px;background:rgba(255,255,255,.08);margin:3px 0 2px;overflow:hidden}}
+.st-bar i{{display:block;height:100%;border-radius:2px}}
+.st-sub{{color:rgba(235,238,245,.55);font-size:10px}}
 .opt-row{{display:flex;align-items:center;gap:8px;font-size:12px;color:rgba(240,242,247,.85);cursor:pointer}}
 .opt-row input{{width:15px;height:15px}}
 </style></head><body>
@@ -3432,7 +3461,8 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
       <h3>変位ベクトルについて</h3>
       <p>
         {lookback_note}。<br>
-        矢印は東西・南北方向の変位を誇張した縮尺で表示しています（実際の変位量はmm〜cmオーダー）。<br>
+        矢印は水平変位（東西・南北）を誇張した縮尺で表示しています（実際の変位量はmm〜cmオーダー）。<br>
+        地図右上のスライダーで倍率を変えられます。「大きい変位を強調」がONの間は、変位の大きい点ほど長さをさらに上乗せして目立たせます（向きは変わりません）。<br>
         対象範囲: ETAS計算対象域（先島諸島〜北海道）内の代表{len(GNSS_STATIONS)}点。
       </p>
       {error_html}
@@ -3444,7 +3474,8 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
       <label class="opt-row"><input type="checkbox" id="chkNames" onchange="toggleNames(this.checked)">観測点名を地図上に表示</label>
     </div>
     <div class="sec">
-      <h3>観測点リスト</h3>
+      <h3>観測点リスト（変位の大きい順）</h3>
+      <div id="gsum"></div>
       <div id="station-list"></div>
     </div>
   </div>
@@ -3460,10 +3491,13 @@ var CONFIGURED = {stations_json};   // 設定済みの全観測点（実デー�
 
 
 var listEl = document.getElementById('station-list');
+var sumEl  = document.getElementById('gsum');
+function esc(t){{ return String(t).replace(/[&<>"']/g, function(c){{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]; }}); }}
 
-// (v9.00) 観測点名ラベル（常時表示。パネルのチェックでON/OFF）
+// (v9.00) 観測点名ラベル（パネルのチェックでON/OFF）
 document.getElementById('map').classList.add('hide-names');   // 既定は非表示（チェックで表示）
 var NAME_OPT = {{permanent:true, direction:'right', offset:[6,0], className:'gnss-label', opacity:1}};
+var NAME_BIG = {{permanent:true, direction:'right', offset:[10,0], className:'gnss-label gnss-label-big', opacity:1}};
 function toggleNames(on){{ document.getElementById('map').classList.toggle('hide-names', !on); }}
 
 if (!LIVE) {{
@@ -3472,61 +3506,149 @@ if (!LIVE) {{
      .bindTooltip(s.name, NAME_OPT).addTo(map);
   }});
   listEl.innerHTML = '<div style="color:rgba(235,238,245,.46)">実データ未取得のため変位は表示されません（設定済みの観測点名のみ表示）</div>';
+  sumEl.style.display = 'none';
 }} else {{
-  // 変位量(mm)を地図上で見やすくするための誇張スケール（メートル/mm）
-  var SCALE_M_PER_MM = 400;
+  // ── (v9.04) 矢印の表示設定 ─────────────────────────
+  var OLD_SCALE = 400;            // v9.03までの倍率(m/mm)。倍率表示の基準
+  var scaleMPerMm = 1500;         // 既定の倍率(m/mm)。旧の約3.8倍
+  var emphasize = true;           // 大きい変位を強調（長さの非線形上乗せ）
+  var NOISE_MM = 3, MID_MM = 7, BIG_MM = 15;
+  var COLORS  = ['#8b9bb4', '#34d399', '#fbbf24', '#f87171'];   // ノイズ級 / 小 / 中 / 大
+  var LV_TEXT = ['ノイズ級', '小', '中', '大'];
   var mPerDegLat = 111320.0;
 
-  function destPoint(lat, lon, dE_mm, dN_mm){{
-    var mPerDegLon = 111320.0 * Math.cos(lat * Math.PI/180);
-    var dxM = dE_mm * SCALE_M_PER_MM, dyM = dN_mm * SCALE_M_PER_MM;
-    return [lat + dyM/mPerDegLat, lon + dxM/mPerDegLon];
+  VECTORS.forEach(function(v){{ v.mag = Math.sqrt(v.dE_mm*v.dE_mm + v.dN_mm*v.dN_mm); }});
+  var byMagAsc  = VECTORS.slice().sort(function(a,b){{ return a.mag - b.mag; }});   // 小→大の順に描く＝大きい点が最前面
+  var byMagDesc = byMagAsc.slice().reverse();
+  var MAXMAG = byMagDesc.length ? Math.max(byMagDesc[0].mag, 1) : 1;
+
+  function level(mag){{ return mag > BIG_MM ? 3 : (mag > MID_MM ? 2 : (mag > NOISE_MM ? 1 : 0)); }}
+
+  // 強調ON: 3mm以下は等倍、それより大きいほど長さを上乗せ（5mm→×1.0, 15mm→×1.55, 30mm→×2.0）
+  function effMag(mag){{ return emphasize ? mag * Math.pow(Math.max(mag, NOISE_MM) / 5.0, 0.4) : mag; }}
+
+  function destPoint(v){{
+    var k = v.mag > 0 ? effMag(v.mag) / v.mag : 0;
+    var mPerDegLon = 111320.0 * Math.cos(v.lat * Math.PI/180);
+    var dxM = v.dE_mm * k * scaleMPerMm, dyM = v.dN_mm * k * scaleMPerMm;
+    return [v.lat + dyM/mPerDegLat, v.lon + dxM/mPerDegLon];
   }}
 
+  // 矢頭はピクセル基準で作る（ズームしても形が崩れない）
+  function headPolygon(from, to, headPx){{
+    var z = map.getZoom();
+    var p0 = map.project(L.latLng(from[0], from[1]), z), p1 = map.project(L.latLng(to[0], to[1]), z);
+    var dx = p1.x - p0.x, dy = p1.y - p0.y, len = Math.sqrt(dx*dx + dy*dy);
+    if (len < 3) return null;
+    var hs = Math.min(headPx, len * 0.7), ux = dx/len, uy = dy/len, a = 0.45;
+    function wing(s){{
+      var bx = -ux*Math.cos(a) + uy*s*Math.sin(a), by = -ux*s*Math.sin(a) - uy*Math.cos(a);
+      var q = map.unproject(L.point(p1.x + hs*bx, p1.y + hs*by), z);
+      return [q.lat, q.lng];
+    }}
+    return [to, wing(1), wing(-1)];
+  }}
+
+  var layer = L.layerGroup().addTo(map);
+  function draw(){{
+    layer.clearLayers();
+    byMagAsc.forEach(function(v){{
+      var lv = level(v.mag), color = COLORS[lv];
+      var w  = 1.6 + Math.min(v.mag, 30) / 30 * 3.4;           // 1.6〜5px: 大きい変位ほど太く
+      var op = lv === 0 ? 0.55 : (lv === 1 ? 0.82 : 1.0);       // ノイズ級は控えめに
+      var dest = destPoint(v);
+      var tip = esc(v.name) + '：東' + v.dE_mm.toFixed(1) + 'mm / 北' + v.dN_mm.toFixed(1) + 'mm → 水平 <b>' + v.mag.toFixed(1) + 'mm</b>（' + v.span_days + '日間）';
+
+      if (lv >= 2) {{   // 強調リング
+        L.circleMarker([v.lat, v.lon], {{radius: lv === 3 ? 12 : 9, color: color, weight: 2, opacity: 0.55, fill: false, interactive: false}}).addTo(layer);
+      }}
+      var label = lv >= 2
+        ? '<span style="color:' + color + '">' + esc(v.name) + ' <b>' + v.mag.toFixed(1) + 'mm</b></span>'
+        : esc(v.name);
+      L.circleMarker([v.lat, v.lon], {{radius: 3 + lv * 0.8, color: '#05070d', weight: 1, fillColor: color, fillOpacity: 1}})
+       .bindTooltip(label, lv >= 2 ? NAME_BIG : NAME_OPT).addTo(layer);
+
+      if (v.mag > 0) {{
+        L.polyline([[v.lat, v.lon], dest], {{color: '#000', weight: w + 3, opacity: 0.5, lineCap: 'round', interactive: false}}).addTo(layer);   // 縁取り
+        L.polyline([[v.lat, v.lon], dest], {{color: color, weight: w, opacity: op, lineCap: 'round'}}).bindTooltip(tip).addTo(layer);
+        var hp = headPolygon([v.lat, v.lon], dest, 7 + w * 2.2);
+        if (hp) L.polygon(hp, {{color: '#000', weight: 1, opacity: 0.5, fillColor: color, fillOpacity: op, interactive: false}}).addTo(layer);
+      }}
+    }});
+    updateLegend();
+  }}
+
+  // ── 右上コントロール（倍率・強調） ──────────────────
+  var ctl = L.control({{position: 'topright'}});
+  ctl.onAdd = function(){{
+    var d = L.DomUtil.create('div', 'gctl');
+    d.innerHTML =
+        '<div class="row"><span class="ttl">矢印の倍率</span><span class="val" id="gScaleVal"></span></div>'
+      + '<input type="range" id="gScale" min="400" max="6000" step="100" value="' + scaleMPerMm + '">'
+      + '<label><input type="checkbox" id="gEmph" checked>大きい変位を強調</label>'
+      + '<small id="gScaleNote"></small>';
+    L.DomEvent.disableClickPropagation(d);
+    L.DomEvent.disableScrollPropagation(d);
+    return d;
+  }};
+  ctl.addTo(map);
+  function refreshCtl(){{
+    document.getElementById('gScaleVal').textContent = '×' + (scaleMPerMm / OLD_SCALE).toFixed(1) + '（従来比）';
+    document.getElementById('gScaleNote').textContent = '1mm ＝ ' + (scaleMPerMm / 1000).toFixed(1) + 'km（強調' + (emphasize ? 'ON' : 'OFF') + '）';
+  }}
+  document.getElementById('gScale').addEventListener('input', function(e){{ scaleMPerMm = +e.target.value; refreshCtl(); draw(); }});
+  document.getElementById('gEmph').addEventListener('change', function(e){{ emphasize = e.target.checked; refreshCtl(); draw(); }});
+  map.on('zoomend', draw);   // 矢頭はピクセル基準なのでズーム後に作り直す
+
+  // ── 観測点リスト（変位の大きい順）＋サマリー ─────────
+  var nBig = byMagDesc.filter(function(v){{ return v.mag > BIG_MM; }}).length;
+  var nMid = byMagDesc.filter(function(v){{ return v.mag > MID_MM; }}).length;
+  sumEl.innerHTML = byMagDesc.length
+    ? '最大 <b style="color:' + COLORS[level(byMagDesc[0].mag)] + '">' + byMagDesc[0].mag.toFixed(1) + 'mm</b>（' + esc(byMagDesc[0].name) + '）<br>'
+      + '15mm超 <b style="color:' + COLORS[3] + '">' + nBig + '</b>点 ／ 7mm超 <b style="color:' + COLORS[2] + '">' + nMid + '</b>点 ／ 全 <b>' + byMagDesc.length + '</b>点'
+    : '';
   var listHtml = '';
-  VECTORS.forEach(function(v){{
-    var mag = Math.sqrt(v.dE_mm*v.dE_mm + v.dN_mm*v.dN_mm);
-    var color = mag > 15 ? '#f87171' : (mag > 7 ? '#fbbf24' : '#34d399');
-    var dest = destPoint(v.lat, v.lon, v.dE_mm, v.dN_mm);
-
-    L.circleMarker([v.lat, v.lon], {{radius:3.5, color:color, fillColor:color, fillOpacity:0.9, weight:1}})
-     .bindTooltip(v.name, NAME_OPT).addTo(map);
-    L.polyline([[v.lat, v.lon], dest], {{color:color, weight:2, opacity:0.85}})
-     .bindTooltip(v.name + '：東' + v.dE_mm.toFixed(1) + 'mm / 北' + v.dN_mm.toFixed(1) + 'mm（' + v.span_days + '日間）')
-     .addTo(map);
-    // 簡易矢頭
-    var ang = Math.atan2(dest[0]-v.lat, dest[1]-v.lon);
-    var ah = 0.10, aw = 0.35;
-    var wing1 = [dest[0] - ah*Math.sin(ang) + aw*ah*Math.cos(ang), dest[1] - ah*Math.cos(ang) - aw*ah*Math.sin(ang)];
-    var wing2 = [dest[0] - ah*Math.sin(ang) - aw*ah*Math.cos(ang), dest[1] - ah*Math.cos(ang) + aw*ah*Math.sin(ang)];
-    L.polygon([dest, wing1, wing2], {{color:color, fillColor:color, fillOpacity:0.9, weight:0}}).addTo(map);
-
-    listHtml += '<div style="cursor:pointer" onclick="map.flyTo([' + v.lat + ',' + v.lon + '],8,{{duration:0.6}})"><b style="color:rgba(240,242,247,.85)">' + v.name + '</b>' + (/^[0-9]+$/.test(v.name) ? '' : '<span style="color:rgba(235,238,245,.36);font-size:9px">　' + v.code + '</span>') + '<br>'
-      + '東西: ' + v.dE_mm.toFixed(1) + 'mm　南北: ' + v.dN_mm.toFixed(1) + 'mm　上下: ' + v.dU_mm.toFixed(1) + 'mm'
-      + '　<span style="color:rgba(235,238,245,.46)">(' + v.n_points + '点/' + v.span_days + '日)</span></div>';
+  byMagDesc.forEach(function(v){{
+    var lv = level(v.mag), color = COLORS[lv];
+    var pct = Math.max(2, Math.min(100, v.mag / Math.max(MAXMAG, BIG_MM) * 100));
+    listHtml += '<div class="st-row" onclick="map.flyTo([' + v.lat + ',' + v.lon + '],8,{{duration:0.6}})">'
+      + '<div class="st-head"><span class="nm">' + esc(v.name) + '</span>'
+      + (/^[0-9]+$/.test(v.name) ? '' : '<span class="cd">' + esc(v.code) + '</span>')
+      + '<span class="mg" style="color:' + color + '">' + v.mag.toFixed(1) + 'mm</span></div>'
+      + '<div class="st-bar"><i style="width:' + pct.toFixed(0) + '%;background:' + color + '"></i></div>'
+      + '<div class="st-sub">東西 ' + v.dE_mm.toFixed(1) + '　南北 ' + v.dN_mm.toFixed(1) + '　上下 ' + v.dU_mm.toFixed(1) + 'mm　(' + v.n_points + '点/' + v.span_days + '日)</div></div>';
   }});
   listEl.innerHTML = listHtml || '<div style="color:rgba(235,238,245,.46)">データなし</div>';
 }}
 
 // 凡例
-var legend=L.control({{position:'bottomleft'}});
-legend.onAdd=function(){{
-  var d=L.DomUtil.create('div');
-  d.style.cssText='background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);padding:10px 14px;border-radius:18px;border:1px solid rgba(255,255,255,.18);font-size:12px;color:#f3f4f6;line-height:2';
-  if (LIVE) {{
-    d.innerHTML='<b>GNSS変位ベクトル</b><br>'
-      + '<span style="color:#34d399">━</span> 小（≤7mm）　'
-      + '<span style="color:#fbbf24">━</span> 中（〜15mm）　'
-      + '<span style="color:#f87171">━</span> 大（15mm〜）<br>'
-      + '<hr style="border-color:rgba(255,255,255,.18);margin:4px 0">'
-      + '<small>矢印の向き＝変位方向、長さは誇張表示</small>';
-  }} else {{
-    d.innerHTML='<b>GNSS 電子基準点</b><br><span style="color:#34d399">●</span> GEONET基準点（仮）<br>'
+var legendDiv = null;
+function updateLegend(){{
+  if (!legendDiv || !LIVE) return;
+  var km = function(mm){{ return (effMag(mm) * scaleMPerMm / 1000); }};
+  var row = function(c, w, t){{ return '<span style="display:inline-block;width:22px;height:' + w + 'px;background:' + c + ';border-radius:2px;vertical-align:middle;margin-right:6px"></span>' + t + '<br>'; }};
+  legendDiv.innerHTML = '<b>GNSS変位ベクトル（水平・直近' + (VECTORS.length ? VECTORS[0].span_days : '') + '日）</b><br>'
+    + row(COLORS[3], 5, '大（15mm超）　長さ ' + km(20).toFixed(0) + 'km@20mm')
+    + row(COLORS[2], 4, '中（7〜15mm）')
+    + row(COLORS[1], 3, '小（3〜7mm）')
+    + row(COLORS[0], 2, 'ノイズ級（3mm以下）')
+    + '<hr style="border-color:rgba(255,255,255,.18);margin:4px 0">'
+    + '<small>10mm ＝ 地図上 ' + km(10).toFixed(1) + 'km　／　向き＝変位方向<br>'
+    + (emphasize ? '大きい変位ほど長さを非線形に強調中' : '強調OFF（変位に比例）') + '</small>';
+}}
+var legend = L.control({{position:'bottomleft'}});
+legend.onAdd = function(){{
+  var d = L.DomUtil.create('div');
+  d.style.cssText = 'background:rgba(26,29,44,.55);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);padding:10px 14px;border-radius:18px;border:1px solid rgba(255,255,255,.18);font-size:12px;color:#f3f4f6;line-height:1.9';
+  legendDiv = d;
+  if (!LIVE) {{
+    d.innerHTML = '<b>GNSS 電子基準点</b><br><span style="color:#34d399">●</span> GEONET基準点（仮）<br>'
       + '<hr style="border-color:rgba(255,255,255,.18);margin:4px 0"><small>実データはSFTP設定後に表示されます</small>';
   }}
   return d;
 }};
 legend.addTo(map);
+if (LIVE) {{ refreshCtl(); draw(); }}
 </script></body></html>"""
 
 
@@ -5386,7 +5508,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v9.00</title>
+  <title>地震研究統合プラットフォーム v9.04</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
@@ -5481,7 +5603,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v9.00 / 研究用</div>
+      <div>v9.04 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
