@@ -3095,6 +3095,34 @@ def _refresh_gnss_cache():
             _gnss_cache["updating"] = False
 
 
+# (v9.00) 観測点ID(070809など)を地点名(韮崎など)で表示するための対応表。
+# 優先順: ①データ側のnameが地点名ならそれ ②下の上書き表 ③data/gnss_station_names.json
+# ({"070809": "韮崎", ...} 形式。追加はこのファイルに書くだけで反映) ④GNSS_STATIONSの名称 ⑤ID。
+GNSS_NAME_OVERRIDES = {"070809": "韮崎"}
+GNSS_NAMES_FILE = os.environ.get("GNSS_NAMES_FILE", "data/gnss_station_names.json")
+_gnss_names_cache = {"mtime": None, "table": {}}
+
+def _gnss_name_table():
+    table = {str(c): n for c, n, _la, _lo in GNSS_STATIONS}
+    table.update(GNSS_NAME_OVERRIDES)
+    try:
+        mt = os.path.getmtime(GNSS_NAMES_FILE)
+        if _gnss_names_cache["mtime"] != mt:
+            with open(GNSS_NAMES_FILE, encoding="utf-8") as f:
+                _gnss_names_cache["table"] = {str(k): str(v) for k, v in json.load(f).items()}
+            _gnss_names_cache["mtime"] = mt
+        table.update(_gnss_names_cache["table"])
+    except Exception:
+        pass
+    return table
+
+def _gnss_display_name(code, name=None):
+    """観測点の表示名。nameがIDのまま(数字のみ/codeと同一)なら対応表で地点名に置き換える。"""
+    code = str(code); nm = str(name or "")
+    if nm and nm != code and not nm.isdigit():
+        return nm
+    return _gnss_name_table().get(code) or nm or code
+
 def get_gnss_vectors():
     """
     キャッシュ済みのGNSS変位データを返す。
@@ -3110,6 +3138,8 @@ def get_gnss_vectors():
         updating = _gnss_cache["updating"]
     if (data is None or stale) and not updating:
         threading.Thread(target=_refresh_gnss_cache, daemon=True).start()
+    if data:   # (v9.00) 表示用に地点名へ置換したコピーを返す（キャッシュ本体は変えない）
+        data = [dict(v, name=_gnss_display_name(v.get("code", ""), v.get("name"))) for v in data]
     return data
 
 
@@ -3145,7 +3175,7 @@ def _gnss_station_values(ref_time=None):
             ds = (ref_date - timedelta(days=lag)).strftime("%Y-%m-%d")
             rec = d.get(ds)
             if rec:
-                out.append((code, h["name"], h["lat"], h["lon"], math.hypot(rec[0], rec[1]), ds))
+                out.append((code, _gnss_display_name(code, h["name"]), h["lat"], h["lon"], math.hypot(rec[0], rec[1]), ds))
                 break
     return out
 
@@ -3320,7 +3350,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
     </div>
     <div class="sec">
       <h3>表示設定</h3>
-      <label class="opt-row"><input type="checkbox" id="chkNames" checked onchange="toggleNames(this.checked)">観測点名を地図上に表示</label>
+      <label class="opt-row"><input type="checkbox" id="chkNames" onchange="toggleNames(this.checked)">観測点名を地図上に表示</label>
     </div>
     <div class="sec">
       <h3>観測点リスト</h3>
@@ -3341,6 +3371,7 @@ var CONFIGURED = {stations_json};   // 設定済みの全観測点（実デー�
 var listEl = document.getElementById('station-list');
 
 // (v9.00) 観測点名ラベル（常時表示。パネルのチェックでON/OFF）
+document.getElementById('map').classList.add('hide-names');   // 既定は非表示（チェックで表示）
 var NAME_OPT = {{permanent:true, direction:'right', offset:[6,0], className:'gnss-label', opacity:1}};
 function toggleNames(on){{ document.getElementById('map').classList.toggle('hide-names', !on); }}
 
@@ -3379,7 +3410,7 @@ if (!LIVE) {{
     var wing2 = [dest[0] - ah*Math.sin(ang) - aw*ah*Math.cos(ang), dest[1] - ah*Math.cos(ang) + aw*ah*Math.sin(ang)];
     L.polygon([dest, wing1, wing2], {{color:color, fillColor:color, fillOpacity:0.9, weight:0}}).addTo(map);
 
-    listHtml += '<div style="cursor:pointer" onclick="map.flyTo([' + v.lat + ',' + v.lon + '],8,{{duration:0.6}})"><b style="color:rgba(240,242,247,.85)">' + v.name + '</b>（' + v.code + '）<br>'
+    listHtml += '<div style="cursor:pointer" onclick="map.flyTo([' + v.lat + ',' + v.lon + '],8,{{duration:0.6}})"><b style="color:rgba(240,242,247,.85)">' + v.name + '</b>' + (/^[0-9]+$/.test(v.name) ? '' : '<span style="color:rgba(235,238,245,.36);font-size:9px">　' + v.code + '</span>') + '<br>'
       + '東西: ' + v.dE_mm.toFixed(1) + 'mm　南北: ' + v.dN_mm.toFixed(1) + 'mm　上下: ' + v.dU_mm.toFixed(1) + 'mm'
       + '　<span style="color:rgba(235,238,245,.46)">(' + v.n_points + '点/' + v.span_days + '日)</span></div>';
   }});
