@@ -35,6 +35,8 @@
      共有URL/CSV出力、PWA化。通知は「時期の警報」と誤解されないよう、注目セルの変化として位置づける。
 
 ■ 更新履歴（要点のみ）
+  v9.08 TEC取得をGNSSと同じ方式に統一(有効判定TEC_ENABLED／更新中フラグ付きの裏更新／古ければアクセス時に再取得／
+        TEC_JSON_URLによる数値JSON代替経路／/tec/status・/tec/refresh_now・/tec/raw_image追加／3時間超の古いTECはリスクに使わない)
   v9.07 標準プリセットにGNSS追加／重み見直し／GNSSは「超えた分だけ押し上げ」／アーカイブの重みをサーバーと一致
   v9.06 GNSSを現在値のみ(履歴・基準なし)に変更。アーカイブのGNSSは未実装に
   v9.05 リスクマップの再計算を高速化(計算結果は同じ)
@@ -95,6 +97,15 @@ try:
 except ImportError:
     paramiko = None
     _PARAMIKO_AVAILABLE = False
+
+# TEC画像(NICT)のデコードに使用。未インストールでもアプリ全体は動作する
+# （その場合はTEC画像取得が自動的に無効化される。requirements.txtに Pillow の追加が必要）。
+try:
+    from PIL import Image as _PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PILImage = None
+    _PIL_AVAILABLE = False
 
 app = Flask(__name__)
 
@@ -2586,15 +2597,37 @@ def _frac_box_to_px(frac_box, w, h):
 
 TEC_FETCH_INTERVAL_SEC = 600      # 元データが10分間隔のため合わせる
 TEC_HISTORY_MAX        = 6 * 24   # 直近24時間分(10分間隔換算)を基準値計算に保持
+TEC_CACHE_SEC          = TEC_FETCH_INTERVAL_SEC   # (GNSS_CACHE_SEC相当) これを過ぎたら次のアクセスで裏更新
+TEC_LIVE_MAX_STALE_SEC = 3 * 3600  # (GNSS_LIVE_MAX_STALE_DAYS相当) これより古いTECはリスクマップに使わない
+
+# ── 代替取得経路（GNSS_JSON_URL と同じ考え方）──────────────
+# NICTの画像を色逆変換する代わりに、別環境(PC/GitHub Actions等)で作った数値JSONのURLを指定できる。
+#   例: https://raw.githubusercontent.com/<owner>/<repo>/main/tec_grid.json
+#   形式: {"updated": "2026-10-14 12:00 JST",
+#          "cells": [{"lat": 35.25, "lon": 138.25, "v": 22.1}, ...]}      ← v は TECU
+#   lat/lon は任意の点でよく、リスク格子(0.5°)ごとに中央値へ集約される。
+# 設定されている間は画像取得より優先される（未設定なら従来どおり画像の色逆変換）。
+TEC_JSON_URL = os.environ.get("TEC_JSON_URL", "").strip()
 
 _tec_lock    = threading.Lock()
-_tec_cache   = {"grid": None, "ts": 0.0, "updated": None}
+_tec_cache   = {"grid": None,       # {(gi,gj): TECU}
+                "ts": 0.0,          # 最後に「成功」した時刻（データの鮮度）
+                "tried": 0.0,       # 最後に「試行」した時刻（失敗時の連打防止）
+                "updated": None,    # 表示用の更新時刻文字列
+                "error": None,      # 直近の失敗理由（成功したらNone）
+                "updating": False,  # 更新中フラグ（二重起動防止）
+                "source": None,     # "image" / "json"
+                "image_url": None,  # 採用した画像URL
+                "attempts": []}     # 直近の試行ログ（/tec/status で確認）
 _tec_history = []   # [(epoch_sec, {(gi,gj): value, ...}), ...] 古い→新しい順
 
 def _tec_calibrated():
     c = TEC_CALIBRATION
     return all(c.get(k) is not None for k in
                ("map_px_box_frac", "map_latlon_box", "legend_px_box_frac", "legend_value_range"))
+
+# (GSI_GNSS_ENABLED 相当) JSON URLがあるか、Pillow+キャリブレーション済みで画像を読めるとき有効
+TEC_ENABLED = bool(TEC_JSON_URL or (_PIL_AVAILABLE and _tec_calibrated()))
 
 def _tec_build_url(dt):
     doy = dt.timetuple().tm_yday
@@ -2631,26 +2664,24 @@ def _tec_candidate_list():
     return out
 
 def _fetch_tec_image():
-    """NICT準リアルタイムTECマップ(AMAP)のJPEGを、時刻候補を順に試して取得する。失敗時はNone。"""
+    """NICT準リアルタイムTECマップ(AMAP)のJPEGを、時刻候補を順に試して取得する。
+    戻り値: (PIL画像 or None, 採用したURL or None, 試行ログ[str, ...])"""
     global _tec_url_pref
-    try:
-        from PIL import Image
-    except ImportError:
-        print("[TEC] Pillowが未インストールです（pip install Pillow --break-system-packages）")
-        return None
+    attempts = []
+    if not _PIL_AVAILABLE:
+        return None, None, ["Pillowが未インストールです（pip install Pillow）"]
     headers = {"User-Agent": "Mozilla/5.0 (compatible; SeismoApp/5.0; research use)"}
     for tz, lag, url in _tec_candidate_list():
         try:
             resp = requests.get(url, timeout=10, headers=headers)
             if resp.status_code == 200 and resp.content:
                 _tec_url_pref = {"tz": tz, "lag_min": lag}
-                print(f"[TEC] 画像取得成功: {url}")
-                return Image.open(io.BytesIO(resp.content)).convert("RGB")
-        except Exception:
-            continue
-    print("[TEC] 候補URLすべて404/失敗でした（TEC_URL_TEMPLATEやAMAP以外の"
-          "命名パターンに変わっている可能性があります）")
-    return None
+                attempts.append(f"200 {url}")
+                return _PILImage.open(io.BytesIO(resp.content)).convert("RGB"), url, attempts
+            attempts.append(f"{resp.status_code} {url}")
+        except Exception as e:
+            attempts.append(f"ERR {type(e).__name__} {url}")
+    return None, None, attempts
 
 def _build_tec_lut(img):
     """カラーバー領域を等間隔サンプリングして (R,G,B)→TEC値 のLUTを作る。"""
@@ -2721,35 +2752,120 @@ def _decode_tec_grid(img):
         grid[(gi, gj)] = float(np.median(vals))
     return grid
 
-def update_tec_cache():
-    """TEC画像を取得・デコードしてキャッシュを更新する。バックグラウンドループから呼ぶ。"""
-    global _tec_cache, _tec_history
-    if not _tec_calibrated():
-        print("[TEC] 未キャリブレーションのためスキップ（TEC_CALIBRATIONを設定してください）")
-        return
-    img = _fetch_tec_image()
-    if img is None:
-        return
-    grid = _decode_tec_grid(img)
-    if not grid:
-        print("[TEC] デコード結果が空でした（キャリブレーション値を確認してください）")
-        return
-    now = time.time()
+def _tec_grid_from_json(obj):
+    """TEC_JSON_URL の中身 {"cells":[{"lat","lon","v"},...]} をリスク格子 {(gi,gj): TECU} に集約する。"""
+    acc = {}
+    for c in (obj.get("cells") or []):
+        try:
+            lat, lon, v = float(c["lat"]), float(c["lon"]), float(c["v"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(v) and 0.0 <= v < 500.0):    # TECUとして非現実的な値は捨てる
+            continue
+        key = (int(math.floor(lat / RISK_GRID_SIZE)), int(math.floor(lon / RISK_GRID_SIZE)))
+        if key in _RISK_CELLS:
+            acc.setdefault(key, []).append(v)
+    return {k: float(np.median(vs)) for k, vs in acc.items()}
+
+
+def _refresh_tec_cache():
+    """TECを取得して _tec_cache / _tec_history を更新する（バックグラウンド実行想定）。
+    GNSSの _refresh_gnss_cache と同じく、更新中フラグで二重起動を防ぎ、失敗理由を error に残す。
+    失敗しても直前の成功データ(grid/ts)は消さない。"""
+    global _tec_history
     with _tec_lock:
-        _tec_cache = {"grid": grid, "ts": now,
-                      "updated": datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")}
-        _tec_history.append((now, grid))
-        cutoff = now - TEC_HISTORY_MAX * TEC_FETCH_INTERVAL_SEC
-        _tec_history = [(t, g) for t, g in _tec_history if t >= cutoff]
-    print(f"[TEC] 更新完了 セル数:{len(grid)}")
+        if _tec_cache["updating"]:
+            return
+        _tec_cache["updating"] = True
+    try:
+        grid, source, error = None, None, None
+        image_url, attempts, upd_str = None, [], None
+        if TEC_JSON_URL:
+            try:
+                r = requests.get(TEC_JSON_URL, timeout=20); r.raise_for_status()
+                obj = r.json()
+                grid = _tec_grid_from_json(obj)
+                if grid:
+                    source = "json"
+                    upd_str = str(obj.get("updated") or "").strip() or None
+                else:
+                    error = "TEC JSONに有効なセルがありません"
+            except Exception as e:
+                error = f"TEC JSON取得エラー: {e}"
+        elif not _PIL_AVAILABLE:
+            error = "Pillowが未インストールです（requirements.txtに Pillow を追加してください）"
+        elif not _tec_calibrated():
+            error = "TEC_CALIBRATION が未設定です"
+        else:
+            img, image_url, attempts = _fetch_tec_image()
+            if img is None:
+                last = attempts[-1] if attempts else ""
+                error = f"TEC画像を取得できませんでした（候補{len(attempts)}件すべて失敗。最後: {last}）"
+            else:
+                try:
+                    grid = _decode_tec_grid(img)
+                except Exception as e:
+                    error = f"TEC画像のデコードエラー: {e}"
+                if grid:
+                    source = "image"
+                elif not error:
+                    error = "TEC画像のデコード結果が空でした（/tec/raw_image?overlay=1 で枠位置を確認）"
+
+        now = time.time()
+        with _tec_lock:
+            _tec_cache["tried"] = now
+            _tec_cache["attempts"] = attempts[-24:]
+            _tec_cache["image_url"] = image_url
+            if grid:
+                _tec_cache.update(grid=grid, ts=now, source=source, error=None,
+                                  updated=upd_str or datetime.now(JST).strftime("%Y-%m-%d %H:%M JST"))
+                _tec_history.append((now, grid))
+                cutoff = now - TEC_HISTORY_MAX * TEC_FETCH_INTERVAL_SEC
+                _tec_history = [(t, g) for t, g in _tec_history if t >= cutoff]
+            else:
+                _tec_cache["error"] = error
+        if grid:
+            print(f"[TEC] 更新完了 セル数:{len(grid)} 取得元:{source}")
+        else:
+            print(f"[TEC] {error}")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        with _tec_lock:
+            _tec_cache["tried"] = time.time()
+            _tec_cache["error"] = f"TEC更新中の予期しないエラー: {e}"
+    finally:
+        with _tec_lock:
+            _tec_cache["updating"] = False
+
+
+def update_tec_cache():
+    """(互換) バックグラウンドループ・手動再計算から呼ぶ同期版。実体は _refresh_tec_cache。"""
+    _refresh_tec_cache()
+
+
+def get_tec_grid():
+    """キャッシュ済みのTECグリッドを返す（無効時・未取得時はNone）。
+    キャッシュが古ければバックグラウンドで非同期更新を開始する（get_gnss_vectors と同じ方式）。
+    Renderの無料枠でスリープ明けに最初のアクセスで取得が走る。"""
+    if not TEC_ENABLED:
+        return None
+    with _tec_lock:
+        stale    = (time.time() - _tec_cache["tried"]) > TEC_CACHE_SEC
+        grid     = _tec_cache["grid"]
+        updating = _tec_cache["updating"]
+    if stale and not updating:
+        threading.Thread(target=_refresh_tec_cache, daemon=True).start()
+    return dict(grid) if grid else None
 
 def _risk_tec_raw():
     """各セルについて「現在のTEC値 − 直近履歴の平均値」の絶対偏差を返す。
     急激な増減を電離圏擾乱の目安として扱うが、学術的に確立した指標ではない点に注意。"""
+    get_tec_grid()   # 古ければ裏で更新を起動（今回の計算には現在のキャッシュを使う）
     with _tec_lock:
         cur = _tec_cache["grid"]
+        ts = _tec_cache["ts"]
         hist = list(_tec_history)
-    if not cur or len(hist) < 3:
+    if not cur or len(hist) < 3 or (time.time() - ts) > TEC_LIVE_MAX_STALE_SEC:
         return {}
     baseline = {}
     for _, g in hist[:-1]:
@@ -2767,19 +2883,24 @@ def render_tec(updated_str):
     now_jst = datetime.now(timezone(timedelta(hours=9)))
     date_str = now_jst.strftime("%Y年%m月%d日 %H:%M JST")
 
+    grid = get_tec_grid()      # 古ければ裏で更新を起動する
     with _tec_lock:
-        grid = _tec_cache["grid"]
         tec_updated = _tec_cache["updated"]
+        tec_error   = _tec_cache["error"]
+        tec_source  = _tec_cache["source"]
 
     if not grid:
-        # 未キャリブレーション/未取得時は、従来どおり画像埋め込み＋リンク集のフォールバック表示
+        # 未取得時は、従来どおり画像埋め込み＋リンク集のフォールバック表示
+        import html as _html
+        reason = _html.escape(tec_error) if tec_error else "取得中です（数十秒後に再読込してください）"
         status_html = ('<span style="color:#fbbf24;font-weight:700">未取得</span> — '
-                        'TEC_CALIBRATION が未設定か、直近の取得に失敗しています。'
+                        f'{reason}。詳細は /tec/status 。'
                         '下の画像・リンクを参考値としてご利用ください。')
         cells_js = "[]"
     else:
-        status_html = (f'<span style="color:#34d399;font-weight:700">取得中（実験的・色逆変換）</span> '
-                        f'— セル数:{len(grid)} / 元画像更新: {tec_updated or "不明"}')
+        how = "外部JSON" if tec_source == "json" else "実験的・色逆変換"
+        status_html = (f'<span style="color:#34d399;font-weight:700">取得中（{how}）</span> '
+                        f'— セル数:{len(grid)} / 元データ更新: {tec_updated or "不明"}')
         cells = [{"lat": round(_RISK_CELLS[k][0], 3), "lon": round(_RISK_CELLS[k][1], 3),
                   "v": round(v, 2)} for k, v in grid.items()]
         cells_js = json.dumps(cells, ensure_ascii=False)
@@ -6166,6 +6287,68 @@ def gnss_raw_sample():
         f"path: {path}\ntotal_lines: {len(lines)}\nparsed_rows: {len(parsed)}\n\n--- preview ---\n{preview}",
         mimetype="text/plain")
 
+@app.route("/tec/status")
+def tec_status():
+    """TEC取得の設定・稼働状況を返す（/gnss/status のTEC版）。"""
+    with _tec_lock:
+        c = dict(_tec_cache)
+        n_hist = len(_tec_history)
+    ts, tried = c["ts"], c["tried"]
+    fmt = lambda t: datetime.fromtimestamp(t, JST).strftime("%Y-%m-%d %H:%M JST") if t else None
+    return {
+        "enabled": TEC_ENABLED,
+        "mode": "json" if TEC_JSON_URL else "image",
+        "json_url_set": bool(TEC_JSON_URL),
+        "pillow_available": _PIL_AVAILABLE,
+        "calibrated": _tec_calibrated(),
+        "cells": len(c["grid"]) if c["grid"] else 0,
+        "history_samples": n_hist,
+        "source": c["source"],
+        "last_success": ts, "last_success_str": fmt(ts),
+        "last_attempt_str": fmt(tried),
+        "data_updated": c["updated"],
+        "age_sec": round(time.time() - ts) if ts else None,
+        "used_in_riskmap": bool(ts and (time.time() - ts) <= TEC_LIVE_MAX_STALE_SEC and n_hist >= 3),
+        "updating": c["updating"],
+        "error": c["error"],
+        "image_url": c["image_url"],
+        "url_pref": dict(_tec_url_pref),
+        "recent_attempts": c["attempts"],
+    }
+
+@app.route("/tec/refresh_now", methods=["POST"])
+def tec_refresh_now():
+    """TECの再取得を手動でトリガーする（デバッグ・動作確認用）。"""
+    if not TEC_ENABLED:
+        return Response("TECが無効です（TEC_JSON_URL 未設定、かつPillow未インストールまたはTEC_CALIBRATION未設定）", status=400)
+    with _tec_lock:
+        already = _tec_cache["updating"]
+    if already:
+        return {"status": "already_updating"}
+    threading.Thread(target=_refresh_tec_cache, daemon=True).start()
+    return {"status": "started"}
+
+@app.route("/tec/raw_image")
+def tec_raw_image():
+    """取得できた最新のNICT TEC画像をPNGで返す（/gnss/raw_sample のTEC版）。
+    ?overlay=1 を付けると、地図本体の枠(赤)とカラーバーの枠(緑)を重ね描きする。
+    TEC_CALIBRATION の *_frac が実画像とずれていないかを目視確認するために使う。"""
+    if not _PIL_AVAILABLE:
+        return Response("Pillowが未インストールです", status=400)
+    img, url, attempts = _fetch_tec_image()
+    if img is None:
+        return Response("画像を取得できませんでした\n" + "\n".join(attempts), status=502, mimetype="text/plain")
+    if request.args.get("overlay") == "1" and _tec_calibrated():
+        from PIL import ImageDraw
+        w, h = img.size
+        d = ImageDraw.Draw(img)
+        for key, col in (("map_px_box_frac", (255, 0, 0)), ("legend_px_box_frac", (0, 200, 0))):
+            x0, y0, x1, y1 = _frac_box_to_px(TEC_CALIBRATION[key], w, h)
+            d.rectangle([x0, y0, x1, y1], outline=col, width=1)
+    buf = io.BytesIO(); img.save(buf, "PNG")
+    return Response(buf.getvalue(), mimetype="image/png",
+                    headers={"X-Source-Url": url, "X-Image-Size": f"{img.size[0]}x{img.size[1]}"})
+
 # quakes.csv（JMA/P2P/USGS統合データ）はkeep_days=HIST_CALIB_LOOKBACK_DAYS(65)より
 # 古いデータを保持していない。アーカイブ検索の対象期間がこの保持範囲より古い場合は
 # ローカルCSVではなく、気象庁一元化震源カタログ(fetch_quakes_jma_catalog_range)、
@@ -6527,14 +6710,18 @@ def _recalc_pressure():
     return f"{len(obs)}観測点・{label}"
 
 def _recalc_tec():
+    if not TEC_ENABLED:
+        raise RuntimeError("TECが無効です（TEC_JSON_URL 未設定、かつPillow未インストールまたはTEC_CALIBRATION未設定）")
     with _tec_lock:
+        if _tec_cache["updating"]:
+            raise RuntimeError("TECの更新が既に実行中です。しばらくしてからもう一度お試しください")
         before = _tec_cache["ts"]
-    update_tec_cache()
+    _refresh_tec_cache()
     with _tec_lock:
-        after, grid = _tec_cache["ts"], _tec_cache["grid"]
+        after, grid, err, src_ = _tec_cache["ts"], _tec_cache["grid"], _tec_cache["error"], _tec_cache["source"]
     if after == before or not grid:
-        raise RuntimeError("TEC画像の取得またはデコードに失敗しました（未キャリブレーションの可能性もあります）")
-    return f"{len(grid)}セル"
+        raise RuntimeError(err or "TECを取得できませんでした")
+    return f"{len(grid)}セル（{'JSON' if src_ == 'json' else '画像'}）"
 
 def _recalc_gnss():
     if not GSI_GNSS_ENABLED:
@@ -6578,7 +6765,7 @@ def _recalc_riskmap():
     _step("活断層の応力負荷", lambda: get_fault_stress_grid(quakes))
     _step("プレート境界の応力負荷", lambda: get_plate_stress_grid(quakes))
     _step("気圧", _recalc_pressure)
-    if _tec_calibrated():
+    if TEC_ENABLED:
         _step("TEC", _recalc_tec)
     _step("キャリブレーション", _recalc_calibration)   # 一番重いので最後
     if problems:
