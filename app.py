@@ -1,7 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v9.06
+地震研究統合プラットフォーム v9.07
 
+v9.07: 統合リスクマップの調整。
+       ①標準プリセットにGNSS変位を追加（ETAS・b値・活断層・プレート境界＋GNSS）。GNSSが使えない間(未設定/取得中/現在値なし)は
+         自動で従来の4成分だけになる。GNSSは「平常範囲なら総合値を変えず、他の成分の水準を超えて大きい時だけ押し上げる」扱いに
+         変更（小さい変位を『低リスクの証拠』として総合値を下げないため。平穏時のLv別セル数の較正もそのまま保たれる）。
+       ②重みを見直し: ETAS 0.55→0.45、活断層 0.10→0.15、プレート境界 0.05→0.10、GNSS 0.10→0.20（b値0.15・気圧0.05・TEC0.10は据え置き）。
+         ETAS・b値・活断層/プレート応力は同じ地震カタログから作るため、ETAS一極集中を和らげ、独立な観測であるGNSSを手厚くした。
+         レベル境界は重みから自動で再較正される。
+       ③その他: アーカイブ画面の重み(表示・計算)をサーバーの重みと自動で一致させた(従来は画面側に固定値があり、
+         重みを変えるとアーカイブだけ境界とずれる恐れがあった)。画面タイトル/フッターのバージョン表記(v9.04のまま)を更新。
 v9.06: GNSS変位の使い方を変更。
        ・統合リスクマップ: 過去の値(履歴・過去65日の基準)は参照せず、現在の水平変位(直近7日, mm)だけで
          スコア化する。固定の目盛り(GNSS_SCORE_POINTS: ノイズ3mm/中7mm/大15mm)で絶対評価する。
@@ -4005,16 +4014,19 @@ function togglePlate(btn){{
 # ══════════════════════════════════════════════════════
 RISK_GRID_SIZE = 0.5   # 統合リスクマップの共通格子（ETAS/b値より粗い格子に集約する）
 
-# 各データソースの既定の重み（合計1.0。未選択/データ欠損のセルは
-# 選択されている項目だけで自動的に再正規化される）
+# 各データソースの既定の重み。選択された項目(とそのセルにある項目)だけで自動的に再正規化されるので、
+# 合計は1.0でなくてよい（比率だけが意味を持つ）。レベル境界(しきい値)はこの重みから自動較正される。
+# (v9.07) ETAS・b値・活断層/プレート応力は同じ地震カタログから作られ相関が強い。ETASへの一極集中を和らげ、
+#         地震活動とは独立な観測であるGNSSを手厚くした。標準プリセットの比は
+#         ETAS 0.45 : b値 0.15 : 活断層 0.15 : プレート 0.10 (+ GNSSが使えるセルはGNSS 0.20)。
 RISK_DEFAULT_WEIGHTS = {
-    "etas":     0.55,
+    "etas":     0.45,
     "bvalue":   0.15,
-    "fault":    0.10,
-    "plate":    0.05,
+    "fault":    0.15,
+    "plate":    0.10,
     "pressure": 0.05,
     "tec":      0.10,
-    "gnss":     0.10,   # (v9.00) GNSS変位。選択された成分だけで再正規化されるので、合計が1.0を超えても問題ない
+    "gnss":     0.20,   # (v9.07) GNSS変位(現在値)。基準(他成分)を超えた分だけ総合を押し上げる扱い
 }
 RISK_LABELS = {"etas": "ETAS", "bvalue": "b値", "fault": "活断層",
                "plate": "プレート境界", "pressure": "気圧", "tec": "TEC(電離圏・実験的)",
@@ -4689,7 +4701,7 @@ def render_riskmap(risk_cells, updated_str):
     # (v9.06) GNSS成分: 現在値だけを使う。現在のセルにGNSS値がある時だけ選択可能にする
     gnss_ready = any("gnss" in c["c"] for c in risk_cells)
     if gnss_ready:
-        gnss_row = ('<div class="chk-row"><input type="checkbox" id="chk_gnss" onchange="onToggle(\'gnss\')">'
+        gnss_row = ('<div class="chk-row"><input type="checkbox" id="chk_gnss" checked onchange="onToggle(\'gnss\')">'
                     f'<span class="clabel">GNSS変位（地殻変動・現在値）</span><span class="cweight">w={w["gnss"]}</span></div>')
     else:
         if not GSI_GNSS_ENABLED:
@@ -4847,7 +4859,7 @@ canvas.dChart{{display:block;width:100%}}
   <div class="note">
     重みは選択されたデータのみを使い自動的に再正規化されます。<br>
     セルをクリックすると統合リスク指数と各データの寄与度（内訳）を表示します。<br>
-    GNSS変位は、各セルに半径{GNSS_CELL_RADIUS_KM:.0f}km以内で最も近い電子基準点の直近{GNSS_LOOKBACK_DAYS}日の水平変位（現在値）を割り当て、過去の値とは比べず、変位の大きさ(mm)だけで固定の目盛りでスコア化します（ノイズ水準{GNSS_NOISE_MM:.0f}mm程度で低め、7mm・15mmで高めに評価）。観測点から遠いセルはGNSSを使わず、他の成分だけで評価します。座標値は公表に遅れがあるため、基準日は内訳に表示します。「地殻変動」プリセットはプレート境界＋GNSSです（GNSSが使えない間はプレート境界のみ）。
+    GNSS変位は、各セルに半径{GNSS_CELL_RADIUS_KM:.0f}km以内で最も近い電子基準点の直近{GNSS_LOOKBACK_DAYS}日の水平変位（現在値）を割り当て、過去の値とは比べず、変位の大きさ(mm)だけで固定の目盛りでスコア化します（ノイズ水準{GNSS_NOISE_MM:.0f}mm程度で低め、7mm・15mmで高めに評価）。観測点から遠いセルはGNSSを使わず、他の成分だけで評価します。座標値は公表に遅れがあるため、基準日は内訳に表示します。GNSSは「他の成分の水準を超えて大きい時だけ総合値を押し上げ、平常範囲なら総合値を変えない」扱いです（小さい変位を低リスクの証拠とはみなしません）。標準プリセットはETAS・b値・活断層・プレート境界＋GNSS（GNSSが使えない間は前の4つのみ）、「地殻変動」はプレート境界＋GNSSです（GNSSが使えない間はプレート境界のみ）。
   </div>
 </div>
 <div id="mp">
@@ -4902,12 +4914,13 @@ var KEYS = ['etas','bvalue','fault','plate','pressure','gnss'];
 var GNSS_READY = {gnss_ready_js};   // (v9.06) 現在のGNSS値が使えるか
 
 var PRESETS = {{
-  standard: {{etas:true, bvalue:true, fault:true, plate:true, pressure:false, gnss:false}},
+  standard: {{etas:true, bvalue:true, fault:true, plate:true, pressure:false, gnss:true}},   // (v9.07) GNSSが使えない間は自動で外れる
   all:      {{etas:true, bvalue:true, fault:true, plate:true, pressure:true,  gnss:true}},
   geo:      {{etas:false,bvalue:false,fault:true, plate:true, pressure:false, gnss:false}},
   crust:    {{etas:false,bvalue:false,fault:false,plate:true, pressure:false, gnss:true}}
 }};
 var selected = Object.assign({{}}, PRESETS.standard);
+if(!GNSS_READY) selected.gnss = false;   // (v9.07)
 
 if(window.innerWidth<=768){{
   document.getElementById('panel').classList.add('closed');
@@ -4948,16 +4961,27 @@ function onToggle(key){{
 // 成分が少ないセルの総合値が極端値に張り付くのを防ぐ（サーバー側のしきい値算出と同じ扱い）。
 var HIST_KEYS = ['etas','bvalue','fault','plate'];   // (v9.06) GNSSはそのセルに無ければ中立補完せず除外する
 function computeComposite(cell){{
-  var wsum=0, ssum=0, used=[], wmiss=0;
+  var wsum=0, ssum=0, used=[], wmiss=0, g=null;
   KEYS.forEach(function(k){{
     if(!selected[k]) return;
+    if(k === 'gnss'){{ if(cell.c.gnss) g = cell.c.gnss.s; return; }}   // GNSSは下で別扱い
     var wk = WEIGHTS[k];
     if(cell.c[k]){{ wsum += wk; ssum += wk*cell.c[k].s; used.push(k); }}
     else if(HIST_KEYS.indexOf(k) >= 0){{ wmiss += wk; }}
   }});
+  // (v9.07) GNSSは「他の成分の水準(base)を超えた分だけ」総合を押し上げる。
+  //   平常範囲(baseより小さい)なら base で置き換えるので総合値は変わらない(小さい変位を低リスクの証拠にしない)。
+  //   他の成分が1つも無い時は、GNSSのスコアそのものを使う。
+  var eff = {{}};
+  if(g !== null){{
+    var base = (wsum > 0) ? (ssum + 0.5*wmiss)/(wsum + wmiss) : null;
+    var ge = (base === null) ? g : Math.max(g, base);
+    eff.gnss = ge;
+    wsum += WEIGHTS.gnss; ssum += WEIGHTS.gnss*ge; used.push('gnss');
+  }}
   if(wsum<=0) return null;
   var wall = wsum + wmiss;
-  return {{score: (ssum + 0.5*wmiss)/wall, used: used, wsum: wall, wmiss: wmiss}};
+  return {{score: (ssum + 0.5*wmiss)/wall, used: used, wsum: wall, wmiss: wmiss, eff: eff}};
 }}
 // (v7.56) Lv5=特別警報級(年数回程度)/Lv4=危険警報級(活発期でも数日に一度程度)を
 // 目指す絶対基準。以前は0.95/0.7だったが、サーバー側の絶対評価がセル単位の
@@ -5068,7 +5092,7 @@ function showDetail(cell, comp, lv){{
     var d = cell.c[k];
     var nw = WEIGHTS[k] / comp.wsum;
     labels.push(LABELS[k]);
-    contribFloat.push(nw * d.s * 100);
+    contribFloat.push(nw * ((comp.eff && comp.eff[k] != null) ? comp.eff[k] : d.s) * 100);   // (v9.07) GNSSは合成に使った値
     colors.push(COMP_COLOR[k] || '#60a5fa');
   }});
   var names = comp.used.map(function(k){{ return LABELS[k]; }});
@@ -5086,7 +5110,8 @@ function showDetail(cell, comp, lv){{
     var g = cell.c.gnss;
     document.getElementById('dBreakdown').innerHTML +=
       '<div style="font-size:10px;color:rgba(235,238,245,.46);margin-top:4px">GNSS: ' + g.n +
-      '（約' + g.d + 'km）水平' + g.r.toFixed(1) + 'mm/7日　基準日' + g.t + '</div>';
+      '（約' + g.d + 'km）水平' + g.r.toFixed(1) + 'mm/7日　基準日' + g.t +
+      ((comp.eff && comp.eff.gnss > g.s + 1e-9) ? '　→ 他成分より大きく総合値を押し上げ' : '　→ 平常範囲のため総合値は変えません') + '</div>';
   }}
   drawBarChart(document.getElementById('dBarCanvas'), labels, contribInt, colors);
 
@@ -5289,13 +5314,13 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
   <div class="sec" id="chkSec" style="display:none">
     <h3>使用データ（チェックで選択）</h3>
     <div class="chk-row"><input type="checkbox" id="chk_etas" checked onchange="onToggle('etas')">
-      <span class="clabel">ETAS（地震活動度）</span><span class="cweight">w=0.55</span></div>
+      <span class="clabel">ETAS（地震活動度）</span><span class="cweight">w=__W_ETAS__</span></div>
     <div class="chk-row"><input type="checkbox" id="chk_bvalue" checked onchange="onToggle('bvalue')">
-      <span class="clabel">b値（Gutenberg-Richter）</span><span class="cweight">w=0.15</span></div>
+      <span class="clabel">b値（Gutenberg-Richter）</span><span class="cweight">w=__W_BVALUE__</span></div>
     <div class="chk-row"><input type="checkbox" id="chk_fault" checked onchange="onToggle('fault')">
-      <span class="clabel">活断層 応力負荷</span><span class="cweight">w=0.10</span></div>
+      <span class="clabel">活断層 応力負荷</span><span class="cweight">w=__W_FAULT__</span></div>
     <div class="chk-row"><input type="checkbox" id="chk_plate" checked onchange="onToggle('plate')">
-      <span class="clabel">プレート境界 応力負荷</span><span class="cweight">w=0.05</span></div>
+      <span class="clabel">プレート境界 応力負荷</span><span class="cweight">w=__W_PLATE__</span></div>
     <div class="chk-row disabled"><input type="checkbox" disabled>
       <span class="clabel">GNSS変位（地殻変動）</span><span class="cbadge">未実装</span></div>
   </div>
@@ -5336,7 +5361,7 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
 <script>
 var RISK_COLOR = {5:'#0c000c',4:'#8000ff',3:'#ff0000',2:'#ffe600',1:'#66ccff'};
 var COMP_COLOR = {etas:'#ef4444', bvalue:'#f97316', fault:'#facc15', plate:'#38bdf8'};
-var WEIGHTS = {etas:0.55, bvalue:0.15, fault:0.10, plate:0.05};
+var WEIGHTS = __WEIGHTS_JSON__;
 var LABELS  = {etas:'ETAS', bvalue:'b値', fault:'活断層', plate:'プレート境界'};
 var KEYS = ['etas','bvalue','fault','plate'];
 var GS = __RISK_GRID_SIZE__;
@@ -5535,6 +5560,10 @@ function runFetch(){
 }
 </script></body></html>"""
     html = html.replace("__RISK_GRID_SIZE__", str(RISK_GRID_SIZE))
+    # (v9.07) 重みはサーバー側(しきい値の較正に使うもの)と必ず一致させる
+    html = html.replace("__WEIGHTS_JSON__", json.dumps({k: RISK_DEFAULT_WEIGHTS[k] for k in _RISK_HIST_KEYS}))
+    for _k in _RISK_HIST_KEYS:
+        html = html.replace(f"__W_{_k.upper()}__", f"{RISK_DEFAULT_WEIGHTS[_k]:.2f}")
     html = html.replace("__LEAFLET_CDN__", LEAFLET_CDN)
     html = html.replace("__DARK_TILE__", DARK_TILE)
     html = html.replace("__GEOJSON_JS__", GEOJSON_JS)
@@ -5546,7 +5575,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v9.04</title>
+  <title>地震研究統合プラットフォーム v9.07</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
@@ -5641,7 +5670,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震研究統合プラットフォーム</div>
-      <div>v9.04 / 研究用</div>
+      <div>v9.07 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
