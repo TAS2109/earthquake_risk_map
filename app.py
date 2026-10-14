@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v9.05
+地震研究統合プラットフォーム v9.06
 
+v9.06: GNSS変位の使い方を変更。
+       ・統合リスクマップ: 過去の値(履歴・過去65日の基準)は参照せず、現在の水平変位(直近7日, mm)だけで
+         スコア化する。固定の目盛り(GNSS_SCORE_POINTS: ノイズ3mm/中7mm/大15mm)で絶対評価する。
+         GNSSが無いセル(最寄り観測点が半径外)は成分なしとして扱い、他の成分だけで総合値を出す。
+         レベル境界は従来どおりGNSSを含まない成分の組合せ(ETAS/b値/活断層/プレート)の自動算出値を使う。
+         これにより、GNSSの日次履歴の取得・保持・基準計算(v9.00〜v9.05)は不要になり削除した(起動も軽くなる)。
+       ・アーカイブ: GNSS変位は未実装(成分から外した)。
 v9.05: 統合リスクマップの再計算(起動時のキャリブレーション／「このタブを再計算」)を高速化。計算式・結果は変えず、
        ・ETAS集計をnumpyで一括化、断層/プレート応力は距離行列を1回だけ作って全65時点を行列積で処理、
        ・quakes.csvの読み込みを65回→1回、最寄りセル割当・GNSS割当・履歴の並べ替えをキャッシュ、
@@ -183,8 +190,10 @@ GNSS_SFTP_TIMEOUT  = 20
 
 # (v9.00) GNSS変位を統合リスクマップ/アーカイブの成分にするための設定
 GNSS_CELL_RADIUS_KM      = 60.0  # セル中心からこの距離以内で最も近い観測点の値をそのセルに割り当てる
-GNSS_NOISE_MM            = 3.0   # 7日トレンドの典型的なノイズ水準(mm)。ドメイン下限(高レベルの許可条件)の基準
-GNSS_HIST_MAX_STALE_DAYS = 3     # 過去時点(キャリブレーション/アーカイブ)で、その日からさかのぼって使う最大日数
+GNSS_NOISE_MM            = 3.0   # 7日トレンドの典型的なノイズ水準(mm)
+# (v9.06) 現在の水平変位(mm/7日) → スコア(0〜1)の固定目盛り。GNSSタブの色分け(ノイズ≤3/中>7/大>15)に合わせた。
+# 過去実績は使わない。暫定値で、運用しながら調整する前提。大きな変位でもGNSS単独でLv5にならないよう上限は0.95。
+GNSS_SCORE_POINTS        = [(0.0, 0.10), (3.0, 0.30), (7.0, 0.55), (15.0, 0.80), (30.0, 0.95)]
 GNSS_LIVE_MAX_STALE_DAYS = 30    # 現在値として使う座標値の最大経過日数(これより古い観測点は除外)
 
 # ETAS対象範囲（in_etas_region）に絞った代表的な電子基準点。
@@ -231,9 +240,8 @@ GNSS_STATIONS = [
     ("940001", "稚内",     45.4150, 141.6730),
 ]
 
-_gnss_cache = {"data": None, "ts": 0.0, "error": None, "updating": False, "hist": None}
+_gnss_cache = {"data": None, "ts": 0.0, "error": None, "updating": False}
 _gnss_lock  = threading.Lock()
-_gnss_state = {"recalib_pending": False}   # (v9.00) キャリブレーション計算中にGNSS履歴が揃った場合の再計算フラグ
 
 # ── Hi-net（防災科研）微小地震データ ───────────────────────
 # JMAの公開情報（発表対象は基本的に有感地震、または一定規模以上）には出てこない
@@ -1522,7 +1530,6 @@ HIST_CALIB_MIN_CELL_SAMPLES = 20  # (v7.56) セル単位の絶対評価に必要
 
 _hist_calib_cache = {"ts": 0.0,
                       "etas_cell": None, "bvalue_cell": None, "fault_cell": None, "plate_cell": None,
-                      "gnss_cell": None,
                       "risk_thresholds": None, "risk_calib_report": None,
                       "n_samples": 0}
 _hist_calib_lock = threading.Lock()
@@ -1546,8 +1553,8 @@ RISK_CALM_QUANTILE = 0.5      # 「平穏」= 過去サンプル日のセル数�
 RISK_LV5_EXCEED_PROB = 0.05   # Lv5: 過去サンプルのうち何割の日に1セルでも出るか(平穏時はほぼ0)
 RISK_LEVEL_MIN_GAP = 0.005    # 隣り合うしきい値の最小間隔（同値で潰れないように）
 RISK_THRESH_DEFAULT = [0.2, 0.4, 0.6, 0.85, 0.97]   # キャリブレーション未完了時のフォールバック(従来値)
-_RISK_HIST_KEYS = ["etas", "bvalue", "fault", "plate", "gnss"]   # 過去履歴を持つ成分(気圧・TECは履歴なし)
-_RISK_STD_KEYS  = ["etas", "bvalue", "fault", "plate"]           # 「標準」プリセット(検算レポートの対象。GNSSは含めない)
+_RISK_HIST_KEYS = ["etas", "bvalue", "fault", "plate"]   # 過去履歴を持つ成分(気圧・TEC・GNSSは履歴なし)
+_RISK_STD_KEYS  = ["etas", "bvalue", "fault", "plate"]           # 「標準」プリセット(検算レポートの対象)
 
 def _risk_subset_key(keys):
     """成分キーの集合を、JS側と共通の並び順のキー文字列にする。"""
@@ -1555,8 +1562,8 @@ def _risk_subset_key(keys):
 
 def _compute_risk_level_thresholds(per_time_raw, calib_pools):
     """過去サンプル(per_time_raw: [ {etas,bvalue,fault,plate の生値dict}, ... ])から、
-    成分の選択パターンごと(31通り。v9.00でGNSS追加)にLv1〜Lv5のしきい値を求める。
-    calib_pools: {etas_cell, bvalue_cell, fault_cell, plate_cell, gnss_cell}（セル単位の履歴プール。gnss_cellは空でも可）
+    成分の選択パターンごと(15通り)にLv1〜Lv5のしきい値を求める。
+    calib_pools: {etas_cell, bvalue_cell, fault_cell, plate_cell}（セル単位の履歴プール）
     戻り値: (thresholds{key:[t1..t5]}, report{...検算用の統計})。作れなければ (None, None)。"""
     import itertools
     cell_keys = list(_RISK_CELLS.keys())
@@ -1569,7 +1576,6 @@ def _compute_risk_level_thresholds(per_time_raw, calib_pools):
     etas_floor  = _make_etas_domain_floor(_cellwise_median_map(calib_pools["etas_cell"]))
     fault_floor = _make_stress_domain_floor(_cellwise_median_map(calib_pools["fault_cell"]))
     plate_floor = _make_stress_domain_floor(_cellwise_median_map(calib_pools["plate_cell"]))
-    gnss_floor  = _make_gnss_domain_floor(_cellwise_median_map(calib_pools.get("gnss_cell")))
 
     # S[t, セル, 成分] = 各時点の成分別スコア(0〜1)。成分が無いセルはNaN。
     S = np.full((T, n_cells, len(_RISK_HIST_KEYS)), np.nan)
@@ -1580,7 +1586,6 @@ def _compute_risk_level_thresholds(per_time_raw, calib_pools):
             "bvalue": _absolute_rank_map(raws["bvalue"], calib_pools["bvalue_cell"], invert=True,  log_transform=False, domain_floor_fn=_bvalue_domain_floor, loo=True, sorted_cache=sc["bvalue"]),
             "fault":  _absolute_rank_map(raws["fault"],  calib_pools["fault_cell"],  invert=False, log_transform=False, domain_floor_fn=fault_floor, loo=True, sorted_cache=sc["fault"]),
             "plate":  _absolute_rank_map(raws["plate"],  calib_pools["plate_cell"],  invert=False, log_transform=False, domain_floor_fn=plate_floor, loo=True, sorted_cache=sc["plate"]),
-            "gnss":   _absolute_rank_map(raws.get("gnss"), calib_pools.get("gnss_cell"), invert=False, log_transform=False, domain_floor_fn=gnss_floor, loo=True, sorted_cache=sc["gnss"]),
         }
         for ci, comp in enumerate(_RISK_HIST_KEYS):
             for k, v in ranks[comp].items():
@@ -1602,7 +1607,7 @@ def _compute_risk_level_thresholds(per_time_raw, calib_pools):
             w = w_all[list(combo)][None, None, :]
             valid = ~np.isnan(sub)
             if not valid.any():
-                continue   # (v9.00) 選んだ成分のどれにもデータが無い組合せ(例: GNSS履歴が未取得でGNSS単独)は境界を作らない
+                continue
             wsum = (w * valid).sum(axis=2)
             # (v8.21) 選択した成分のうちそのセルに無いものは中立値0.5として扱う（JS側と同じ）。
             # 成分が1つしか無いセルの総合値がその成分の順位そのままになり、極端値
@@ -1613,21 +1618,10 @@ def _compute_risk_level_thresholds(per_time_raw, calib_pools):
 
             # 各時点で「上からk番目のスコア」を取り、その分位(既定=中央値)をしきい値にする
             desc = -np.sort(-np.where(np.isnan(comp), -1.0, comp), axis=1)
-            # (v9.00) GNSSは観測点の周囲のセルにしか成分が無い(疎)。GNSSを含む組合せでは、評価できる
-            # セル数(nv)に比例して目標セル数を縮める（全セル数基準のままだと目標が評価可能セル数を
-            # 超えて、境界が負の値になり全セルが高レベルになるため）。GNSSを含まない組合せは従来どおり。
-            has_gnss = _RISK_HIST_KEYS.index("gnss") in combo
-            nv = (~np.isnan(comp)).sum(axis=1)             # (T,) 各時点で評価できるセル数
-            day_ok = (nv > 0) if has_gnss else np.ones(T, dtype=bool)
-            th = {}
-            for lv in (1, 2, 3, 4):
-                if has_gnss:
-                    k_t = np.clip(np.ceil(cum[lv] * nv / n_cells).astype(int), 1, np.maximum(nv, 1))
-                else:
-                    k_t = np.full(T, min(cum[lv], n_cells), dtype=int)
-                th[lv] = float(np.quantile(desc[np.arange(T), k_t - 1][day_ok], RISK_CALM_QUANTILE))
+            th = {lv: float(np.quantile(desc[:, min(cum[lv], n_cells) - 1], RISK_CALM_QUANTILE))
+                  for lv in (1, 2, 3, 4)}
             # Lv5: 「その日の最大スコア」の (1-p) 分位 → 過去のp割の日に1セル以上出る水準
-            th5 = float(np.quantile(desc[day_ok, 0], 1.0 - RISK_LV5_EXCEED_PROB))
+            th5 = float(np.quantile(desc[:, 0], 1.0 - RISK_LV5_EXCEED_PROB))
             arr = [th[1], th[2], th[3], th[4], th5]
             # 単調増加を保証（同値・逆転を最小間隔で押し上げ）
             for i in range(1, 5):
@@ -1637,7 +1631,7 @@ def _compute_risk_level_thresholds(per_time_raw, calib_pools):
             thresholds[key] = arr
 
             # 検算: 標準構成(全4成分)で、しきい値を当てた場合の日別セル数の分布
-            if set(_RISK_HIST_KEYS[c] for c in combo) == set(_RISK_STD_KEYS):   # 検算は標準構成(GNSSなし)
+            if set(_RISK_HIST_KEYS[c] for c in combo) == set(_RISK_STD_KEYS):   # 検算は標準構成
                 cnt = {}
                 for lv, (lo, hi) in {1: (arr[0], arr[1]), 2: (arr[1], arr[2]),
                                      3: (arr[2], arr[3]), 4: (arr[3], arr[4]), 5: (arr[4], 9)}.items():
@@ -1680,15 +1674,11 @@ def _compute_historical_calibration():
       ・ETAS: 地震×近傍セルの集計をPythonループからnumpyの一括集計へ。
       ・断層/プレート応力: 距離行列を基準時刻ごとに作り直していたのを、1回だけ作って
         時間減衰の重みとの行列積で全時点を一度に出す方式へ。最寄りセルの割当もキャッシュ。
-      ・GNSS履歴の取得(通信待ち)を最初に開始し、地震側の計算と並行させる。
       ・しきい値算出での履歴の並べ替えを使い回す。"""
     from collections import defaultdict
-    if GSI_GNSS_ENABLED:
-        _gnss_start_history_fetch()   # (v9.05) 待たずに取得だけ先に始める（計算と並行）
     ref_times = _sample_ref_times()
     etas_cell, bvalue_cell, fault_cell, plate_cell = (defaultdict(list), defaultdict(list),
                                                        defaultdict(list), defaultdict(list))
-    gnss_cell = defaultdict(list)   # (v9.00) GNSS変位(水平mm)のセル別プール
     per_time_raw = []   # (v8.21) しきい値キャリブレーション用: 各時点の成分別生値
 
     # ── 1) 地震データを1回だけ読み込み、時刻順の配列にする ──
@@ -1729,28 +1719,23 @@ def _compute_historical_calibration():
             print(f"[絶対基準キャリブレーション] 応力負荷の計算でエラー: {e}")
             rows = []
 
-    # ── 4) GNSS（履歴の取得が終わるのをここで待つ）──
-    if rows and GSI_GNSS_ENABLED:
-        _gnss_wait_for_history()   # (v9.00) GNSSの履歴を基準に含めるため、取得を待つ
     ok = 0
     for n, (rt, rt_e, lo, hi, etas_raw_t, bvalue_raw_t) in enumerate(rows):
         try:
             fault_raw, plate_raw = fault_list[n], plate_list[n]
-            gnss_raw_t, _gsrc = _gnss_risk_raw(ref_time=rt)
             for k, v in etas_raw_t.items(): etas_cell[k].append(v)
             for k, v in bvalue_raw_t.items(): bvalue_cell[k].append(v)
             for k, v in fault_raw.items(): fault_cell[k].append(v)
             for k, v in plate_raw.items(): plate_cell[k].append(v)
-            for k, v in gnss_raw_t.items(): gnss_cell[k].append(v)
             per_time_raw.append({"etas": etas_raw_t, "bvalue": bvalue_raw_t,
-                                 "fault": fault_raw, "plate": plate_raw, "gnss": gnss_raw_t})
+                                 "fault": fault_raw, "plate": plate_raw})
             ok += 1
         except Exception as e:
             print(f"[絶対基準キャリブレーション] サンプル({rt})でエラー: {e}")
             continue
     print(f"[絶対基準キャリブレーション] {ok}/{len(ref_times)}時点サンプリング完了 "
           f"(etas_cells={len(etas_cell)} bvalue_cells={len(bvalue_cell)} "
-          f"fault_cells={len(fault_cell)} plate_cells={len(plate_cell)} gnss_cells={len(gnss_cell)})")
+          f"fault_cells={len(fault_cell)} plate_cells={len(plate_cell)})")
     # セル単位プールは、サンプル時点数(ok)が少なすぎる(=積み上げ途中)場合は
     # 誤ったセル基準値で誤判定するより「未キャリブレーション」扱いの方が安全なため、
     # 十分な時点数が確保できるまではNoneのままにする。
@@ -1765,8 +1750,7 @@ def _compute_historical_calibration():
             risk_thresholds, risk_report = _compute_risk_level_thresholds(
                 per_time_raw,
                 {"etas_cell": dict(etas_cell), "bvalue_cell": dict(bvalue_cell),
-                 "fault_cell": dict(fault_cell), "plate_cell": dict(plate_cell),
-                 "gnss_cell": dict(gnss_cell)})
+                 "fault_cell": dict(fault_cell), "plate_cell": dict(plate_cell)})
             if risk_thresholds:
                 std = risk_thresholds.get(_risk_subset_key(_RISK_STD_KEYS))
                 print(f"[リスクレベル境界] 標準構成のしきい値 Lv1〜Lv5 = {std}")
@@ -1784,7 +1768,6 @@ def _compute_historical_calibration():
         "bvalue_cell": dict(bvalue_cell) if (cell_ready and bvalue_cell) else None,
         "fault_cell":  dict(fault_cell)  if (cell_ready and fault_cell)  else None,
         "plate_cell":  dict(plate_cell)  if (cell_ready and plate_cell)  else None,
-        "gnss_cell":   dict(gnss_cell)   if (cell_ready and gnss_cell)   else None,
         "n_samples": ok,
     }
 
@@ -1799,9 +1782,6 @@ def _get_historical_calibration():
                 global _hist_calib_cache
                 try:
                     _hist_calib_cache = _compute_historical_calibration()
-                    # (v9.00) 計算中にGNSS履歴が揃ったのに今回の結果に入っていなければ、次回アクセスで作り直す
-                    if _gnss_state.pop("recalib_pending", False) and not _hist_calib_cache.get("gnss_cell"):
-                        _hist_calib_cache["ts"] = 0.0
                 finally:
                     _hist_calib_lock.release()
             threading.Thread(target=_job, daemon=True).start()
@@ -3071,90 +3051,6 @@ def _compute_station_displacement(rows, lookback_days=GNSS_LOOKBACK_DAYS):
             "last_date": recent[-1][0].strftime("%Y-%m-%d")}
 
 
-def _build_displacement_history(rows, lookback_days=GNSS_LOOKBACK_DAYS):
-    """(v9.00) 日付昇順の(date, X, Y, Z)から、各日を終点とする直近lookback_days日の変位を
-    {"YYYY-MM-DD": [dE_mm, dN_mm, dU_mm]} で返す（キャリブレーション・アーカイブ用の履歴）。"""
-    out = {}
-    for i in range(len(rows)):
-        window = rows[max(0, i - lookback_days - 6): i + 1]
-        disp = _compute_station_displacement(window, lookback_days)
-        if disp:
-            out[rows[i][0].strftime("%Y-%m-%d")] = [round(disp["dE_mm"], 2), round(disp["dN_mm"], 2),
-                                                    round(disp["dU_mm"], 2)]
-    return out
-
-
-def _hist_from_json_stations(stations):
-    """(v9.00) GNSS_JSON_URL方式用: 各観測点に任意の "history" があれば履歴として取り込む。
-    形式は {"YYYY-MM-DD": [dE_mm, dN_mm, dU_mm]} または [{"date","dE_mm","dN_mm","dU_mm"}, ...]。
-    無ければ空dict（その場合GNSSは現在値の表示のみで、リスクマップの成分にはならない）。"""
-    hist = {}
-    for st in stations or []:
-        h = st.get("history")
-        if not h or st.get("code") is None:
-            continue
-        d = {}
-        try:
-            if isinstance(h, dict):
-                for ds, rec in h.items():
-                    d[str(ds)[:10]] = [float(rec[0]), float(rec[1]), float(rec[2]) if len(rec) > 2 else 0.0]
-            else:
-                for rec in h:
-                    d[str(rec["date"])[:10]] = [float(rec["dE_mm"]), float(rec["dN_mm"]),
-                                                float(rec.get("dU_mm", 0.0))]
-            if d:
-                hist[st["code"]] = {"name": st.get("name", st["code"]), "lat": float(st["lat"]),
-                                    "lon": float(st["lon"]), "d": d}
-        except Exception:
-            continue
-    return hist
-
-
-def _gnss_set_history(hist):
-    """(v9.00) 変位履歴をキャッシュに保存する。初めて履歴が使えるようになった時は、
-    GNSS込みで基準を作り直すよう統合リスクマップのキャリブレーションを期限切れにする。"""
-    if not hist:
-        return
-    with _gnss_lock:
-        first = _gnss_cache.get("hist") is None
-        _gnss_cache["hist"] = hist
-    if first:
-        if _hist_calib_lock.locked():
-            _gnss_state["recalib_pending"] = True   # 計算中のキャリブレーションが終わったら作り直す
-        else:
-            _hist_calib_cache["ts"] = 0.0
-
-
-def _gnss_start_history_fetch():
-    """(v9.05) GNSS履歴の取得を(まだ始まっていなければ)バックグラウンドで開始するだけで、待たない。
-    キャリブレーションでは、この取得(通信待ち)と地震側の計算(CPU)を並行して進めるために使う。"""
-    with _gnss_lock:
-        if _gnss_cache.get("hist") is not None or _gnss_cache["updating"]:
-            return
-    threading.Thread(target=_refresh_gnss_cache, daemon=True).start()
-
-def _gnss_wait_for_history(timeout=150):
-    """(v9.00) GNSS履歴が使えるまで待つ（キャリブレーションのバックグラウンドスレッド専用）。
-    未取得なら取得を開始する。取得に失敗した/時間切れの場合はFalse（GNSSなしで続行し、
-    後から履歴が揃えば自動で作り直される）。"""
-    with _gnss_lock:
-        if _gnss_cache.get("hist") is not None:
-            return True
-        updating = _gnss_cache["updating"]
-    if not updating:
-        threading.Thread(target=_refresh_gnss_cache, daemon=True).start()
-        time.sleep(1.0)
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        with _gnss_lock:
-            if _gnss_cache.get("hist") is not None:
-                return True
-            if not _gnss_cache["updating"] and (_gnss_cache["error"] or _gnss_cache["ts"] > 0):
-                return False
-        time.sleep(2.0)
-    return False
-
-
 def _refresh_gnss_cache():
     """GNSS_STATIONS全点について実データを取得し、_gnss_cacheを更新する（バックグラウンド実行想定）。"""
     with _gnss_lock:
@@ -3172,8 +3068,6 @@ def _refresh_gnss_cache():
                     else:
                         _gnss_cache["error"] = "GNSS JSONに観測点データがありません"
                     _gnss_cache["ts"] = time.time()
-                if st:
-                    _gnss_set_history(_hist_from_json_stations(st))
             except Exception as e:
                 with _gnss_lock:
                     _gnss_cache["error"] = f"GNSS JSON取得エラー: {e}"; _gnss_cache["ts"] = time.time()
@@ -3187,16 +3081,14 @@ def _refresh_gnss_cache():
                 _gnss_cache["error"] = msg
             return
 
-        results, errors, hist_all = [], 0, {}
+        results, errors = [], 0
         try:
             for code, name, lat, lon in GNSS_STATIONS:
                 try:
-                    rows = _fetch_station_positions(sftp, code, full=True)
+                    rows = _fetch_station_positions(sftp, code)
                     disp = _compute_station_displacement(rows)
                     if disp:
                         results.append({"code": code, "name": name, "lat": lat, "lon": lon, **disp})
-                        hist_all[code] = {"name": name, "lat": lat, "lon": lon,
-                                          "d": _build_displacement_history(rows)}
                     else:
                         errors += 1
                 except Exception as e:
@@ -3216,8 +3108,6 @@ def _refresh_gnss_cache():
             else:
                 _gnss_cache["error"] = f"全{len(GNSS_STATIONS)}点でデータ取得に失敗しました"
             _gnss_cache["ts"] = time.time()
-        if hist_all:
-            _gnss_set_history(hist_all)
         print(f"[GNSS] 更新完了: {len(results)}/{len(GNSS_STATIONS)}点 成功（エラー{errors}件）")
     finally:
         with _gnss_lock:
@@ -3348,40 +3238,23 @@ def get_gnss_vectors():
     return data
 
 
-def _gnss_station_values(ref_time=None):
-    """(v9.00) 各観測点の水平変位(mm)を [(code, name, lat, lon, horiz_mm, 基準日), ...] で返す。
-    ref_time=None: 現在の変位ベクトル。指定時: その日(UTC)から最大GNSS_HIST_MAX_STALE_DAYS日さかのぼって
-    最も新しい日次履歴を使う（座標値の公表遅れ等で無い日は、その観測点を除外）。"""
+def _gnss_station_values():
+    """(v9.06) 各観測点の現在の水平変位(mm/7日)を [(code, name, lat, lon, horiz_mm, 基準日), ...] で返す。
+    座標値の公表遅れで古すぎる観測点(GNSS_LIVE_MAX_STALE_DAYS超)は除く。"""
     out = []
-    if ref_time is None:
-        vectors = get_gnss_vectors()
-        today = datetime.now(timezone.utc).date()
-        for v in (vectors or []):
-            try:
-                last = v.get("last_date") or ""
-                if last:
-                    age = (today - datetime.strptime(last, "%Y-%m-%d").date()).days
-                    if age > GNSS_LIVE_MAX_STALE_DAYS:
-                        continue
-                out.append((v["code"], v.get("name", v["code"]), float(v["lat"]), float(v["lon"]),
-                            math.hypot(float(v["dE_mm"]), float(v["dN_mm"])), last))
-            except Exception:
-                continue
-        return out
-    with _gnss_lock:
-        hist = _gnss_cache.get("hist")
-    if not hist:
-        return out
-    rt = ref_time.astimezone(timezone.utc) if ref_time.tzinfo else ref_time
-    ref_date = rt.date()
-    for code, h in hist.items():
-        d = h.get("d") or {}
-        for lag in range(GNSS_HIST_MAX_STALE_DAYS + 1):
-            ds = (ref_date - timedelta(days=lag)).strftime("%Y-%m-%d")
-            rec = d.get(ds)
-            if rec:
-                out.append((code, _gnss_display_name(code, h["name"]), h["lat"], h["lon"], math.hypot(rec[0], rec[1]), ds))
-                break
+    vectors = get_gnss_vectors()
+    today = datetime.now(timezone.utc).date()
+    for v in (vectors or []):
+        try:
+            last = v.get("last_date") or ""
+            if last:
+                age = (today - datetime.strptime(last, "%Y-%m-%d").date()).days
+                if age > GNSS_LIVE_MAX_STALE_DAYS:
+                    continue
+            out.append((v["code"], v.get("name", v["code"]), float(v["lat"]), float(v["lon"]),
+                        math.hypot(float(v["dE_mm"]), float(v["dN_mm"])), last))
+        except Exception:
+            continue
     return out
 
 
@@ -3418,30 +3291,17 @@ def _gnss_assign_cells(stations):
     return raw, src
 
 
-def _gnss_risk_raw(ref_time=None):
-    """(v9.00) 統合リスクマップ用のGNSS生値。戻り値は (raw, src)。"""
-    return _gnss_assign_cells(_gnss_station_values(ref_time))
+def _gnss_risk_raw():
+    """統合リスクマップ用のGNSS生値(現在値)。戻り値は (raw, src)。"""
+    return _gnss_assign_cells(_gnss_station_values())
 
 
-def _make_gnss_domain_floor(median_map, lv3_ratio=2.0, lv4_ratio=4.0):
-    """(v9.00) GNSS用ドメイン下限。基準は『そのセルの平常時中央値』と『ノイズ水準GNSS_NOISE_MM』の
-    大きい方。変位がその2倍未満ならLv3相当まで、4倍未満ならLv4相当までに頭打ちにする
-    （GEONETの日々の座標値は数mmのばらつきがあり、ノイズ程度の変動で高レベルにならないように）。
-    倍率は暫定値で、実績を見て再チューニングする前提。"""
-    def _floor(cell_key, raw_v, s):
-        base = max(median_map.get(cell_key, 0.0), GNSS_NOISE_MM)
-        ratio = raw_v / base
-        if ratio < lv3_ratio: return min(s, 0.55)
-        if ratio < lv4_ratio: return min(s, 0.80)
-        return s
-    return _floor
-
-
-def _gnss_rank_map(gnss_raw, calib):
-    """(v9.00) GNSS生値を、そのセル自身の過去実績(gnss_cellプール)に対する絶対評価でスコア化する。"""
-    pool = calib.get("gnss_cell")
-    return _absolute_rank_map(gnss_raw, pool, invert=False, log_transform=False,
-                              domain_floor_fn=_make_gnss_domain_floor(_cellwise_median_map(pool)))
+def _gnss_score_map(gnss_raw):
+    """(v9.06) GNSS生値(水平変位mm/7日)を、固定の目盛り GNSS_SCORE_POINTS でスコア(0〜1)にする。
+    過去実績との比較はしない(現在値のみ)。"""
+    xs = [p[0] for p in GNSS_SCORE_POINTS]
+    ys = [p[1] for p in GNSS_SCORE_POINTS]
+    return {k: float(min(np.interp(v, xs, ys), RISK_SCORE_MAX)) for k, v in gnss_raw.items()}
 
 
 def _gnss_comp_entry(key, gnss_rank, gnss_raw, gnss_src):
@@ -3451,16 +3311,6 @@ def _gnss_comp_entry(key, gnss_rank, gnss_raw, gnss_src):
         return None
     name, dist_km, ds = gnss_src.get(key, ("", 0.0, ""))
     return {"s": round(s, 4), "r": round(gnss_raw[key], 2), "n": name, "d": int(round(dist_km)), "t": ds}
-
-
-def _gnss_hist_range():
-    """(v9.00) 保持しているGNSS履歴の日付範囲 (最古, 最新)。無ければNone。"""
-    with _gnss_lock:
-        hist = _gnss_cache.get("hist")
-    if not hist:
-        return None
-    ds = [k for h in hist.values() for k in (h.get("d") or {})]
-    return (min(ds), max(ds)) if ds else None
 
 
 def render_gnss(updated_str):
@@ -4618,7 +4468,7 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid, quakes):
     plate_raw    = get_plate_stress_grid(quakes)
     pressure_raw = _risk_pressure_raw()
     tec_raw      = _risk_tec_raw()
-    gnss_raw, gnss_src = _gnss_risk_raw()   # (v9.00) 現在のGNSS変位
+    gnss_raw, gnss_src = _gnss_risk_raw()   # (v9.06) 現在のGNSS変位(過去値は使わない)
 
     # ── ハイブリッド方式 ──────────────────────────────
     # 「今この瞬間の空間内相対順位」だけでなく、「アーカイブ(過去65日間)の
@@ -4639,7 +4489,7 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid, quakes):
                                       domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("fault_cell"))))
     plate_rank    = _absolute_rank_map(plate_raw, calib.get("plate_cell"), invert=False, log_transform=False,
                                       domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("plate_cell"))))
-    gnss_rank     = _gnss_rank_map(gnss_raw, calib)   # (v9.00) 自観測点の過去実績に対する絶対評価
+    gnss_rank     = _gnss_score_map(gnss_raw)   # (v9.06) 現在値のみ・固定目盛りでスコア化
     pressure_rank = {k: min(v, PRESSURE_TEC_SCORE_CAP)
                       for k, v in _percentile_rank_map(pressure_raw, invert=False).items()}
     tec_rank      = {k: min(v, PRESSURE_TEC_SCORE_CAP)
@@ -4703,7 +4553,6 @@ def compute_risk_grid_historical(quakes, ref_time):
 
     etas_raw   = _risk_etas_raw(etas_grid_scores)
     bvalue_raw = _risk_bvalue_raw(bvalue_grid)
-    gnss_raw, gnss_src = _gnss_risk_raw(ref_time=ref_time)   # (v9.00) 基準日のGNSS変位（履歴が無ければ空）
 
     # 通常版(compute_risk_grid)と同じハイブリッド方式（相対順位×過去実績との
     # 絶対比較×ドメイン知識）を適用し、アーカイブ表示と現在表示でレベルの
@@ -4718,7 +4567,6 @@ def compute_risk_grid_historical(quakes, ref_time):
                                     domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("fault_cell"))))
     plate_rank  = _absolute_rank_map(plate_raw, calib.get("plate_cell"), invert=False, log_transform=False,
                                     domain_floor_fn=_make_stress_domain_floor(_cellwise_median_map(calib.get("plate_cell"))))
-    gnss_rank   = _gnss_rank_map(gnss_raw, calib)
 
     cells = []
     for key, (lat, lon) in _RISK_CELLS.items():
@@ -4731,9 +4579,6 @@ def compute_risk_grid_historical(quakes, ref_time):
             comp["fault"] = {"s": round(fault_rank[key], 4), "r": round(fault_raw[key], 1)}
         if key in plate_rank:
             comp["plate"] = {"s": round(plate_rank[key], 4), "r": round(plate_raw[key], 1)}
-        _g = _gnss_comp_entry(key, gnss_rank, gnss_raw, gnss_src)
-        if _g:
-            comp["gnss"] = _g
         if comp:
             cells.append({"lat": round(lat, 3), "lon": round(lon, 3), "c": comp})
     return cells
@@ -4767,11 +4612,6 @@ def compute_risk_trend_for_cell(gi, gj, selected_keys):
     calib = _get_historical_calibration()
     key = (gi, gj)
     fault_score = plate_score = None
-    gnss_score = None
-    if "gnss" in selected:   # (v9.00) 活断層/プレートと同様、推移全体には現在値を使い回す簡易実装
-        gv = _gnss_risk_raw()[0].get(key)
-        if gv is not None:
-            gnss_score = _abs_score_single(key, gv, calib.get("gnss_cell"), False, False, _make_gnss_domain_floor)
     if "fault" in selected or "plate" in selected:
         quakes_now = load_quakes()
     if "fault" in selected:
@@ -4809,8 +4649,6 @@ def compute_risk_trend_for_cell(gi, gj, selected_keys):
             comp["fault"] = fault_score
         if plate_score is not None:
             comp["plate"] = plate_score
-        if gnss_score is not None:
-            comp["gnss"] = gnss_score
         if not comp:
             continue
         sel_hist = [k for k in selected if k in _RISK_HIST_KEYS]
@@ -4848,15 +4686,20 @@ def render_riskmap(risk_cells, updated_str):
     n_cells = len(risk_cells)
     w = RISK_DEFAULT_WEIGHTS
 
-    # (v9.00) GNSS成分: 過去実績(基準)が作れていて、かつ現在のセルにGNSSがある時だけ選択可能にする
-    gnss_ready = bool(_get_historical_calibration().get("gnss_cell")) and any("gnss" in c["c"] for c in risk_cells)
+    # (v9.06) GNSS成分: 現在値だけを使う。現在のセルにGNSS値がある時だけ選択可能にする
+    gnss_ready = any("gnss" in c["c"] for c in risk_cells)
     if gnss_ready:
         gnss_row = ('<div class="chk-row"><input type="checkbox" id="chk_gnss" onchange="onToggle(\'gnss\')">'
-                    f'<span class="clabel">GNSS変位（地殻変動）</span><span class="cweight">w={w["gnss"]}</span></div>')
+                    f'<span class="clabel">GNSS変位（地殻変動・現在値）</span><span class="cweight">w={w["gnss"]}</span></div>')
     else:
-        _why = "未設定" if not GSI_GNSS_ENABLED else "データ準備中"
+        if not GSI_GNSS_ENABLED:
+            _why = "未設定"
+        elif _gnss_cache.get("data") is None and (_gnss_cache["updating"] or not _gnss_cache["ts"]):
+            _why = "取得中"
+        else:
+            _why = "現在値なし"
         gnss_row = ('<div class="chk-row disabled"><input type="checkbox" id="chk_gnss" disabled>'
-                    f'<span class="clabel">GNSS変位（地殻変動）</span><span class="cbadge">{_why}</span></div>')
+                    f'<span class="clabel">GNSS変位（地殻変動・現在値）</span><span class="cbadge">{_why}</span></div>')
     gnss_ready_js = "true" if gnss_ready else "false"
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -5004,7 +4847,7 @@ canvas.dChart{{display:block;width:100%}}
   <div class="note">
     重みは選択されたデータのみを使い自動的に再正規化されます。<br>
     セルをクリックすると統合リスク指数と各データの寄与度（内訳）を表示します。<br>
-    GNSS変位は、各セルに半径{GNSS_CELL_RADIUS_KM:.0f}km以内で最も近い電子基準点の直近{GNSS_LOOKBACK_DAYS}日の水平変位を割り当て、その観測点自身の過去実績と比べて絶対評価します（観測点から遠いセルは成分なし＝中立扱い）。座標値は公表に遅れがあるため、基準日は内訳に表示します。「地殻変動」プリセットはプレート境界＋GNSSです（GNSSが使えない間はプレート境界のみ）。
+    GNSS変位は、各セルに半径{GNSS_CELL_RADIUS_KM:.0f}km以内で最も近い電子基準点の直近{GNSS_LOOKBACK_DAYS}日の水平変位（現在値）を割り当て、過去の値とは比べず、変位の大きさ(mm)だけで固定の目盛りでスコア化します（ノイズ水準{GNSS_NOISE_MM:.0f}mm程度で低め、7mm・15mmで高めに評価）。観測点から遠いセルはGNSSを使わず、他の成分だけで評価します。座標値は公表に遅れがあるため、基準日は内訳に表示します。「地殻変動」プリセットはプレート境界＋GNSSです（GNSSが使えない間はプレート境界のみ）。
   </div>
 </div>
 <div id="mp">
@@ -5056,7 +4899,7 @@ var THRESH = {thresh_js};   // (v8.21) レベル境界: 成分選択パターン
 var GS = {gs};
 var RISK_COLOR = {{5:'{LEVEL_COLOR[5]}',4:'{LEVEL_COLOR[4]}',3:'{LEVEL_COLOR[3]}',2:'{LEVEL_COLOR[2]}',1:'{LEVEL_COLOR[1]}'}};
 var KEYS = ['etas','bvalue','fault','plate','pressure','gnss'];
-var GNSS_READY = {gnss_ready_js};   // (v9.00) GNSSの過去実績(基準)が使えるか
+var GNSS_READY = {gnss_ready_js};   // (v9.06) 現在のGNSS値が使えるか
 
 var PRESETS = {{
   standard: {{etas:true, bvalue:true, fault:true, plate:true, pressure:false, gnss:false}},
@@ -5103,7 +4946,7 @@ function onToggle(key){{
 
 // (v8.21) 過去履歴のある成分(ETAS/b値/活断層/プレート)がそのセルに無い場合は中立0.5で補う。
 // 成分が少ないセルの総合値が極端値に張り付くのを防ぐ（サーバー側のしきい値算出と同じ扱い）。
-var HIST_KEYS = ['etas','bvalue','fault','plate','gnss'];
+var HIST_KEYS = ['etas','bvalue','fault','plate'];   // (v9.06) GNSSはそのセルに無ければ中立補完せず除外する
 function computeComposite(cell){{
   var wsum=0, ssum=0, used=[], wmiss=0;
   KEYS.forEach(function(k){{
@@ -5128,9 +4971,9 @@ function computeComposite(cell){{
 // (v8.21) しきい値はサーバー側で「平穏時のLv別セル数が目標値に近くなる」よう
 // 過去65日の実績から自動算出したもの(THRESH)を使う。成分の選択パターンごとに
 // 合成スコアの分布が違うため、選択中の成分(ETAS/b値/活断層/プレート境界)で引き当てる。
-// 気圧は過去履歴が無くキャリブレーションできないため、キーには含めない（GNSSは履歴があるので含める）。
+// 気圧・GNSSは過去履歴が無くキャリブレーションできないため、キーには含めない。
 function currentThresholds(){{
-  var ks = ['etas','bvalue','fault','plate','gnss'].filter(function(k){{ return selected[k]; }});
+  var ks = ['etas','bvalue','fault','plate'].filter(function(k){{ return selected[k]; }});   // (v9.06) GNSSはキーに含めない
   return (THRESH.by_subset && THRESH.by_subset[ks.join(',')]) || THRESH.default;
 }}
 function levelOf(score){{
@@ -5433,7 +5276,7 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
 </style></head><body>
 <div id="panel">
   <h2>過去時点マップ検索</h2>
-  <p class="sub">日付と時刻を指定すると、その時刻から1か月前までの地震データを取得し直し、その時点の統合リスクマップ（ETAS・b値・活断層・プレート境界、利用できる場合はGNSS変位）を再現します。</p>
+  <p class="sub">日付と時刻を指定すると、その時刻から1か月前までの地震データを取得し直し、その時点の統合リスクマップ（ETAS・b値・活断層・プレート境界）を再現します。GNSS変位は未実装です。</p>
 
   <div class="sec">
     <h3>基準日時（JST）</h3>
@@ -5453,15 +5296,14 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
       <span class="clabel">活断層 応力負荷</span><span class="cweight">w=0.10</span></div>
     <div class="chk-row"><input type="checkbox" id="chk_plate" checked onchange="onToggle('plate')">
       <span class="clabel">プレート境界 応力負荷</span><span class="cweight">w=0.05</span></div>
-    <div class="chk-row"><input type="checkbox" id="chk_gnss" disabled onchange="onToggle('gnss')">
-      <span class="clabel">GNSS変位（地殻変動）</span><span class="cweight">w=0.10</span></div>
-    <div id="gnssNote" style="font-size:10px;color:rgba(235,238,245,.46);padding:0 4px 4px;line-height:1.6"></div>
+    <div class="chk-row disabled"><input type="checkbox" disabled>
+      <span class="clabel">GNSS変位（地殻変動）</span><span class="cbadge">未実装</span></div>
   </div>
 
   <div id="cellCount" style="display:none">表示中のセル数: <span id="cellN">0</span></div>
   <div class="note">
     気圧偏差・TECは過去分のデータを保持していないため、この検索には含まれません。<br>
-    GNSS変位は保持している日次の座標値履歴から基準日の値を使います。座標値は公表に遅れがあり、履歴の範囲外や公表前の日付では使えません（その場合はチェックできません）。<br>
+    GNSS変位は、アーカイブでは未実装です（統合リスクマップタブでは現在値のみで使えます）。<br>
     直近60日以内は気象庁(JMA)・P2P地震情報を統合した高精度データを使用します。<br>
     それより古い日時は、サーバーに気象庁一元化震源カタログの年別ファイルがある期間ならそれを使います。
     無い期間はUSGSの過去カタログから都度取得します（数年前まで指定可能）。
@@ -5493,12 +5335,12 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
 </div>
 <script>
 var RISK_COLOR = {5:'#0c000c',4:'#8000ff',3:'#ff0000',2:'#ffe600',1:'#66ccff'};
-var COMP_COLOR = {etas:'#ef4444', bvalue:'#f97316', fault:'#facc15', plate:'#38bdf8', gnss:'#34d399'};
-var WEIGHTS = {etas:0.55, bvalue:0.15, fault:0.10, plate:0.05, gnss:0.10};
-var LABELS  = {etas:'ETAS', bvalue:'b値', fault:'活断層', plate:'プレート境界', gnss:'GNSS変位'};
-var KEYS = ['etas','bvalue','fault','plate','gnss'];
+var COMP_COLOR = {etas:'#ef4444', bvalue:'#f97316', fault:'#facc15', plate:'#38bdf8'};
+var WEIGHTS = {etas:0.55, bvalue:0.15, fault:0.10, plate:0.05};
+var LABELS  = {etas:'ETAS', bvalue:'b値', fault:'活断層', plate:'プレート境界'};
+var KEYS = ['etas','bvalue','fault','plate'];
 var GS = __RISK_GRID_SIZE__;
-var selected = {etas:true, bvalue:true, fault:true, plate:true, gnss:false};
+var selected = {etas:true, bvalue:true, fault:true, plate:true};
 var CELLS = [];
 var lastShownList = [];
 var map = null, rectLayer = null;
@@ -5601,12 +5443,6 @@ function showDetail(cell, comp, lv){
     return '<div class="brk-row"><span>' + nm + '</span>' +
       '<span class="brk-val">' + (contribInt[i]>=0?'+':'') + contribInt[i] + '</span></div>';
   }).join('');
-  if(cell.c.gnss && comp.used.indexOf('gnss') >= 0){   // (v9.00) どの観測点の値かを表示
-    var g = cell.c.gnss;
-    document.getElementById('dBreakdown').innerHTML +=
-      '<div style="font-size:10px;color:rgba(235,238,245,.46);margin-top:4px">GNSS: ' + g.n +
-      '（約' + g.d + 'km）水平' + g.r.toFixed(1) + 'mm/7日　基準日' + g.t + '</div>';
-  }
   drawBarChart(document.getElementById('dBarCanvas'), labels, contribInt, colors);
 }
 
@@ -5653,8 +5489,7 @@ function fmtStatus(d){
   return '基準時刻: <b>' + d.ref_time_jst + '</b><br>' +
          '取得期間: ' + d.period_start_jst + ' 〜 ' + d.ref_time_jst + '<br>' +
          'データソース: <b>' + srcLabel + '</b><br>' +
-         '使用した地震データ: <b>' + d.quake_count + '</b>件 ／ セル数: <b>' + d.cells.length + '</b>' +
-         (d.gnss && d.gnss.note ? '<br>GNSS: ' + d.gnss.note : '');
+         '使用した地震データ: <b>' + d.quake_count + '</b>件 ／ セル数: <b>' + d.cells.length + '</b>';
 }
 
 function runFetch(){
@@ -5680,12 +5515,6 @@ function runFetch(){
     .then(function(d){
       CELLS = d.cells || [];
       if(d.thresholds) THRESH = d.thresholds;
-      // (v9.00) GNSSが使える時だけチェックを有効化（使えない時は外して無効にする）
-      var g = d.gnss || {cells:0, note:''};
-      var gchk = document.getElementById('chk_gnss');
-      gchk.disabled = !(g.cells > 0);
-      if(gchk.disabled){ gchk.checked = false; selected.gnss = false; }
-      document.getElementById('gnssNote').textContent = g.note || '';
       statusBox.className = ''; statusBox.innerHTML = fmtStatus(d);
       document.getElementById('chkSec').style.display = CELLS.length ? 'block' : 'none';
       document.getElementById('cellCount').style.display = CELLS.length ? 'block' : 'none';
@@ -6201,9 +6030,6 @@ def gnss_status():
         "updating": updating,
         "error": error,
         "lookback_days": GNSS_LOOKBACK_DAYS,
-        "history_stations": len(_gnss_cache.get("hist") or {}),      # (v9.00) 日次履歴を持つ観測点数
-        "history_range": _gnss_hist_range(),                         # (v9.00) 履歴の日付範囲
-        "risk_pool_ready": bool(_hist_calib_cache.get("gnss_cell")), # (v9.00) リスクマップの基準にGNSSが入っているか
         "names_file": (_gnss_name_table() and {                      # (v9.02) 地点名ファイルの読込状況
             "found": bool(_gnss_names_info["path"]), "path": _gnss_names_info["path"],
             "entries": _gnss_names_info["count"], "error": _gnss_names_info["error"],
@@ -6390,19 +6216,6 @@ def archive_historical_riskmap():
         import traceback; traceback.print_exc()
         return {"error": f"リスクマップの再計算に失敗しました: {e}"}, 500
 
-    # (v9.00) GNSS変位を反映できたか（できなかった理由も返す）
-    gnss_cells = sum(1 for c in cells if "gnss" in c["c"])
-    if gnss_cells > 0:
-        gnss_note = f"{gnss_cells}セルにGNSS変位を反映できます"
-    elif not GSI_GNSS_ENABLED:
-        gnss_note = "GNSS未設定のため含まれません"
-    elif not _get_historical_calibration().get("gnss_cell"):
-        gnss_note = "GNSSの過去実績(基準)が未作成のため含まれません（履歴取得中、または履歴なし）"
-    else:
-        rng = _gnss_hist_range()
-        gnss_note = (f"この日付のGNSS座標値が無いため含まれません（保持範囲 {rng[0]}〜{rng[1]}。範囲外か公表前の可能性）"
-                     if rng else "GNSS履歴が未取得のため含まれません")
-
     return {
         "ref_time_jst": ref_time_jst.strftime("%Y-%m-%d %H:%M JST"),
         "period_start_jst": (start_utc.astimezone(JST)).strftime("%Y-%m-%d %H:%M JST"),
@@ -6410,7 +6223,6 @@ def archive_historical_riskmap():
         "data_source": data_source,
         "min_mag": JMA_CATALOG_MIN_MAG if data_source == "jma_catalog" else None,
         "thresholds": get_risk_level_thresholds(),
-        "gnss": {"cells": gnss_cells, "note": gnss_note},
         "cells": cells,
     }
 
