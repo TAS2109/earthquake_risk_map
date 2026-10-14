@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-地震リスクマップ v9.10
+地震リスクマップ v9.20
 
 ■ 目的と成功の定義
   統合リスクマップの目的は、地震の「発生時期の予測」ではなく、「M6以上の大きな地震が起きる場所を、
   高リスクのセルに集められているか」。評価は「M6以上の何%が、面積の何%の高リスクセルに入ったか」
   (Molchan図／面積あたりの的中率)で行う。評価に使うのは発生“直前”の値（直後は本震・余震で必ず上がる）。
-  現在は人力で、アーカイブタブを使ってM6以上の直前・直後のレベル変化を調べている。
+  (v9.08) 検証タブ(バックテスト)で、M6以上の直前・直後のリスク値を自動で記録・集計できるようになった
+  （従来は人力でアーカイブタブを使って調べていた）。
   ※ Lv・スコアは発生確率ではない。表示にも「確率ではない」旨を残す。
 
 ■ 現在の統合リスクマップの仕様
@@ -17,15 +18,17 @@
   ・GNSSは「他の成分の水準を超えた分だけ総合を押し上げ、平常範囲なら総合を変えない」。観測点から遠いセルはGNSSなし。
   ・レベル境界は、平穏時のLv別セル数(RISK_LEVEL_TARGETS)に合うよう過去65日から自動算出（GNSSは較正に含めない）。
   ・標準プリセット: ETAS+b値+活断層+プレート+GNSS（GNSSが使えない間は自動で外れる）。
-  ・アーカイブ: GNSS変位は未実装。基準(過去65日)は「現在」で作ったものを過去日付にも使う（既知の限界）。
+  ・アーカイブ: GNSS変位は未実装。基準(過去65日)は既定では「現在」で作ったものを過去日付にも使う（既知の限界）。
+    (v9.08) 「この日付で基準を作り直す」(calib=date)なら、基準日より前の65日だけで基準を作る（一元化カタログの範囲）。
 
 ■ 今後の方針（優先順。詳細な案はチャットで検討済み）
-  1. 検証の自動化(最優先): 気象庁一元化カタログ(data/jma_catalog/)のM6以上の一覧に対し、発生1日前などの時点で
+  1. 検証の自動化(最優先) ※v9.08で実装済み。重み・成分の取捨は、この検証タブの結果を見て決める: 気象庁一元化カタログ(data/jma_catalog/)のM6以上の一覧に対し、発生1日前などの時点で
      アーカイブと同じ計算を回し、震源セルのレベル・順位(上位何%)・周囲の最大レベル・高リスク面積比を記録し、
      Molchan図で集計。直前に近くで大きな地震があった例(余震)は分けて評価。比較対象は静的な長期ハザードマップ
      (過去の地震分布・活断層のみ)で、動的更新が静的に勝てるかを見る。重み・成分の取捨はこの結果で決める。
   2. 較正の安定化: 過去65日の基準は直近の大地震列で歪む。日付ごとに基準を作り直せるようにし(古い日付の評価の前提)、
      異常期の除外・近隣セルとの情報共有・数年スケールの併用を検討。
+     ※「日付ごとの基準の作り直し」は v9.08 で実装済み（_compute_historical_calibration(end_utc, quakes, step_hours)）。残りは未着手。
   3. 大地震向けの成分: 長期評価(地震調査研究推進本部)・プレート固着・活断層を背景リスクに追加。規模別スコア(M5+/M6+/M7+)。
   4. 余震と異常の分離、空間平滑(カーネル)、データが薄いセルの不確かさ表示。
   5. GNSS: 定常速度の差し引き、広域ノイズ除去、複数点の整合、観測点の増加。検証用に、GNSS込みのリスクマップを
@@ -35,9 +38,12 @@
      共有URL/CSV出力、PWA化。通知は「時期の警報」と誤解されないよう、注目セルの変化として位置づける。
 
 ■ 更新履歴（要点のみ）
+  v9.20 app_35(v9.10: TEC実装更新)と app_38(v9.08: 検証タブ・日付ごとの基準)を統合。両者の変更は互いに独立で、競合なし
   v9.10 TEC取得をGNSSと同じ方式に統一(有効判定TEC_ENABLED／更新中フラグ付きの裏更新／古ければアクセス時に再取得／
         TEC_JSON_URLによる数値JSON代替経路／/tec/status・/tec/refresh_now・/tec/raw_image追加／3時間超の古いTECはリスクに使わない／
         NICT画像の公開遅れ(数時間)に合わせ遡りを6時間に拡大・TEC_URL_TEMPLATE環境変数で形式変更可)
+  v9.08 検証タブ(M6以上バックテスト・Molchan図・静的ハザードとの比較・余震の分離)／日付ごとの基準の作り直し
+        (_compute_historical_calibration に end_utc/quakes/step_hours を追加、アーカイブに calib=date)
   v9.07 標準プリセットにGNSS追加／重み見直し／GNSSは「超えた分だけ押し上げ」／アーカイブの重みをサーバーと一致
   v9.06 GNSSを現在値のみ(履歴・基準なし)に変更。アーカイブのGNSSは未実装に
   v9.05 リスクマップの再計算を高速化(計算結果は同じ)
@@ -56,6 +62,7 @@
   6. TEC          - 電離圏全電子数 (NICT SCIDAS リンク)
   7. GNSS         - 地殻変動 (GEONET SFTP実データ変位ベクトル、未設定時はプレースホルダー)
   8. 海面気圧     - アメダス海面気圧マップ
+  10. 検証       - M6以上のバックテスト(Molchan図)。静的ハザードとの比較、余震は分けて評価。CSV出力あり
   9. アーカイブ   - 日時指定で、その時点から過去1か月分の地震データで統合リスクマップを再計算（GNSSは未実装）
                   （直近60日以内はJMA/P2P統合データ、それより古い日時は気象庁一元化震源カタログ
                     (data/jma_catalog/ のファイル)、無ければUSGS過去カタログを都度取得）
@@ -1661,13 +1668,14 @@ def get_risk_level_thresholds():
             "calibrated": bool(calib.get("risk_thresholds")),
             "n_samples": calib.get("n_samples", 0)}
 
-def _sample_ref_times(lookback_days=HIST_CALIB_LOOKBACK_DAYS, step_hours=HIST_CALIB_SAMPLE_HOURS):
-    now = datetime.now(timezone.utc)
+def _sample_ref_times(lookback_days=HIST_CALIB_LOOKBACK_DAYS, step_hours=HIST_CALIB_SAMPLE_HOURS, end_utc=None):
+    # (v9.08) end_utc を指定すると「その日時より前」の期間でサンプリングする（日付ごとの基準の作り直し用）
+    now = end_utc or datetime.now(timezone.utc)
     n = int(lookback_days * 24 / step_hours)
     # 直近(0時間前=現在)は「今まさに評価しようとしている値」と重なるため含めない
     return [now - timedelta(hours=step_hours * i) for i in range(1, n + 1)]
 
-def _compute_historical_calibration():
+def _compute_historical_calibration(end_utc=None, quakes=None, step_hours=HIST_CALIB_SAMPLE_HOURS):
     """過去HIST_CALIB_LOOKBACK_DAYS日間を定期サンプリングし、ETAS/b値/断層・
     プレート応力それぞれの「生の値」の分布(プール)を作る。アーカイブタブの
     再計算ロジック(analyze_etas(ref_time=...) / _historical_fault_plate_raw)と同じ計算を、
@@ -1686,9 +1694,18 @@ def _compute_historical_calibration():
       ・ETAS: 地震×近傍セルの集計をPythonループからnumpyの一括集計へ。
       ・断層/プレート応力: 距離行列を基準時刻ごとに作り直していたのを、1回だけ作って
         時間減衰の重みとの行列積で全時点を一度に出す方式へ。最寄りセルの割当もキャッシュ。
-      ・しきい値算出での履歴の並べ替えを使い回す。"""
+      ・しきい値算出での履歴の並べ替えを使い回す。
+
+    (v9.08) 日付ごとの基準の作り直し:
+      ・end_utc を指定すると、「現在」ではなくその日時の直前HIST_CALIB_LOOKBACK_DAYS日で基準を作る。
+        古い日付の評価に「現在の基準」を使うと、その日付より未来の活動が基準に混ざる(先読み)ため。
+      ・quakes を渡すと、quakes.csv(直近65日だけ保持)ではなくその地震リストから作る。
+        古い日付では一元化カタログ等から読んだ [end_utc-125日, end_utc] の地震を渡す。
+        （評価の窓は各サンプル時刻より前だけなので、end_utc より後の地震が混ざっても使われない）
+      ・step_hours でサンプル間隔を変えられる（既定は従来どおり24時間）。
+      省略時は従来と同じ動作（現在・quakes.csv・24時間）。"""
     from collections import defaultdict
-    ref_times = _sample_ref_times()
+    ref_times = _sample_ref_times(step_hours=step_hours, end_utc=end_utc)
     etas_cell, bvalue_cell, fault_cell, plate_cell = (defaultdict(list), defaultdict(list),
                                                        defaultdict(list), defaultdict(list))
     per_time_raw = []   # (v8.21) しきい値キャリブレーション用: 各時点の成分別生値
@@ -1697,7 +1714,7 @@ def _compute_historical_calibration():
     win = 60 * 86400.0
     t_lo = min(ref_times) - timedelta(days=60)
     t_hi = max(ref_times)
-    qa = _build_quake_arrays(load_quakes_between(t_lo, t_hi))
+    qa = _build_quake_arrays(load_quakes_between(t_lo, t_hi) if quakes is None else quakes)
     qt = qa["t"]
     samples = []   # (rt, rt_epoch, lo, hi): 各時点で使う地震の範囲 qa[lo:hi]
     for rt in ref_times:
@@ -4682,9 +4699,10 @@ def _historical_fault_plate_raw(quakes, ref_time):
 
     return fault_raw, plate_raw
 
-def compute_risk_grid_historical(quakes, ref_time):
+def compute_risk_grid_historical(quakes, ref_time, calib=None):
     """過去時点(ref_time)における統合リスクマップ用のセル一覧を返す。
-    quakesは事前に [ref_time - 1か月, ref_time] の範囲でフィルタ済みのものを渡す。"""
+    quakesは事前に [ref_time - 1か月, ref_time] の範囲でフィルタ済みのものを渡す。
+    (v9.08) calib を渡すと、その基準(日付ごとに作り直したもの)で評価する。省略時は現在の基準。"""
     etas_grid_scores = analyze_etas(quakes, ref_time=ref_time)
     bvalue_grid = compute_bvalue_grid(quakes)
     fault_raw, plate_raw = _historical_fault_plate_raw(quakes, ref_time)
@@ -4695,7 +4713,7 @@ def compute_risk_grid_historical(quakes, ref_time):
     # 通常版(compute_risk_grid)と同じハイブリッド方式（相対順位×過去実績との
     # 絶対比較×ドメイン知識）を適用し、アーカイブ表示と現在表示でレベルの
     # 意味がぶれないようにする。
-    calib = _get_historical_calibration()
+    calib = calib or _get_historical_calibration()
     # (v7.56) 通常版(compute_risk_grid)と同じくセル単位絶対評価プールを使用。
     etas_rank   = _absolute_rank_map(etas_raw, calib.get("etas_cell"), invert=False, log_transform=True,
                                     domain_floor_fn=_make_etas_domain_floor(_cellwise_median_map(calib.get("etas_cell"))))
@@ -4814,6 +4832,725 @@ def compute_risk_trend_for_cell(gi, gj, selected_keys):
             pass
 
     return points, prev_day_score
+
+# ══════════════════════════════════════════════════════
+# 検証: M6以上バックテスト(Molchan図) と 日付ごとの基準の作り直し (v9.08)
+# ──────────────────────────────────────────────────────
+# ■ 目的
+#   統合リスクマップが「M6以上の震源を、面積の何%の高リスクセルに集められているか」を、
+#   気象庁一元化カタログ(data/jma_catalog/)の過去のM6以上すべてについて自動で測る。
+#   これまで人力でアーカイブタブを使って記録していた作業（直前・直後のリスク値）の自動化。
+#
+# ■ 評価の手順（1地震ごと）
+#   1) 発生の lead_hours 前(既定24時間前)を評価時点とし、その時点までの地震だけで
+#      アーカイブと同じ計算（ETAS/b値/活断層/プレート → 絶対評価 → 合成）を行う。
+#   2) 震源セルの「順位」τ = そのセルより高スコアのセルの面積比（上位τ。0に近いほど良い）。
+#      面積はセルの緯度による縮み(cos)で重み付け。スコアの無いセルは「警戒できない」扱いで
+#      面積には数える（甘くならないように）。
+#   3) 周囲(±BT_NEAR_RADIUS_CELLS セル)の最大レベル／最大スコアでの順位も記録する。
+#   4) レベルごとの高リスク面積比（Lv>=1〜5 のセルが占める面積の割合）も記録する。
+#   5) 発生 after_hours 後(既定1時間後)のスコアも「参考用」として記録する。
+#   6) 比較用に、静的な長期ハザードマップ（その時点から過去 BT_STATIC_LOOKBACK_YEARS 年の
+#      M>=BT_STATIC_MIN_MAG の地震分布を平滑化したもの／それに活断層への近さを加えたもの）でも
+#      同じ順位τを出す。評価時点より後の地震は一切使わない。
+#   Molchan図: 横軸=警戒した面積の割合τ、縦軸=外れ率(τ以内に入らなかった地震の割合)。
+#   対角線(ランダム)より下にあるほど良い。
+#
+# ■ 余震の分離
+#   発生前に近くでM>=aftershock_prev_mag の大地震があった例を分ける。
+#     aftershock : 評価時点より前にあった(マップが知っていた) → 余震・続発
+#     unseen     : 評価時点と発生の間にあった(マップは知らない) → 直前の前震など
+#     independent: 近くに大地震なし
+#   「近く・直前」の範囲は大地震の規模から決める(_bt_seq_window)。
+#
+# ■ 日付ごとの基準の作り直し
+#   通常の基準(_hist_calib_cache)は「現在から過去65日」で作る。古い日付の評価に使うと、
+#   その日付より未来の活動で基準が歪む（先読み）。ここでは基準日(anchor)より前の65日だけで
+#   基準(セル別プール・しきい値)を作り直す。anchorは評価時点を rebuild_days 日の格子に
+#   切り下げたもの(0なら1地震ごとに作り直す)。基準の作成は重いので、同じanchorの地震で共有する。
+# ══════════════════════════════════════════════════════
+BACKTEST_DIR = "data/backtest"
+BT_WINDOW_DAYS = 60.0          # 較正(_compute_historical_calibration)の窓と同じ。変えるなら較正側も合わせること
+BT_STD_KEY = _risk_subset_key(_RISK_STD_KEYS)
+BT_NEAR_RADIUS_CELLS = 1       # 「周囲」= 震源セルから±1セル(約±55km)
+# 余震判定: 前の大地震の規模Mpから「近く(km)」「直前(日)」を決める
+BT_SEQ_MIN_RADIUS_KM = 50.0
+BT_SEQ_MAX_RADIUS_KM = 400.0
+BT_SEQ_MIN_DAYS      = 30.0
+BT_SEQ_MAX_DAYS      = 365.0
+# 静的ハザードマップ
+BT_STATIC_MIN_MAG        = 4.5
+BT_STATIC_LOOKBACK_YEARS = 10
+BT_STATIC_SIGMA_CELLS    = 1.0
+BT_STATIC_W_SEIS         = 0.7   # 「地震分布＋活断層」版の重み(順位の加重平均)
+BT_STATIC_W_FAULT        = 0.3
+BT_TAU_GRID = [i / 100.0 for i in range(101)]
+BT_GROUP_LABELS = {"all": "全体", "independent": "独立(近くに大地震なし)",
+                   "aftershock": "余震・続発(評価時点で既知の大地震の後)",
+                   "unseen": "直前に発生(評価時点では未発生の前震等)"}
+BT_MODEL_LABELS = {"dyn": "動的(統合リスクマップ)", "st_seis": "静的(地震分布のみ)",
+                   "st_comb": "静的(地震分布＋活断層)"}
+
+_BT_KEYS  = list(_RISK_CELLS.keys())
+_BT_IDX   = {k: i for i, k in enumerate(_BT_KEYS)}
+_BT_N     = len(_BT_KEYS)
+_BT_W     = np.array([math.cos(math.radians(_RISK_CELLS[k][0])) for k in _BT_KEYS])
+_BT_WTOT  = float(_BT_W.sum())
+_BT_GI0   = min(k[0] for k in _BT_KEYS)
+_BT_GJ0   = min(k[1] for k in _BT_KEYS)
+_BT_CI    = np.array([k[0] - _BT_GI0 for k in _BT_KEYS], dtype=np.int64)
+_BT_CJ    = np.array([k[1] - _BT_GJ0 for k in _BT_KEYS], dtype=np.int64)
+_BT_SHAPE = (int(_BT_CI.max()) + 1, int(_BT_CJ.max()) + 1)
+
+
+# ── 小物 ───────────────────────────────────────────
+def _bt_cell_index(lat, lon):
+    """震源の緯度経度 → _RISK_CELLS 内の通し番号。対象外(領域外)は None。"""
+    return _BT_IDX.get((int(math.floor(lat / RISK_GRID_SIZE)), int(math.floor(lon / RISK_GRID_SIZE))))
+
+def _bt_dist_km(a, b):
+    dlat = (a["lat"] - b["lat"]) * 111.0
+    dlon = (a["lon"] - b["lon"]) * 111.0 * math.cos(math.radians((a["lat"] + b["lat"]) / 2.0))
+    return math.hypot(dlat, dlon)
+
+def _bt_seq_window(mag_prev):
+    """前の大地震(規模mag_prev)の『近く(km)』と『直前(日)』。
+    近く: 断層長(Wells&Coppersmith)の2倍を BT_SEQ_MIN〜MAX_RADIUS_KM に収めたもの。
+    直前: M6で30日、規模が1上がるごとに約3.2倍、BT_SEQ_MIN〜MAX_DAYS に収めたもの。"""
+    L = 10.0 ** (-2.44 + 0.59 * mag_prev)
+    r = min(max(2.0 * L, BT_SEQ_MIN_RADIUS_KM), BT_SEQ_MAX_RADIUS_KM)
+    d = min(max(BT_SEQ_MIN_DAYS * 10.0 ** (0.5 * (mag_prev - 6.0)), BT_SEQ_MIN_DAYS), BT_SEQ_MAX_DAYS)
+    return r, d
+
+def _bt_pct_rank(x):
+    """ベクトルxの順位(0〜1、大きい値ほど1に近い。同値は平均順位)。"""
+    x = np.asarray(x, dtype=float)
+    u, inv, cnt = np.unique(x, return_inverse=True, return_counts=True)
+    below = np.cumsum(cnt) - cnt
+    avg = below + (cnt - 1) / 2.0
+    return (avg[inv] + 0.5) / len(x)
+
+def _bt_tau(vec, idx):
+    """セルidxの順位τ = (それより高いセルの面積 + 同点の面積/2) / 全面積。小さいほど『上位』。
+    スコアが無い(NaN)セルは警戒できないので τ=1.0。"""
+    s = vec[idx]
+    if np.isnan(s):
+        return 1.0
+    ok = ~np.isnan(vec)
+    above = _BT_W[ok & (vec > s)].sum()
+    tie = _BT_W[ok & (vec == s)].sum()
+    return float((above + 0.5 * tie) / _BT_WTOT)
+
+def _bt_maxfilter(vec, r):
+    """各セルについて、±rセル四方の最大値(NaNは無視。全部NaNならNaN)。
+    『しきい値以上のセルを周囲r個ぶん広げた領域』= 『最大値フィルタ後がしきい値以上』なので、
+    周囲を含めた面積・順位をそのまま計算できる。"""
+    H, W = _BT_SHAPE
+    grid = np.full((H + 2 * r, W + 2 * r), -np.inf)
+    grid[_BT_CI + r, _BT_CJ + r] = np.where(np.isnan(vec), -np.inf, vec)
+    out = np.full((H, W), -np.inf)
+    for di in range(-r, r + 1):
+        for dj in range(-r, r + 1):
+            out = np.maximum(out, grid[r + di:r + di + H, r + dj:r + dj + W])
+    res = out[_BT_CI, _BT_CJ]
+    return np.where(np.isinf(res), np.nan, res)
+
+def _bt_levels(score_vec, th):
+    lv = np.zeros(len(score_vec), dtype=int)
+    with np.errstate(invalid="ignore"):
+        for t in th:
+            lv += (score_vec >= t)
+    return lv
+
+def _bt_binom_sf(k, n, p):
+    """二項分布 P(X>=k | n, p)。ランダムな警戒面積pで、n個中k個以上が入る確率。"""
+    if k <= 0:
+        return 1.0
+    if k > n:
+        return 0.0
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    lp, lq = math.log(p), math.log(1.0 - p)
+    lg_n = math.lgamma(n + 1)
+    s = 0.0
+    for i in range(k, n + 1):
+        s += math.exp(lg_n - math.lgamma(i + 1) - math.lgamma(n - i + 1) + i * lp + (n - i) * lq)
+    return min(1.0, s)
+
+def _bt_jst(dt):
+    return dt.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ── 日本の一元化カタログの収録範囲 ────────────────────
+def _jma_catalog_coverage():
+    """年別ファイルがある年と、収録期間(最初・最後の記録時刻)を返す。無ければ None。"""
+    years = [y for y in range(1923, datetime.now(timezone.utc).year + 1) if _jma_catalog_find(y)]
+    if not years:
+        return None
+    first = _jma_catalog_span(_jma_catalog_find(years[0]))[0]
+    last = _jma_catalog_span(_jma_catalog_find(years[-1]))[1]
+    if first is None or last is None:
+        return None
+    return {"first": first, "last": last, "years": years,
+            "contiguous": years == list(range(years[0], years[-1] + 1))}
+
+def _fetch_catalog_strict(start_utc, end_utc, min_mag=None):
+    """一元化カタログから読む。期間を覆っていなければ例外（USGSへは逃げない。
+    基準と評価で地震の検知下限が混ざると、b値やETASの絶対評価が歪むため）。"""
+    qs = fetch_quakes_jma_catalog_range(start_utc, end_utc, min_mag=min_mag)
+    if qs is None:
+        raise RuntimeError(f"一元化カタログ(data/jma_catalog/)が {start_utc.astimezone(JST):%Y-%m-%d}〜"
+                           f"{end_utc.astimezone(JST):%Y-%m-%d} を覆っていません")
+    return qs
+
+
+# ── 日付ごとの基準（アーカイブタブの「基準を作り直す」用の小さなキャッシュ）────────
+_date_calib_cache = {}          # key(JST日付) -> 較正結果
+_date_calib_state = {"key": None, "error": None, "started": 0.0, "running": False}
+_date_calib_lock = threading.Lock()
+DATE_CALIB_KEEP = 3
+
+def _date_calib_anchor(ref_utc):
+    """基準日時の属するJST日付の0時(UTC)。基準日時以前なので先読みにならない。"""
+    j = ref_utc.astimezone(JST).replace(hour=0, minute=0, second=0, microsecond=0)
+    return j.astimezone(timezone.utc)
+
+def get_calibration_at(ref_utc):
+    """基準日(ref_utcのJST日付の0時)より前の65日だけで作った基準を返す。
+    未作成なら背景スレッドで作り始め、(None, 状態) を返す。作成に失敗したら (None, {"error":...})。"""
+    anchor = _date_calib_anchor(ref_utc)
+    key = anchor.astimezone(JST).strftime("%Y%m%d")
+    with _date_calib_lock:
+        hit = _date_calib_cache.get(key)
+        if hit is not None:
+            return hit, {"key": key}
+        st = _date_calib_state
+        if st["running"] and time.time() - st["started"] < 1800:
+            return None, {"pending": True, "key": st["key"], "same": st["key"] == key}
+        if st["key"] == key and st["error"]:
+            err = st["error"]
+            st["key"], st["error"] = None, None     # 次回は再試行できるように
+            return None, {"error": err}
+        st.update(key=key, error=None, started=time.time(), running=True)
+
+    def _job():
+        try:
+            lo = anchor - timedelta(days=HIST_CALIB_LOOKBACK_DAYS + BT_WINDOW_DAYS)
+            qs = _fetch_catalog_strict(lo, anchor)
+            calib = _compute_historical_calibration(end_utc=anchor, quakes=qs)
+            if not calib.get("risk_thresholds"):
+                raise RuntimeError(f"基準のサンプルが不足しています（{calib.get('n_samples', 0)}時点）")
+            calib["anchor_jst"] = _bt_jst(anchor)
+            with _date_calib_lock:
+                _date_calib_cache[key] = calib
+                while len(_date_calib_cache) > DATE_CALIB_KEEP:
+                    _date_calib_cache.pop(next(iter(_date_calib_cache)))
+                _date_calib_state.update(key=None, running=False)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            with _date_calib_lock:
+                _date_calib_state.update(error=str(e) or e.__class__.__name__, running=False)
+    threading.Thread(target=_job, daemon=True).start()
+    return None, {"pending": True, "key": key, "same": True}
+
+
+# ── 地震(M6以上)の一覧と、余震の分類 ──────────────────
+def _bt_load_events(start_utc, end_utc, min_mag, prev_mag):
+    """一元化カタログから M>=min(min_mag, prev_mag) の地震を時系列で返す。
+    余震判定のため、start より BT_SEQ_MAX_DAYS 日前から読む。"""
+    cov = _jma_catalog_coverage()
+    if not cov:
+        raise RuntimeError("一元化カタログ(data/jma_catalog/ の年別ファイル)が見つかりません")
+    if not cov["contiguous"]:
+        raise RuntimeError(f"年別ファイルが連続していません（{cov['years'][0]}〜{cov['years'][-1]} の欠けを確認してください）")
+    lo = max(start_utc - timedelta(days=BT_SEQ_MAX_DAYS), cov["first"])
+    hi = min(end_utc, cov["last"])
+    if lo >= hi:
+        raise RuntimeError("指定期間がカタログの収録期間外です")
+    qs = _fetch_catalog_strict(lo, hi, min_mag=min(min_mag, prev_mag))
+    events = []
+    for q in qs:
+        t = datetime.fromisoformat(q["time"].replace("Z", "+00:00"))
+        events.append({"t": t, "lat": q["lat"], "lon": q["lon"], "mag": q["mag"], "depth": q.get("depth", 0.0),
+                       "place": q.get("place", ""),
+                       "id": f"{t.strftime('%Y%m%d%H%M%S')}_{q['lat']:.2f}_{q['lon']:.2f}"})
+    events.sort(key=lambda e: e["t"])
+    return events, cov
+
+def _bt_predecessors(ev, big):
+    """ev の『近く・直前』にあった大地震(big: M>=prev_mag、時系列)の一覧。"""
+    out = []
+    for p in big:
+        if p["t"] >= ev["t"]:
+            break
+        r, d = _bt_seq_window(p["mag"])
+        gap = (ev["t"] - p["t"]).total_seconds() / 86400.0
+        if gap > d:
+            continue
+        dist = _bt_dist_km(ev, p)
+        if dist > r:
+            continue
+        out.append({"t": p["t"], "mag": p["mag"], "place": p["place"], "dist_km": dist, "gap_days": gap})
+    return out
+
+def _bt_classify(ev, big, eval_t):
+    """('independent'|'aftershock'|'unseen', 一番大きい前の大地震 or None)"""
+    preds = _bt_predecessors(ev, big)
+    if not preds:
+        return "independent", None
+    known = [p for p in preds if p["t"] <= eval_t]
+    if known:
+        return "aftershock", max(known, key=lambda p: p["mag"])
+    return "unseen", max(preds, key=lambda p: p["mag"])
+
+
+# ── 静的な長期ハザードマップ ──────────────────────────
+def _bt_smooth(grid):
+    R = 2
+    k1 = np.exp(-0.5 * (np.arange(-R, R + 1) / BT_STATIC_SIGMA_CELLS) ** 2)
+    K = np.outer(k1, k1); K /= K.sum()
+    H, W = grid.shape
+    pad = np.pad(grid, R)
+    out = np.zeros_like(grid)
+    for di in range(-R, R + 1):
+        for dj in range(-R, R + 1):
+            out += K[di + R, dj + R] * pad[R + di:R + di + H, R + dj:R + dj + W]
+    return out
+
+def _bt_static_prepare(start_utc, end_utc, cov):
+    """静的ハザードマップの材料（M>=BT_STATIC_MIN_MAG の長期カタログと、活断層への近さ）。評価ごとの切り出しは _bt_static_vectors。"""
+    s0 = max(start_utc - timedelta(days=365.25 * BT_STATIC_LOOKBACK_YEARS), cov["first"])
+    e0 = min(end_utc, cov["last"])
+    qs = _fetch_catalog_strict(s0, e0, min_mag=BT_STATIC_MIN_MAG)
+    keys, gi0, gj0, tab = _risk_cell_lookup()
+    t = np.array([datetime.fromisoformat(q["time"].replace("Z", "+00:00")).timestamp() for q in qs], dtype=float)
+    cell = np.full(len(qs), -1, dtype=np.int64)
+    for n, q in enumerate(qs):
+        i = _bt_cell_index(q["lat"], q["lon"])
+        if i is not None:
+            cell[n] = i
+    fault_pct = None
+    try:
+        fpts = _decimate_points(_flatten_line_points(get_japan_active_faults()), FSP.MAX_POINTS)
+        d = _min_dist_km_grid(fpts)
+        if d:
+            fd = np.array([d.get(k, np.inf) for k in _BT_KEYS], dtype=float)
+            fault_pct = _bt_pct_rank(-fd)        # 近いほど高い
+    except Exception as e:
+        print(f"[バックテスト] 活断層への近さを作れません（静的の『＋活断層』は地震分布のみになります）: {e}")
+    print(f"[バックテスト] 静的ハザード用カタログ: M>={BT_STATIC_MIN_MAG} {len(qs)}件")
+    return {"t": t, "cell": cell, "fault_pct": fault_pct,
+            "lookback_sec": 365.25 * 86400.0 * BT_STATIC_LOOKBACK_YEARS}
+
+def _bt_static_vectors(st, eval_epoch):
+    lo = int(np.searchsorted(st["t"], eval_epoch - st["lookback_sec"], side="left"))
+    hi = int(np.searchsorted(st["t"], eval_epoch, side="right"))
+    c = st["cell"][lo:hi]
+    c = c[c >= 0]
+    cnt = np.bincount(c, minlength=_BT_N).astype(float)
+    grid = np.zeros(_BT_SHAPE)
+    grid[_BT_CI, _BT_CJ] = cnt
+    seis = _bt_smooth(grid)[_BT_CI, _BT_CJ]
+    if st["fault_pct"] is not None:
+        comb = BT_STATIC_W_SEIS * _bt_pct_rank(seis) + BT_STATIC_W_FAULT * st["fault_pct"]
+    else:
+        comb = seis.copy()
+    return {"st_seis": seis, "st_comb": comb}
+
+
+# ── 動的(統合リスクマップ)のスコア ────────────────────
+class _BtRankCtx:
+    """1つの基準(calib)に対するランク計算の下準備（ドメイン下限・並べ替え済み履歴）を使い回す。
+    計算は compute_risk_grid_historical と同じ（絶対評価のみ・loo無し）。"""
+    def __init__(self, calib):
+        self.calib = calib
+        self.floors = {
+            "etas":   _make_etas_domain_floor(_cellwise_median_map(calib.get("etas_cell"))),
+            "bvalue": _bvalue_domain_floor,
+            "fault":  _make_stress_domain_floor(_cellwise_median_map(calib.get("fault_cell"))),
+            "plate":  _make_stress_domain_floor(_cellwise_median_map(calib.get("plate_cell"))),
+        }
+        self.sc = {k: {} for k in _RISK_HIST_KEYS}
+
+    def composite(self, raw):
+        c = self.calib
+        ranks = {
+            "etas":   _absolute_rank_map(raw["etas"], c.get("etas_cell"), invert=False, log_transform=True,
+                                         domain_floor_fn=self.floors["etas"], sorted_cache=self.sc["etas"]),
+            "bvalue": _absolute_rank_map(raw["bvalue"], c.get("bvalue_cell"), invert=True, log_transform=False,
+                                         domain_floor_fn=self.floors["bvalue"], sorted_cache=self.sc["bvalue"]),
+            "fault":  _absolute_rank_map(raw["fault"], c.get("fault_cell"), invert=False, log_transform=False,
+                                         domain_floor_fn=self.floors["fault"], sorted_cache=self.sc["fault"]),
+            "plate":  _absolute_rank_map(raw["plate"], c.get("plate_cell"), invert=False, log_transform=False,
+                                         domain_floor_fn=self.floors["plate"], sorted_cache=self.sc["plate"]),
+        }
+        S = np.full((_BT_N, len(_RISK_HIST_KEYS)), np.nan)
+        for ci, comp in enumerate(_RISK_HIST_KEYS):
+            for k, v in ranks[comp].items():
+                i = _BT_IDX.get(k)
+                if i is not None:
+                    S[i, ci] = v
+        w = np.array([RISK_DEFAULT_WEIGHTS[k] for k in _RISK_HIST_KEYS])
+        valid = ~np.isnan(S)
+        # しきい値の算出(_compute_risk_level_thresholds)・JS側と同じ: 無い成分は中立値で補い、全成分の重みで割る
+        comp = (np.where(valid, S, RISK_NEUTRAL_SCORE) * w).sum(axis=1) / w.sum()
+        comp[(w * valid).sum(axis=1) <= 0] = np.nan
+        return comp
+
+def _bt_raw_series(qa, epochs, fpts, ppts):
+    """各時刻(epoch秒)について、その時点までの直近 BT_WINDOW_DAYS 日の地震から ETAS・b値・活断層・
+    プレート境界の『生の値』を作る（較正と同じ計算。断層・プレートは全時刻まとめて）。"""
+    qt = qa["t"]
+    win = BT_WINDOW_DAYS * 86400.0
+    rows = []
+    for e in epochs:
+        lo = int(np.searchsorted(qt, e - win, side="left"))
+        hi = int(np.searchsorted(qt, e, side="right"))
+        if hi > lo:
+            etas_raw = _risk_etas_raw(_analyze_etas_window(qa, lo, hi, e))
+            bvalue_raw = _risk_bvalue_raw(compute_bvalue_grid(qa["q"][lo:hi]))
+        else:
+            etas_raw, bvalue_raw = {}, {}
+        rows.append((e, lo, hi, etas_raw, bvalue_raw))
+    sp = [(e, lo, hi) for e, lo, hi, _, _ in rows]
+    fl = _load_to_grid_max_multi(fpts, _fault_plate_loads_multi(fpts, qa, sp, window_days=BT_WINDOW_DAYS))
+    pl = _load_to_grid_max_multi(ppts, _fault_plate_loads_multi(ppts, qa, sp, window_days=BT_WINDOW_DAYS))
+    return [{"etas": r[3], "bvalue": r[4], "fault": fl[i], "plate": pl[i]} for i, r in enumerate(rows)]
+
+
+# ── 1地震ぶんの記録 ───────────────────────────────
+def _bt_model_stats(vec, idx, r):
+    D = _bt_maxfilter(vec, r)
+    return {"tau": round(_bt_tau(vec, idx), 5), "tau_nb": round(_bt_tau(D, idx), 5)}
+
+def _bt_make_record(ev, group, prev, eval_t, anchor, score_vec, after_vec, th, st_vecs, p):
+    idx = ev["cell_idx"]
+    r = BT_NEAR_RADIUS_CELLS
+    lv = _bt_levels(score_vec, th)
+    D = _bt_maxfilter(score_vec, r)
+    valid = ~np.isnan(score_vec)
+    validD = ~np.isnan(D)
+    with np.errstate(invalid="ignore"):
+        area_ge = [round(float(_BT_W[valid & (score_vec >= t)].sum() / _BT_WTOT), 5) for t in th]
+        area_dil = [round(float(_BT_W[validD & (D >= t)].sum() / _BT_WTOT), 5) for t in th]
+    nb_level = int(sum(1 for t in th if validD[idx] and D[idx] >= t))
+    s_before = float(score_vec[idx]) if valid[idx] else None
+    a_valid = not np.isnan(after_vec[idx])
+    s_after = float(after_vec[idx]) if a_valid else None
+    rec = {
+        "id": ev["id"], "t_utc": ev["t"].isoformat(), "t_jst": _bt_jst(ev["t"]),
+        "place": ev["place"], "mag": ev["mag"], "depth": ev["depth"], "lat": round(ev["lat"], 3), "lon": round(ev["lon"], 3),
+        "cell": list(_BT_KEYS[idx]), "group": group,
+        "prev": None if prev is None else {"t_jst": _bt_jst(prev["t"]), "mag": prev["mag"], "place": prev["place"],
+                                           "dist_km": round(prev["dist_km"], 1), "gap_days": round(prev["gap_days"], 2)},
+        "eval_jst": _bt_jst(eval_t), "anchor_jst": _bt_jst(anchor),
+        "dyn": {"score": None if s_before is None else round(s_before * 100, 1),
+                "level": int(lv[idx]) if valid[idx] else 0, "valid": bool(valid[idx]),
+                "nb_level": nb_level, "n_scored": int(valid.sum()),
+                "area_ge": area_ge, "area_dil_ge": area_dil, **_bt_model_stats(score_vec, idx, r)},
+        "after": {"score": None if s_after is None else round(s_after * 100, 1),
+                  "level": int(sum(1 for t in th if a_valid and after_vec[idx] >= t))},
+        "st_seis": _bt_model_stats(st_vecs["st_seis"], idx, r),
+        "st_comb": _bt_model_stats(st_vecs["st_comb"], idx, r),
+        "thresholds": [round(float(t), 4) for t in th],
+    }
+    return rec
+
+
+# ── 実行・保存 ────────────────────────────────────
+BT_DEFAULT_PARAMS = {"start": None, "end": None, "min_mag": 6.0, "lead_hours": 24.0, "after_hours": 1.0,
+                     "rebuild_days": 30.0, "calib_step_hours": float(HIST_CALIB_SAMPLE_HOURS),
+                     "prev_mag": 6.0, "max_depth_km": 0.0}
+
+def _bt_parse_params(d):
+    """画面/APIの入力を検証して実行パラメータにする。start/end は JST の 'YYYY-MM-DD'。"""
+    p = dict(BT_DEFAULT_PARAMS)
+    try:
+        for k in ("min_mag", "lead_hours", "after_hours", "rebuild_days", "calib_step_hours", "prev_mag", "max_depth_km"):
+            if d.get(k) not in (None, ""):
+                p[k] = float(d[k])
+        s = datetime.strptime(str(d.get("start")), "%Y-%m-%d").replace(tzinfo=JST)
+        e = datetime.strptime(str(d.get("end")), "%Y-%m-%d").replace(tzinfo=JST) + timedelta(days=1)
+    except (TypeError, ValueError):
+        raise ValueError("開始日・終了日は YYYY-MM-DD で、数値の項目は数字で入力してください")
+    if not (4.5 <= p["min_mag"] <= 9.5):
+        raise ValueError("対象のマグニチュードは 4.5〜9.5 の範囲で指定してください")
+    if not (1.0 <= p["lead_hours"] <= 24 * 30):
+        raise ValueError("直前の時点は 1〜720 時間で指定してください")
+    if not (0.0 <= p["after_hours"] <= 48):
+        raise ValueError("直後の時点は 0〜48 時間で指定してください")
+    if not (0.0 <= p["rebuild_days"] <= 365):
+        raise ValueError("基準の作り直し間隔は 0〜365 日で指定してください（0=1地震ごと）")
+    if not (6.0 <= p["calib_step_hours"] <= 72):
+        raise ValueError("基準のサンプル間隔は 6〜72 時間で指定してください")
+    if not (4.5 <= p["prev_mag"] <= 9.5):
+        raise ValueError("余震判定の『前の大地震』の規模は 4.5〜9.5 で指定してください")
+    if s >= e:
+        raise ValueError("開始日は終了日より前にしてください")
+    if s.astimezone(timezone.utc) > datetime.now(timezone.utc):
+        raise ValueError("未来の期間は指定できません")
+    p["start"] = s.strftime("%Y-%m-%d")
+    p["end"] = (e - timedelta(days=1)).strftime("%Y-%m-%d")
+    return p
+
+def _bt_cfg_hash(p):
+    """記録(1地震ぶん)の中身が変わる設定だけでハッシュを作る。期間・対象Mは含めない
+    （期間を広げて再実行したとき、計算済みの地震は再利用できる）。"""
+    import hashlib
+    key = json.dumps({"v": 1, "lead": p["lead_hours"], "after": p["after_hours"], "rebuild": p["rebuild_days"],
+                      "step": p["calib_step_hours"], "prev": p["prev_mag"], "near": BT_NEAR_RADIUS_CELLS,
+                      "jma_min": JMA_CATALOG_MIN_MAG, "static": [BT_STATIC_MIN_MAG, BT_STATIC_LOOKBACK_YEARS,
+                      BT_STATIC_SIGMA_CELLS, BT_STATIC_W_SEIS, BT_STATIC_W_FAULT],
+                      "w": {k: RISK_DEFAULT_WEIGHTS[k] for k in _RISK_HIST_KEYS}}, sort_keys=True)
+    return hashlib.sha1(key.encode()).hexdigest()[:10]
+
+def _bt_records_path(cfg):
+    return os.path.join(BACKTEST_DIR, f"records_{cfg}.jsonl")
+
+def _bt_read_records(cfg):
+    path = _bt_records_path(cfg)
+    out = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    out[r["id"]] = r
+                except Exception:
+                    continue
+    return out
+
+def _bt_anchor(eval_t, rebuild_days):
+    if rebuild_days <= 0:
+        return eval_t
+    step = rebuild_days * 86400.0
+    return datetime.fromtimestamp(math.floor(eval_t.timestamp() / step) * step, tz=timezone.utc)
+
+_bt_job = {"running": False, "cancel": False, "phase": "", "done": 0, "total": 0, "message": "",
+           "started": None, "finished": None, "error": None, "params": None, "cfg": None, "skipped": {}}
+_bt_lock = threading.Lock()
+
+def _bt_set(**kw):
+    with _bt_lock:
+        _bt_job.update(kw)
+
+def _bt_run(p):
+    """バックグラウンドで全地震を評価する。結果は1地震ごとに JSONL へ追記（中断しても再開できる）。"""
+    os.makedirs(BACKTEST_DIR, exist_ok=True)
+    cfg = _bt_cfg_hash(p)
+    try:
+        start_utc = datetime.strptime(p["start"], "%Y-%m-%d").replace(tzinfo=JST).astimezone(timezone.utc)
+        end_utc = (datetime.strptime(p["end"], "%Y-%m-%d").replace(tzinfo=JST) + timedelta(days=1)).astimezone(timezone.utc)
+        end_utc = min(end_utc, datetime.now(timezone.utc))
+        lead = timedelta(hours=p["lead_hours"]); after = timedelta(hours=p["after_hours"])
+        calib_span = timedelta(days=HIST_CALIB_LOOKBACK_DAYS + BT_WINDOW_DAYS)
+
+        _bt_set(phase="M6以上の一覧を読み込み中")
+        events, cov = _bt_load_events(start_utc, end_utc, p["min_mag"], p["prev_mag"])
+        # カタログは確定まで数か月遅れる。直後の評価時点までカタログが続く地震だけを対象にする
+        end_utc = min(end_utc, cov["last"] - after)
+        big = [e for e in events if e["mag"] >= p["prev_mag"]]
+        targets, skipped = [], {"領域外": 0, "深さ超過": 0, "基準期間がカタログ外": 0}
+        for ev in events:
+            if ev["mag"] < p["min_mag"] or not (start_utc <= ev["t"] < end_utc):
+                continue
+            ev["cell_idx"] = _bt_cell_index(ev["lat"], ev["lon"])
+            if ev["cell_idx"] is None:
+                skipped["領域外"] += 1; continue
+            if p["max_depth_km"] > 0 and ev["depth"] > p["max_depth_km"]:
+                skipped["深さ超過"] += 1; continue
+            ev["eval_t"] = ev["t"] - lead
+            ev["anchor"] = _bt_anchor(ev["eval_t"], p["rebuild_days"])
+            if ev["anchor"] - calib_span < cov["first"] - _JMA_CATALOG_EDGE_TOL:
+                skipped["基準期間がカタログ外"] += 1; continue
+            ev["group"], ev["prev"] = _bt_classify(ev, big, ev["eval_t"])
+            targets.append(ev)
+        done_recs = _bt_read_records(cfg)
+        todo = [e for e in targets if e["id"] not in done_recs]
+        _bt_set(total=len(targets), done=len(targets) - len(todo), skipped=skipped,
+                message=f"対象{len(targets)}件（計算済み{len(targets) - len(todo)}件・残り{len(todo)}件）")
+        if not todo:
+            _bt_set(phase="完了", message=f"対象{len(targets)}件はすべて計算済みです")
+            return
+
+        _bt_set(phase="静的ハザードマップの材料を準備中")
+        st = _bt_static_prepare(min(e["eval_t"] for e in todo), end_utc, cov)
+        fpts = _decimate_points(_flatten_line_points(get_japan_active_faults()), FSP.MAX_POINTS)
+        ppts = _decimate_points(_flatten_line_points(get_plate_boundaries(), bbox=FAULTS_BBOX), FSP.MAX_POINTS)
+        if not fpts or not ppts:
+            raise RuntimeError("活断層・プレート境界のデータを取得できません（ネットワークを確認してください）")
+
+        groups = {}
+        for ev in todo:
+            groups.setdefault(ev["anchor"], []).append(ev)
+        out_path = _bt_records_path(cfg)
+        n_done = len(targets) - len(todo)
+        for gi, anchor in enumerate(sorted(groups)):
+            if _bt_job["cancel"]:
+                _bt_set(phase="中止", message=f"中止しました（{n_done}/{len(targets)}件まで保存済み）")
+                return
+            evs = sorted(groups[anchor], key=lambda e: e["t"])
+            _bt_set(phase=f"基準の作成と評価 {gi + 1}/{len(groups)}（基準日 {_bt_jst(anchor)[:10]}・{len(evs)}件）")
+            q_lo = anchor - calib_span
+            q_hi = max([anchor] + [e["t"] + after for e in evs])
+            quakes = _fetch_catalog_strict(q_lo, min(q_hi, end_utc + after))
+            calib = _compute_historical_calibration(end_utc=anchor, quakes=quakes, step_hours=p["calib_step_hours"])
+            th_all = calib.get("risk_thresholds") or {}
+            th = th_all.get(BT_STD_KEY)
+            if not th:
+                skipped["基準を作れない"] = skipped.get("基準を作れない", 0) + len(evs)
+                _bt_set(skipped=dict(skipped))
+                print(f"[バックテスト] 基準日{_bt_jst(anchor)}: 基準を作れずスキップ（{calib.get('n_samples', 0)}時点）")
+                n_done += len(evs); _bt_set(done=n_done)
+                continue
+            ctx = _BtRankCtx(calib)
+            qa = _build_quake_arrays(quakes)
+            epochs = []
+            for ev in evs:
+                epochs.append(ev["eval_t"].timestamp())
+                epochs.append((ev["t"] + after).timestamp())
+            raws = _bt_raw_series(qa, epochs, fpts, ppts)
+            with open(out_path, "a", encoding="utf-8") as f:
+                for n, ev in enumerate(evs):
+                    score_vec = ctx.composite(raws[2 * n])
+                    after_vec = ctx.composite(raws[2 * n + 1])
+                    st_vecs = _bt_static_vectors(st, ev["eval_t"].timestamp())
+                    rec = _bt_make_record(ev, ev["group"], ev["prev"], ev["eval_t"], anchor,
+                                          score_vec, after_vec, th, st_vecs, p)
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    f.flush()
+                    n_done += 1
+                    _bt_set(done=n_done)
+            del quakes, qa, raws
+        _bt_set(phase="完了", message=f"{n_done}/{len(targets)}件を評価しました")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        _bt_set(phase="エラー", error=str(e) or e.__class__.__name__)
+    finally:
+        _bt_set(running=False, finished=time.time())
+
+
+# ── 集計(Molchan図など) ───────────────────────────
+def _bt_curve(taus):
+    """Molchan曲線: 警戒面積τ(0〜1)ごとの外れ率（τ以内に入らなかった地震の割合）。"""
+    if not taus:
+        return []
+    a = np.array(taus, dtype=float)
+    return [round(float((a > g + 1e-12).mean()), 4) for g in BT_TAU_GRID]
+
+def _bt_sig_curve(n, alpha=0.05):
+    """ランダムに警戒したとき、片側 alpha で『有意に良い』と言える外れ率の境界(各τ)。n件中k件以上入れば有意。"""
+    if n <= 0:
+        return []
+    lf = np.concatenate(([0.0], np.cumsum(np.log(np.arange(1, n + 1)))))
+    i = np.arange(n + 1)
+    out = []
+    for g in BT_TAU_GRID:
+        if g <= 0 or g >= 1:
+            out.append(None); continue
+        logp = lf[n] - lf[i] - lf[n - i] + i * math.log(g) + (n - i) * math.log(1 - g)
+        tail = np.cumsum(np.exp(logp)[::-1])[::-1]       # P(X>=i)
+        ks = np.nonzero(tail < alpha)[0]
+        out.append(None if len(ks) == 0 else round(1.0 - int(ks[0]) / n, 4))
+    return out
+
+def _bt_metrics(taus):
+    n = len(taus)
+    if n == 0:
+        return {"n": 0}
+    a = np.array(taus, dtype=float)
+    m = {"n": n, "median_tau": round(float(np.median(a)), 4), "mean_tau": round(float(a.mean()), 4),
+         "auc": round(float(1.0 - a.mean()), 4)}
+    for x in (0.05, 0.10, 0.20):
+        k = int((a <= x + 1e-12).sum())
+        tag = int(round(x * 100))
+        m[f"hit{tag}"] = round(k / n, 4); m[f"k{tag}"] = k; m[f"p{tag}"] = round(_bt_binom_sf(k, n, x), 5)
+    return m
+
+def _bt_paired(a, b):
+    """動的(a)と静的(b)の順位の対比較。符号検定(両側)。aが小さい=動的が良い。"""
+    d = np.array(a, dtype=float) - np.array(b, dtype=float)
+    better = int((d < -1e-9).sum()); worse = int((d > 1e-9).sum()); n = better + worse
+    p = 1.0 if n == 0 else min(1.0, 2.0 * _bt_binom_sf(max(better, worse), n, 0.5))
+    return {"n": len(d), "dyn_better": better, "dyn_worse": worse, "tie": len(d) - n,
+            "median_diff": round(float(np.median(d)), 4) if len(d) else None, "p": round(p, 5)}
+
+def _bt_level_table(recs):
+    rows = []
+    for L in range(1, 6):
+        rs = [r for r in recs if r.get("dyn")]
+        if not rs:
+            continue
+        hit = float(np.mean([r["dyn"]["level"] >= L for r in rs]))
+        hit_nb = float(np.mean([r["dyn"]["nb_level"] >= L for r in rs]))
+        area = float(np.mean([r["dyn"]["area_ge"][L - 1] for r in rs]))
+        area_nb = float(np.mean([r["dyn"]["area_dil_ge"][L - 1] for r in rs]))
+        rows.append({"level": L, "hit": round(hit, 4), "area": round(area, 5),
+                     "lift": None if area <= 0 else round(hit / area, 2),
+                     "hit_nb": round(hit_nb, 4), "area_nb": round(area_nb, 5),
+                     "lift_nb": None if area_nb <= 0 else round(hit_nb / area_nb, 2)})
+    return rows
+
+def _bt_summarize(records, p):
+    """records: {id: 記録} から、期間・規模・深さで絞って、グループ別・モデル別に集計する。"""
+    start = datetime.strptime(p["start"], "%Y-%m-%d").replace(tzinfo=JST).astimezone(timezone.utc)
+    end = (datetime.strptime(p["end"], "%Y-%m-%d").replace(tzinfo=JST) + timedelta(days=1)).astimezone(timezone.utc)
+    recs = []
+    for r in records.values():
+        t = datetime.fromisoformat(r["t_utc"])
+        if not (start <= t < end) or r["mag"] < p["min_mag"]:
+            continue
+        if p["max_depth_km"] > 0 and r["depth"] > p["max_depth_km"]:
+            continue
+        recs.append(r)
+    recs.sort(key=lambda r: r["t_utc"])
+    groups = {"all": recs}
+    for g in ("independent", "aftershock", "unseen"):
+        groups[g] = [r for r in recs if r["group"] == g]
+    out = {"params": p, "n_events": len(recs), "group_labels": BT_GROUP_LABELS, "model_labels": BT_MODEL_LABELS,
+           "tau_grid": BT_TAU_GRID, "groups": {}, "rows": recs}
+    for g, rs in groups.items():
+        gg = {"n": len(rs), "models": {}, "levels": _bt_level_table(rs), "sig05": _bt_sig_curve(len(rs)), "paired": {}}
+        for m in ("dyn", "st_seis", "st_comb"):
+            gg["models"][m] = {}
+            for v in ("tau", "tau_nb"):
+                taus = [r[m][v] for r in rs]
+                gg["models"][m][v] = {"metrics": _bt_metrics(taus), "curve": _bt_curve(taus)}
+        for m in ("st_seis", "st_comb"):
+            gg["paired"][m] = {v: _bt_paired([r["dyn"][v] for r in rs], [r[m][v] for r in rs]) for v in ("tau", "tau_nb")}
+        out["groups"][g] = gg
+    return out
+
+def _bt_csv(records, p):
+    """手作業の記録（時刻・震源名・M・直前リスク値・直後リスク値）を先頭に、評価の詳細を右に並べたCSV。"""
+    summary = _bt_summarize(records, p)
+    start = datetime.strptime(p["start"], "%Y-%m-%d").replace(tzinfo=JST).astimezone(timezone.utc)
+    end = (datetime.strptime(p["end"], "%Y-%m-%d").replace(tzinfo=JST) + timedelta(days=1)).astimezone(timezone.utc)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["時刻(JST)", "震源名", "マグニチュード", "発生直前リスク値", "発生直後リスク値(参考用)",
+                "直前Lv", "直後Lv", "震源セル順位(上位%)", "周囲の最大Lv", "高リスク面積比(Lv3以上,%)",
+                "高リスク面積比(周囲込み,Lv3以上,%)", "静的:地震分布 順位(上位%)", "静的:地震分布+活断層 順位(上位%)",
+                "区分", "直前の大地震", "震源緯度", "震源経度", "深さkm", "評価時点(JST)", "基準日時(JST)"])
+    for r in sorted(records.values(), key=lambda r: r["t_utc"]):
+        t = datetime.fromisoformat(r["t_utc"])
+        if not (start <= t < end) or r["mag"] < p["min_mag"]:
+            continue
+        if p["max_depth_km"] > 0 and r["depth"] > p["max_depth_km"]:
+            continue
+        d = r["dyn"]; pv = r.get("prev")
+        w.writerow([r["t_jst"], r["place"], r["mag"],
+                    "" if d["score"] is None else d["score"], "" if r["after"]["score"] is None else r["after"]["score"],
+                    d["level"], r["after"]["level"], round(d["tau"] * 100, 2), d["nb_level"],
+                    round(d["area_ge"][2] * 100, 2), round(d["area_dil_ge"][2] * 100, 2),
+                    round(r["st_seis"]["tau"] * 100, 2), round(r["st_comb"]["tau"] * 100, 2),
+                    {"independent": "独立", "aftershock": "余震・続発", "unseen": "直前に発生(未観測)"}[r["group"]],
+                    "" if pv is None else f"{pv['t_jst']} M{pv['mag']} {pv['place']} {pv['dist_km']}km {pv['gap_days']}日前",
+                    r["lat"], r["lon"], r["depth"], r["eval_jst"], r["anchor_jst"]])
+    return "\ufeff" + buf.getvalue()
+
 
 def render_riskmap(risk_cells, updated_str):
     cells_js = json.dumps(risk_cells, ensure_ascii=False)
@@ -5355,6 +6092,212 @@ if(!THRESH.calibrated){{
 # メインページ（タブシェル）
 # ══════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════
+# TAB 10: 検証（M6以上バックテスト / Molchan図）
+# ══════════════════════════════════════════════════════
+# 使い方: 期間と条件を決めて「実行」。計算はバックグラウンドで進み、1地震ごとに
+# data/backtest/records_<設定>.jsonl へ保存される（途中で止めても、期間を広げても、
+# 計算済みの地震は再利用される）。結果は /backtest/result、CSVは /backtest/events.csv。
+def render_backtest(updated_str):
+    html = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{display:flex;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif;color:#f3f4f6}
+#panel{width:310px;flex-shrink:0;background:rgba(255,255,255,.055);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);border-right:1px solid rgba(255,255,255,.14);overflow-y:auto;padding:14px}
+#panel h2{font-size:14px;margin-bottom:4px}
+.sub{font-size:11px;color:rgba(235,238,245,.55);line-height:1.6;margin-bottom:10px}
+.sec{margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.09)}
+.sec h3{font-size:11px;color:#93c5fd;margin-bottom:6px;letter-spacing:.5px}
+.field{display:flex;align-items:center;gap:6px;margin-bottom:6px;font-size:12px}
+.field label{flex:1;color:rgba(235,238,245,.75);line-height:1.35}
+.field input{width:104px;padding:5px 6px;border-radius:7px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:#f3f4f6;font-size:12px}
+.hint{font-size:10px;color:rgba(235,238,245,.42);line-height:1.5;margin:-2px 0 6px}
+button{cursor:pointer;font-size:12.5px;font-weight:600;color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:10px;padding:9px 12px;background:linear-gradient(135deg,rgba(10,132,255,.45),rgba(124,92,255,.32))}
+button:hover{filter:brightness(1.15)} button:disabled{opacity:.5;cursor:default;filter:none}
+button.sec2{background:rgba(255,255,255,.08)}
+.row{display:flex;gap:6px}.row button{flex:1}
+#bar{height:7px;background:rgba(255,255,255,.1);border-radius:4px;overflow:hidden;margin:8px 0 4px;display:none}
+#barIn{height:100%;width:0;background:linear-gradient(90deg,#3b82f6,#8b5cf6);transition:width .4s}
+#stat{font-size:11.5px;line-height:1.6;color:rgba(235,238,245,.8)}
+#stat.err{color:#fca5a5}
+#main{flex:1;overflow-y:auto;padding:16px 18px 40px}
+#empty{margin-top:12vh;text-align:center;color:rgba(235,238,245,.45);font-size:13px;line-height:1.8}
+.card{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px 14px;margin-bottom:14px}
+.card h3{font-size:12.5px;margin-bottom:8px}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.tabs button{padding:6px 10px;font-size:11.5px;background:rgba(255,255,255,.07)}
+.tabs button.on{background:linear-gradient(135deg,rgba(10,132,255,.6),rgba(124,92,255,.4))}
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+th,td{padding:5px 6px;text-align:right;border-bottom:1px solid rgba(255,255,255,.08);white-space:nowrap}
+th{color:rgba(235,238,245,.55);font-weight:600} th:first-child,td:first-child{text-align:left}
+.scroll{overflow-x:auto}
+.note{font-size:11px;color:rgba(235,238,245,.55);line-height:1.65;margin-top:8px}
+.warn{color:#fcd34d}
+.legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;margin-top:6px}
+.legend i{display:inline-block;width:18px;height:3px;vertical-align:middle;margin-right:5px}
+svg text{fill:rgba(235,238,245,.7);font-size:11px}
+.lv0{color:#94a3b8}.lv1{color:#86efac}.lv2{color:#fde047}.lv3{color:#fdba74}.lv4{color:#f87171}.lv5{color:#f0abfc}
+@media (max-width:768px){body{flex-direction:column;overflow-y:auto;height:auto}#panel{width:100%;border-right:none;border-bottom:1px solid rgba(255,255,255,.14)}#main{overflow:visible}}
+</style></head><body>
+<div id="panel">
+  <h2>検証：M6以上バックテスト</h2>
+  <p class="sub">気象庁一元化カタログのM6以上について、発生の少し前の時点でアーカイブと同じ計算を行い、震源が「面積の何%の高リスクセル」に入っていたかをMolchan図で集計します。静的な長期ハザードマップと比較し、余震は分けて評価します。リスク値・レベルは確率ではありません。</p>
+  <div class="sec">
+    <h3>期間（JST）</h3>
+    <div class="field"><label>開始日</label><input type="date" id="pStart"></div>
+    <div class="field"><label>終了日</label><input type="date" id="pEnd"></div>
+    <div class="hint" id="covHint"></div>
+    <div class="field"><label>対象のM以上</label><input type="number" id="pMag" step="0.1" value="6.0"></div>
+    <div class="field"><label>震源の深さ上限(km, 0=なし)</label><input type="number" id="pDepth" step="10" value="0"></div>
+  </div>
+  <div class="sec">
+    <h3>評価する時点</h3>
+    <div class="field"><label>直前(発生の何時間前)</label><input type="number" id="pLead" step="1" value="24"></div>
+    <div class="field"><label>直後(発生の何時間後・参考用)</label><input type="number" id="pAfter" step="0.5" value="1"></div>
+  </div>
+  <div class="sec">
+    <h3>基準の作り直し（日付ごとの基準）</h3>
+    <div class="field"><label>作り直す間隔(日, 0=1地震ごと)</label><input type="number" id="pRebuild" step="1" value="30"></div>
+    <div class="field"><label>基準のサンプル間隔(時間)</label><input type="number" id="pStep" step="6" value="24"></div>
+    <div class="hint">基準は「評価時点より前の65日」だけで作ります（先読みなし）。作り直し間隔を短くするほど厳密ですが、基準1回ぶんの計算が地震の数だけ増えます。間隔0は最も厳密で最も遅い設定です。</div>
+  </div>
+  <div class="sec">
+    <h3>余震の判定</h3>
+    <div class="field"><label>前の大地震のM以上</label><input type="number" id="pPrev" step="0.1" value="6.0"></div>
+    <div class="hint">近く(50〜400km)・直前(30〜365日)の範囲は、前の大地震の規模から自動で決めます。</div>
+  </div>
+  <div class="row"><button id="runBtn" onclick="startRun()">実行</button><button id="cancelBtn" class="sec2" onclick="cancelRun()" disabled>中止</button></div>
+  <div id="bar"><div id="barIn"></div></div>
+  <div id="stat"></div>
+  <div class="row" style="margin-top:10px"><button class="sec2" onclick="loadResult()">結果を再読み込み</button><button class="sec2" onclick="dlCsv()">CSV</button></div>
+</div>
+<div id="main"><div id="empty">期間を決めて「実行」を押すと、結果がここに表示されます。<br>計算済みの地震は保存されるので、中断しても期間を広げても続きから進みます。</div></div>
+<script>
+var DEF = __DEFAULTS__;
+var S = {data:null, group:'all', variant:'tau', zoom:false, timer:null, t0:0};
+var COLORS = {dyn:'#60a5fa', st_seis:'#fb923c', st_comb:'#34d399'};
+function $(id){return document.getElementById(id)}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function pct(x,d){return x==null?'-':(x*100).toFixed(d==null?1:d)+'%'}
+function params(){
+  return {start:$('pStart').value, end:$('pEnd').value, min_mag:$('pMag').value, max_depth_km:$('pDepth').value,
+          lead_hours:$('pLead').value, after_hours:$('pAfter').value, rebuild_days:$('pRebuild').value,
+          calib_step_hours:$('pStep').value, prev_mag:$('pPrev').value};
+}
+function qs(o){return Object.keys(o).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(o[k])}).join('&')}
+function setStat(msg, err){var s=$('stat'); s.className=err?'err':''; s.innerHTML=msg}
+function init(){
+  fetch('/backtest/info').then(function(r){return r.json()}).then(function(d){
+    var p = d.last_params || DEF;
+    $('pStart').value=p.start; $('pEnd').value=p.end;
+    ['Mag:min_mag','Depth:max_depth_km','Lead:lead_hours','After:after_hours','Rebuild:rebuild_days','Step:calib_step_hours','Prev:prev_mag'].forEach(function(s){
+      var a=s.split(':'); if(p[a[1]]!=null) $('p'+a[0]).value=p[a[1]];
+    });
+    $('covHint').textContent = d.coverage ? ('カタログ収録: '+d.coverage.first+' 〜 '+d.coverage.last+'（基準に約125日必要なため、先頭から約4か月ぶんは評価できません）') : 'カタログ(data/jma_catalog/)が見つかりません';
+    if(d.job && d.job.running){ watch(); }
+    else if(d.has_records){ loadResult(); }
+  }).catch(function(e){ setStat('初期化に失敗: '+esc(e.message), true) });
+}
+function startRun(){
+  $('runBtn').disabled=true; setStat('開始しています…');
+  fetch('/backtest/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(params())})
+   .then(function(r){return r.json().then(function(j){ if(!r.ok) throw new Error(j.error||('HTTP '+r.status)); return j; })})
+   .then(function(){ S.t0=Date.now(); watch(); })
+   .catch(function(e){ $('runBtn').disabled=false; setStat('開始できません: '+esc(e.message), true) });
+}
+function cancelRun(){ fetch('/backtest/cancel',{method:'POST'}); setStat('中止を要求しました（今の基準の評価が終わり次第止まります）'); }
+function watch(){
+  $('runBtn').disabled=true; $('cancelBtn').disabled=false; $('bar').style.display='block';
+  clearTimeout(S.timer);
+  (function tick(){
+    fetch('/backtest/status').then(function(r){return r.json()}).then(function(s){
+      var tot=s.total||0, dn=s.done||0;
+      $('barIn').style.width = (tot? (100*dn/tot):0)+'%';
+      var sk = Object.keys(s.skipped||{}).filter(function(k){return s.skipped[k]>0}).map(function(k){return k+' '+s.skipped[k]+'件'}).join('、');
+      setStat(esc(s.phase||'')+'<br>'+dn+' / '+tot+' 件'+(s.elapsed?'（'+Math.round(s.elapsed/60*10)/10+'分経過）':'')+(sk?'<br>対象外: '+esc(sk):'')+(s.message&&!s.running?'<br>'+esc(s.message):''), !!s.error);
+      if(s.error) setStat('エラー: '+esc(s.error), true);
+      if(dn>0 && (dn%5===0 || !s.running)) loadResult(true);
+      if(s.running){ S.timer=setTimeout(tick, 2500); }
+      else { $('runBtn').disabled=false; $('cancelBtn').disabled=true; if(!s.error) loadResult(); }
+    }).catch(function(){ S.timer=setTimeout(tick, 5000) });
+  })();
+}
+function loadResult(quiet){
+  fetch('/backtest/result?'+qs(params())).then(function(r){return r.json().then(function(j){ if(!r.ok) throw new Error(j.error||('HTTP '+r.status)); return j; })})
+   .then(function(d){ S.data=d; render(); })
+   .catch(function(e){ if(!quiet) setStat('結果を読めません: '+esc(e.message), true) });
+}
+function dlCsv(){ window.location='/backtest/events.csv?'+qs(params()); }
+function pick(k,v){ S[k]=v; render(); }
+
+function drawMolchan(G){
+  var W=540,H=450,ml=54,mr=16,mt=14,mb=50, pw=W-ml-mr, ph=H-mt-mb;
+  var xmax = S.zoom?0.3:1.0, grid=S.data.tau_grid;
+  function X(t){return ml+pw*Math.min(t,xmax)/xmax} function Y(v){return mt+ph*(1-v)}
+  var s='<svg viewBox="0 0 '+W+' '+H+'" width="100%" style="max-width:620px">';
+  var xt = S.zoom?[0,.05,.1,.15,.2,.25,.3]:[0,.2,.4,.6,.8,1];
+  xt.forEach(function(t){ s+='<line x1="'+X(t)+'" x2="'+X(t)+'" y1="'+mt+'" y2="'+(mt+ph)+'" stroke="rgba(255,255,255,.08)"/><text x="'+X(t)+'" y="'+(mt+ph+16)+'" text-anchor="middle">'+Math.round(t*100)+'%</text>'; });
+  [0,.2,.4,.6,.8,1].forEach(function(v){ s+='<line x1="'+ml+'" x2="'+(ml+pw)+'" y1="'+Y(v)+'" y2="'+Y(v)+'" stroke="rgba(255,255,255,.08)"/><text x="'+(ml-6)+'" y="'+(Y(v)+4)+'" text-anchor="end">'+Math.round(v*100)+'%</text>'; });
+  s+='<text x="'+(ml+pw/2)+'" y="'+(H-8)+'" text-anchor="middle">警戒した面積の割合（高リスクセルから順に）</text>';
+  s+='<text transform="translate(14,'+(mt+ph/2)+') rotate(-90)" text-anchor="middle">外れ率（入らなかった地震の割合）</text>';
+  s+='<line x1="'+X(0)+'" y1="'+Y(1)+'" x2="'+X(1)+'" y2="'+Y(0)+'" stroke="#9ca3af" stroke-dasharray="5 4"/>';
+  var sig=G.sig05||[], pts=[];
+  grid.forEach(function(t,i){ if(sig[i]!=null && t<=xmax) pts.push(X(t)+','+Y(sig[i])); });
+  if(pts.length>1) s+='<polyline fill="none" stroke="#c084fc" stroke-width="1.2" stroke-dasharray="2 3" points="'+pts.join(' ')+'"/>';
+  ['st_seis','st_comb','dyn'].forEach(function(m){
+    var c=G.models[m][S.variant].curve; if(!c.length) return;
+    var p=[]; grid.forEach(function(t,i){ if(t<=xmax+1e-9) p.push(X(t)+','+Y(c[i])); });
+    s+='<polyline fill="none" stroke="'+COLORS[m]+'" stroke-width="'+(m==='dyn'?2.6:1.8)+'" points="'+p.join(' ')+'"/>';
+  });
+  return s+'</svg>';
+}
+function levelCell(l){ return '<span class="lv'+l+'">Lv'+l+'</span>'; }
+function render(){
+  var D=S.data, G=D.groups[S.group], L=D.group_labels, M=D.model_labels, h='';
+  if(!D.n_events){ $('main').innerHTML='<div id="empty">この条件で保存済みの結果はまだありません。「実行」を押してください。</div>'; return; }
+  h+='<div class="card"><div class="tabs">';
+  Object.keys(L).forEach(function(g){ h+='<button class="'+(S.group===g?'on':'')+'" onclick="pick(\\'group\\',\\''+g+'\\')">'+esc(L[g])+'（'+D.groups[g].n+'件）</button>'; });
+  h+='</div><div class="tabs"><button class="'+(S.variant==='tau'?'on':'')+'" onclick="pick(\\'variant\\',\\'tau\\')">震源セルだけで判定</button>'+
+     '<button class="'+(S.variant==='tau_nb'?'on':'')+'" onclick="pick(\\'variant\\',\\'tau_nb\\')">周囲±1セル(約55km)も含める</button>'+
+     '<button class="'+(S.zoom?'on':'')+'" onclick="pick(\\'zoom\\','+(!S.zoom)+')">横軸 0〜30%に拡大</button></div>';
+  if(G.n<10) h+='<div class="note warn">この区分は '+G.n+' 件しかないため、結果は参考程度です（偶然で説明できる範囲が広い）。</div>';
+  if(G.n===0){ $('main').innerHTML=h+'</div>'; return; }
+  h+='<h3>Molchan図（'+esc(L[S.group])+'・'+G.n+'件）</h3>'+drawMolchan(G);
+  h+='<div class="legend"><span><i style="background:'+COLORS.dyn+'"></i>'+esc(M.dyn)+'</span><span><i style="background:'+COLORS.st_comb+'"></i>'+esc(M.st_comb)+'</span><span><i style="background:'+COLORS.st_seis+'"></i>'+esc(M.st_seis)+'</span><span><i style="background:#9ca3af"></i>ランダム</span><span><i style="background:#c084fc"></i>ランダムより有意に良い境界(片側5%)</span></div>';
+  h+='<div class="note">左下に近いほど良い（少ない面積で多くの地震を捉えている）。ランダム（点線の対角線）より下にあり、紫の境界よりも下なら、偶然とは言いにくい水準です。</div></div>';
+
+  h+='<div class="card"><h3>指標（'+(S.variant==='tau'?'震源セルのみ':'周囲込み')+'）</h3><div class="scroll"><table><tr><th>モデル</th><th>上位5%以内</th><th>上位10%以内</th><th>上位20%以内</th><th>中央順位</th><th>AUC</th><th>p(10%)</th></tr>';
+  ['dyn','st_comb','st_seis'].forEach(function(m){ var x=G.models[m][S.variant].metrics;
+    h+='<tr><td>'+esc(M[m])+'</td><td>'+pct(x.hit5,0)+'（'+x.k5+'/'+x.n+'）</td><td>'+pct(x.hit10,0)+'（'+x.k10+'/'+x.n+'）</td><td>'+pct(x.hit20,0)+'（'+x.k20+'/'+x.n+'）</td><td>上位'+pct(x.median_tau)+'</td><td>'+x.auc.toFixed(3)+'</td><td>'+x.p10+'</td></tr>'; });
+  h+='</table></div><div class="note">「上位10%以内」= 面積の10%だけ警戒したとき、そのうち何%の地震が入っていたか（ランダムなら10%）。AUC=1−平均順位（ランダムで0.5）。p(10%)=ランダムでこれ以上入る確率。</div>';
+  h+='<h3 style="margin-top:12px">動的 vs 静的（同じ地震どうしの順位を比較）</h3><div class="scroll"><table><tr><th>比較相手</th><th>動的が上位</th><th>動的が下位</th><th>順位差の中央値</th><th>符号検定p</th></tr>';
+  ['st_comb','st_seis'].forEach(function(m){ var x=G.paired[m][S.variant];
+    h+='<tr><td>'+esc(M[m])+'</td><td>'+x.dyn_better+'件</td><td>'+x.dyn_worse+'件</td><td>'+(x.median_diff==null?'-':(x.median_diff*100).toFixed(1)+'pt')+'</td><td>'+x.p+'</td></tr>'; });
+  h+='</table></div><div class="note">順位差は「動的−静的」。負なら動的のほうが上位。pが大きい(目安0.05以上)なら、どちらが良いとは言えません。</div></div>';
+
+  h+='<div class="card"><h3>レベル別（動的・実際の運用に近い見方）</h3><div class="scroll"><table><tr><th>レベル以上</th><th>面積比</th><th>的中率(震源セル)</th><th>倍率</th><th>面積比(周囲込み)</th><th>的中率(周囲込み)</th><th>倍率</th></tr>';
+  G.levels.forEach(function(r){ h+='<tr><td>'+levelCell(r.level)+'</td><td>'+pct(r.area,2)+'</td><td>'+pct(r.hit,0)+'</td><td>'+(r.lift==null?'-':'×'+r.lift)+'</td><td>'+pct(r.area_nb,2)+'</td><td>'+pct(r.hit_nb,0)+'</td><td>'+(r.lift_nb==null?'-':'×'+r.lift_nb)+'</td></tr>'; });
+  h+='</table></div><div class="note">倍率=的中率÷面積比（1ならランダムと同じ）。面積比は評価した各時点の平均。</div></div>';
+
+  h+='<div class="card"><h3>地震ごとの記録（'+esc(L[S.group])+'）</h3><div class="scroll"><table><tr><th>時刻(JST)</th><th>震源名</th><th>M</th><th>直前</th><th>直後(参考)</th><th>順位</th><th>周囲Lv</th><th>静的順位</th><th>区分</th></tr>';
+  var rows=(D.rows||[]).filter(function(r){ return S.group==='all'||r.group===S.group; });
+  rows.slice(-400).reverse().forEach(function(r){
+    var g={independent:'独立',aftershock:'余震・続発',unseen:'直前発生'}[r.group];
+    h+='<tr><td>'+esc(r.t_jst.slice(0,16))+'</td><td>'+esc(r.place)+'</td><td>'+r.mag+'</td><td>'+(r.dyn.score==null?'-':r.dyn.score)+' '+levelCell(r.dyn.level)+'</td><td>'+(r.after.score==null?'-':r.after.score)+' '+levelCell(r.after.level)+'</td><td>上位'+pct(r.dyn.tau)+'</td><td>'+levelCell(r.dyn.nb_level)+'</td><td>上位'+pct(r.st_comb.tau)+'</td><td>'+g+(r.prev?'<br><small>M'+r.prev.mag+' '+r.prev.dist_km+'km '+r.prev.gap_days+'日前</small>':'')+'</td></tr>'; });
+  h+='</table></div><div class="note">直前/直後はリスク値(0〜100)とレベル。「順位」は震源セルが全セル中の上位何%か。震源名はカタログの英語表記です。全件はCSVで取得できます。</div></div>';
+  $('main').innerHTML=h;
+}
+init();
+</script></body></html>"""
+    d = datetime.now(JST)
+    cov = _jma_catalog_coverage()
+    default_end = (cov["last"].astimezone(JST) - timedelta(days=2)).strftime("%Y-%m-%d") if cov else d.strftime("%Y-%m-%d")
+    default_start = (datetime.strptime(default_end, "%Y-%m-%d") - timedelta(days=3 * 365)).strftime("%Y-%m-%d")
+    defaults = {**BT_DEFAULT_PARAMS, "start": default_start, "end": default_end}
+    return html.replace("__DEFAULTS__", json.dumps(defaults, ensure_ascii=False))
+
+
+# ══════════════════════════════════════════════════════
 # TAB 9: アーカイブ（過去の任意時点における統合リスクマップ検索）
 # ══════════════════════════════════════════════════════
 # ★ 旧仕様（1時間ごとのETAS/b値スナップショット一覧を左のリストから選んで
@@ -5433,6 +6376,8 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
     <h3>基準日時（JST）</h3>
     <div class="field"><label>日付</label><input type="date" id="inDate"></div>
     <div class="field"><label>時刻</label><input type="time" id="inTime" value="00:00"></div>
+    <div style="margin-bottom:10px;font-size:11.5px;color:rgba(235,238,245,.75);line-height:1.5"><label><input type="checkbox" id="inCalib" style="width:auto;margin-right:6px">この日付で基準を作り直す（古い日付向け）</label>
+      <div style="font-size:10px;color:rgba(235,238,245,.42);margin-top:3px">基準日より前の65日だけで基準を作ります（一元化カタログの範囲のみ。初回は数十秒〜数分）。</div></div>
     <button id="fetchBtn" onclick="runFetch()">この時点のリスクマップを取得</button>
     <div id="statusBox"></div>
   </div>
@@ -5637,7 +6582,8 @@ function fmtStatus(d){
   } else {
     srcLabel = 'JMA/P2P統合データ（直近60日）';
   }
-  return '基準時刻: <b>' + d.ref_time_jst + '</b><br>' +
+  var calibLine = (d.calib_mode === 'date') ? ('基準: <b>' + d.calib_anchor_jst + ' より前の65日で作り直し</b><br>') : '';
+  return '基準時刻: <b>' + d.ref_time_jst + '</b><br>' + calibLine +
          '取得期間: ' + d.period_start_jst + ' 〜 ' + d.ref_time_jst + '<br>' +
          'データソース: <b>' + srcLabel + '</b><br>' +
          '使用した地震データ: <b>' + d.quake_count + '</b>件 ／ セル数: <b>' + d.cells.length + '</b>';
@@ -5658,12 +6604,21 @@ function runFetch(){
   statusBox.innerHTML = '地震データを取得し、統合リスクマップを再計算しています…（数十秒かかる場合があります）';
   closeDetail();
 
-  fetch('/archive/historical_riskmap?datetime=' + encodeURIComponent(dateVal + 'T' + timeVal))
+  var pendingRetry = false;
+  var calibQ = document.getElementById('inCalib').checked ? '&calib=date' : '';
+  fetch('/archive/historical_riskmap?datetime=' + encodeURIComponent(dateVal + 'T' + timeVal) + calibQ)
     .then(function(r){
+      if(r.status === 202) return r.json().then(function(e){ return {pending: true, message: e.message}; });
       if(!r.ok) return r.json().then(function(e){ throw new Error(e.error || ('HTTPエラー ' + r.status)); });
       return r.json();
     })
     .then(function(d){
+      if(d.pending){
+        pendingRetry = true;
+        statusBox.className = ''; statusBox.innerHTML = d.message;
+        setTimeout(runFetch, 5000);
+        return;
+      }
       CELLS = d.cells || [];
       if(d.thresholds) THRESH = d.thresholds;
       statusBox.className = ''; statusBox.innerHTML = fmtStatus(d);
@@ -5681,6 +6636,7 @@ function runFetch(){
       statusBox.innerHTML = '取得に失敗しました: ' + e.message;
     })
     .finally(function(){
+      if(pendingRetry) return;
       btn.disabled = false; btn.textContent = 'この時点のリスクマップを取得';
     });
 }
@@ -5701,7 +6657,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>Earthquake-risk-map v9.10</title>
+  <title>Earthquake-risk-map v9.20</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
@@ -5796,7 +6752,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震リスクマップ</div>
-      <div>v9.10 / 研究用</div>
+      <div>v9.20 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -5846,6 +6802,13 @@ SHELL_HTML = """<!DOCTYPE html>
       <span class="badge">JMA/USGS</span>
     </button>
 
+    <div class="sep"></div>
+    <div class="group-title">検証</div>
+    <button class="tab-btn" onclick="sw(9)">
+      <span class="label">バックテスト</span>
+      <span class="badge">Molchan</span>
+    </button>
+
     <div class="recalc-box">
       <button id="recalcBtn" onclick="recalc()">&#8635; このタブを再計算</button>
     </div>
@@ -5861,10 +6824,11 @@ SHELL_HTML = """<!DOCTYPE html>
     <iframe id="f6" src=""></iframe>
     <iframe id="f7" src=""></iframe>
     <iframe id="f8" src=""></iframe>
+    <iframe id="f9" src=""></iframe>
   </div>
   <script>
-    var URLS=['riskmap','history','etas','bvalue','faultmap','tec','gnss','pressure','snapshots'];
-    var loaded=[true,false,false,false,false,false,false,false,false];
+    var URLS=['riskmap','history','etas','bvalue','faultmap','tec','gnss','pressure','snapshots','backtest'];
+    var loaded=[true,false,false,false,false,false,false,false,false,false];
     function sw(idx){
       curTab=idx;
       document.querySelectorAll('.tab-btn').forEach(function(b,i){b.classList.toggle('active',i===idx)});
@@ -5885,7 +6849,7 @@ SHELL_HTML = """<!DOCTYPE html>
     }
 
     // ── 各タブの「再計算」 ──
-    var TAB_LABELS=['統合リスクマップ','地震履歴','ETASマップ','b値マップ','活断層・プレート境界','TEC','GNSS変位','海面気圧','アーカイブ'];
+    var TAB_LABELS=['統合リスクマップ','地震履歴','ETASマップ','b値マップ','活断層・プレート境界','TEC','GNSS変位','海面気圧','アーカイブ','バックテスト'];
     var curTab=0, recalcBusy=false, toastTimer=null;
     function showToast(msg,ms){
       var t=document.getElementById('toast');
@@ -5901,6 +6865,10 @@ SHELL_HTML = """<!DOCTYPE html>
       if(recalcBusy) return;
       var idx=curTab, name=URLS[idx], label=TAB_LABELS[idx];
       if(window.innerWidth<=768){closeSb()}
+      if(idx===9){
+        showToast('バックテストは、タブ左側の「実行」ボタンで計算します',4000);
+        return;
+      }
       if(idx===8){
         // アーカイブは指定日時ごとの再計算UI。タブ内の取得ボタンを同じ入力で再実行する
         var w=document.getElementById('f8').contentWindow;
@@ -6132,6 +7100,7 @@ def tab(name):
     elif name == "gnss":     html = render_gnss(upd)
     elif name == "pressure": html = render_pressure(upd)
     elif name == "snapshots": html = render_snapshots(upd)
+    elif name == "backtest":  html = render_backtest(upd)
     else: return Response("Not found", status=404)
     return Response(html, mimetype="text/html")
 
@@ -6374,6 +7343,33 @@ def tec_raw_image():
 # タイミング次第で「本来は残っているはずのデータが直前に削除されていた」ケースを避ける。
 ARCHIVE_LOCAL_SAFE_DAYS = HIST_CALIB_LOOKBACK_DAYS - 5   # = 60日
 
+def _archive_with_date_calibration(ref_time_jst, ref_time_utc):
+    calib, info = get_calibration_at(ref_time_utc)
+    if calib is None:
+        if info.get("error"):
+            return {"error": f"この日付の基準を作れませんでした: {info['error']}"}, 503
+        who = "この日付の基準（その日より前の65日）" if info.get("same") else "別の日付の基準"
+        return {"pending": True, "message": f"{who}を作成中です。完了すると自動で表示します（初回は数十秒〜数分）"}, 202
+    start_utc = ref_time_utc - timedelta(days=BT_WINDOW_DAYS)   # 基準のサンプルと同じ60日窓で評価する
+    try:
+        quakes = _fetch_catalog_strict(start_utc, ref_time_utc)
+    except Exception as e:
+        return {"error": str(e)}, 503
+    try:
+        cells = compute_risk_grid_historical(quakes, ref_time_utc, calib=calib)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return {"error": f"リスクマップの再計算に失敗しました: {e}"}, 500
+    return {
+        "ref_time_jst": ref_time_jst.strftime("%Y-%m-%d %H:%M JST"),
+        "period_start_jst": start_utc.astimezone(JST).strftime("%Y-%m-%d %H:%M JST"),
+        "quake_count": len(quakes), "data_source": "jma_catalog", "min_mag": JMA_CATALOG_MIN_MAG,
+        "calib_mode": "date", "calib_anchor_jst": calib.get("anchor_jst"),
+        "thresholds": {"by_subset": calib["risk_thresholds"], "default": RISK_THRESH_DEFAULT,
+                       "calibrated": True, "n_samples": calib.get("n_samples", 0)},
+        "cells": cells,
+    }
+
 @app.route("/archive/historical_riskmap")
 def archive_historical_riskmap():
     """
@@ -6404,6 +7400,12 @@ def archive_historical_riskmap():
     now_utc = datetime.now(timezone.utc)
     if ref_time_utc > now_utc:
         return {"error": "未来の日時は指定できません"}, 400
+
+    # (v9.08) calib=date: 現在の基準(過去65日)ではなく、基準日より前の65日だけで基準を作り直して評価する。
+    # 古い日付の評価に現在の基準を使うと、その日付より未来の活動が基準に混ざるため。
+    # 基準・評価とも一元化カタログだけを使う（地震の検知下限が混ざらないように）。
+    if request.args.get("calib") == "date":
+        return _archive_with_date_calibration(ref_time_jst, ref_time_utc)
 
     start_utc = ref_time_utc - timedelta(days=30)
     local_cutoff = now_utc - timedelta(days=ARCHIVE_LOCAL_SAFE_DAYS)
@@ -6456,6 +7458,80 @@ def risk_level_thresholds():
             "default": RISK_THRESH_DEFAULT,
             "report": calib.get("risk_calib_report"),
             "calib_samples": calib.get("n_samples", 0)}
+
+
+# ── 検証タブ(バックテスト)のAPI ─────────────────────────
+@app.route("/backtest/info")
+def backtest_info():
+    cov = _jma_catalog_coverage()
+    last = None
+    lp = os.path.join(BACKTEST_DIR, "last_params.json")
+    if os.path.exists(lp):
+        try:
+            with open(lp, encoding="utf-8") as f:
+                last = json.load(f)
+        except Exception:
+            last = None
+    has = os.path.isdir(BACKTEST_DIR) and any(n.startswith("records_") for n in os.listdir(BACKTEST_DIR))
+    with _bt_lock:
+        job = {"running": _bt_job["running"]}
+    return {"coverage": None if not cov else {"first": cov["first"].astimezone(JST).strftime("%Y-%m-%d"),
+                                              "last": cov["last"].astimezone(JST).strftime("%Y-%m-%d"),
+                                              "contiguous": cov["contiguous"]},
+            "defaults": BT_DEFAULT_PARAMS, "last_params": last, "job": job, "has_records": has}
+
+@app.route("/backtest/start", methods=["POST"])
+def backtest_start():
+    try:
+        p = _bt_parse_params(request.get_json(silent=True) or {})
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    with _bt_lock:
+        if _bt_job["running"]:
+            return {"error": "すでに実行中です"}, 409
+        _bt_job.update(running=True, cancel=False, phase="準備中", done=0, total=0, message="", started=time.time(),
+                       finished=None, error=None, params=p, cfg=_bt_cfg_hash(p), skipped={})
+    os.makedirs(BACKTEST_DIR, exist_ok=True)
+    with open(os.path.join(BACKTEST_DIR, "last_params.json"), "w", encoding="utf-8") as f:
+        json.dump(p, f, ensure_ascii=False)
+    threading.Thread(target=_bt_run, args=(p,), daemon=True).start()
+    return {"status": "started", "cfg": _bt_job["cfg"]}
+
+@app.route("/backtest/status")
+def backtest_status():
+    with _bt_lock:
+        j = dict(_bt_job)
+    end = j["finished"] or time.time()
+    j["elapsed"] = round(end - j["started"], 1) if j["started"] else 0
+    j.pop("params", None)
+    return j
+
+@app.route("/backtest/cancel", methods=["POST"])
+def backtest_cancel():
+    _bt_set(cancel=True)
+    return {"status": "cancel_requested"}
+
+def _bt_params_from_request():
+    args = request.args.to_dict()
+    return _bt_parse_params(args)
+
+@app.route("/backtest/result")
+def backtest_result():
+    try:
+        p = _bt_params_from_request()
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    return _bt_summarize(_bt_read_records(_bt_cfg_hash(p)), p)
+
+@app.route("/backtest/events.csv")
+def backtest_events_csv():
+    try:
+        p = _bt_params_from_request()
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    body = _bt_csv(_bt_read_records(_bt_cfg_hash(p)), p)
+    return Response(body, mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename=backtest_M{p['min_mag']:.1f}_{p['start']}_{p['end']}.csv"})
 
 @app.route("/snapshots")
 def snapshots():
