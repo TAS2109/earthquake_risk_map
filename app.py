@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震リスクマップ v9.07
+地震リスクマップ v9.10
 
 ■ 目的と成功の定義
   統合リスクマップの目的は、地震の「発生時期の予測」ではなく、「M6以上の大きな地震が起きる場所を、
@@ -35,8 +35,9 @@
      共有URL/CSV出力、PWA化。通知は「時期の警報」と誤解されないよう、注目セルの変化として位置づける。
 
 ■ 更新履歴（要点のみ）
-  v9.08 TEC取得をGNSSと同じ方式に統一(有効判定TEC_ENABLED／更新中フラグ付きの裏更新／古ければアクセス時に再取得／
-        TEC_JSON_URLによる数値JSON代替経路／/tec/status・/tec/refresh_now・/tec/raw_image追加／3時間超の古いTECはリスクに使わない)
+  v9.10 TEC取得をGNSSと同じ方式に統一(有効判定TEC_ENABLED／更新中フラグ付きの裏更新／古ければアクセス時に再取得／
+        TEC_JSON_URLによる数値JSON代替経路／/tec/status・/tec/refresh_now・/tec/raw_image追加／3時間超の古いTECはリスクに使わない／
+        NICT画像の公開遅れ(数時間)に合わせ遡りを6時間に拡大・TEC_URL_TEMPLATE環境変数で形式変更可)
   v9.07 標準プリセットにGNSS追加／重み見直し／GNSSは「超えた分だけ押し上げ」／アーカイブの重みをサーバーと一致
   v9.06 GNSSを現在値のみ(履歴・基準なし)に変更。アーカイブのGNSSは未実装に
   v9.05 リスクマップの再計算を高速化(計算結果は同じ)
@@ -2564,10 +2565,15 @@ CELLS.forEach(function(c){{
 # 不明なため、直近の「その場で組み立てたURL」を新しい方から順に何個か試して、
 # 200が返ってきたものを採用する方式にする。一度成功した(タイムゾーン,遅延)は
 # 次回以降の最有力候補として先頭に回すことで、通常は1〜2回のリクエストで済む。
-TEC_URL_TEMPLATE = ("https://aer-nc-web.nict.go.jp/GPS/QR_GEONET/AMAP/"
-                     "{year}/{doy:03d}/{hh}_{mm}_{month:02d}{day:02d}_{year}_Amap.jpg")
+# URL形式が変わった場合は、コードを直さず環境変数 TEC_URL_TEMPLATE で差し替えられる。
+# 使えるプレースホルダー: {year} {doy:03d} {hh} {mm} {month:02d} {day:02d}
+TEC_URL_TEMPLATE = os.environ.get("TEC_URL_TEMPLATE", "").strip() or (
+                    "https://aer-nc-web.nict.go.jp/GPS/QR_GEONET/AMAP/"
+                    "{year}/{doy:03d}/{hh}_{mm}_{month:02d}{day:02d}_{year}_Amap.jpg")
 TEC_URL_STEP_MIN      = 10   # 生成間隔
-TEC_URL_LOOKBACK_MIN  = 90   # どこまで過去に遡って候補を試すか
+# (v9.10) 準リアルタイム版は「数時間(〜4時間程度)遅延」で公開され、ページには最新6時間分が載る。
+# 以前の90分では最新画像まで届かず全候補が404になっていたため、6時間まで遡る。
+TEC_URL_LOOKBACK_MIN  = 360  # どこまで過去に遡って候補を試すか
 _tec_url_pref = {"tz": "jst", "lag_min": 0}   # 直近成功した組み合わせ（起動時はJST・遅延0から）
 
 #   ★ 2026/07/24 実測キャリブレーション済み ★
@@ -2618,6 +2624,7 @@ _tec_cache   = {"grid": None,       # {(gi,gj): TECU}
                 "updating": False,  # 更新中フラグ（二重起動防止）
                 "source": None,     # "image" / "json"
                 "image_url": None,  # 採用した画像URL
+                "hist_url": None,   # 最後に履歴へ入れた画像URL（同じ画像を二重に入れない）
                 "attempts": []}     # 直近の試行ログ（/tec/status で確認）
 _tec_history = []   # [(epoch_sec, {(gi,gj): value, ...}), ...] 古い→新しい順
 
@@ -2635,7 +2642,7 @@ def _tec_build_url(dt):
                                     mm=f"{dt.minute:02d}", month=dt.month, day=dt.day)
 
 def _tec_candidate_list():
-    """(tz, lag_min, url) の候補リストを、前回成功した組み合わせを最優先にして返す。"""
+    """(tz, lag_min, url, dt) の候補リストを、前回成功した組み合わせを最優先にして返す。"""
     now_utc = datetime.now(timezone.utc)
     now_jst = now_utc.astimezone(JST)
     step = TEC_URL_STEP_MIN
@@ -2649,8 +2656,10 @@ def _tec_candidate_list():
     pref_tz, pref_lag = _tec_url_pref["tz"], _tec_url_pref["lag_min"]
 
     ordered = []
-    # 前回成功した組み合わせを最優先
+    # 前回成功した組み合わせを最優先（遅れが縮んでいれば1つ新しい画像を、そうでなければ前回と同じ遅れを）
     if pref_lag in lags:
+        if pref_lag - step >= 0:
+            ordered.append((pref_tz, pref_lag - step))
         ordered.append((pref_tz, pref_lag))
     for tz in (pref_tz, "jst" if pref_tz == "utc" else "utc"):
         for lag in lags:
@@ -2660,7 +2669,7 @@ def _tec_candidate_list():
     out = []
     for tz, lag in ordered:
         dt = bases[tz] - timedelta(minutes=lag)
-        out.append((tz, lag, _tec_build_url(dt)))
+        out.append((tz, lag, _tec_build_url(dt), dt))
     return out
 
 def _fetch_tec_image():
@@ -2671,11 +2680,12 @@ def _fetch_tec_image():
     if not _PIL_AVAILABLE:
         return None, None, ["Pillowが未インストールです（pip install Pillow）"]
     headers = {"User-Agent": "Mozilla/5.0 (compatible; SeismoApp/5.0; research use)"}
-    for tz, lag, url in _tec_candidate_list():
+    for tz, lag, url, dt in _tec_candidate_list():
         try:
             resp = requests.get(url, timeout=10, headers=headers)
             if resp.status_code == 200 and resp.content:
-                _tec_url_pref = {"tz": tz, "lag_min": lag}
+                _tec_url_pref = {"tz": tz, "lag_min": lag,
+                                 "image_time": f"{dt:%Y-%m-%d %H:%M} {'JST' if tz == 'jst' else 'UT'}"}
                 attempts.append(f"200 {url}")
                 return _PILImage.open(io.BytesIO(resp.content)).convert("RGB"), url, attempts
             attempts.append(f"{resp.status_code} {url}")
@@ -2808,18 +2818,22 @@ def _refresh_tec_cache():
                     error = f"TEC画像のデコードエラー: {e}"
                 if grid:
                     source = "image"
+                    upd_str = f"画像 {_tec_url_pref.get('image_time', '?')}／取得 {datetime.now(JST).strftime('%H:%M')} JST"
                 elif not error:
                     error = "TEC画像のデコード結果が空でした（/tec/raw_image?overlay=1 で枠位置を確認）"
 
         now = time.time()
         with _tec_lock:
             _tec_cache["tried"] = now
-            _tec_cache["attempts"] = attempts[-24:]
+            _tec_cache["attempts"] = (attempts if len(attempts) <= 10 else
+                                      attempts[:4] + [f"…({len(attempts) - 8}件省略)…"] + attempts[-4:])
             _tec_cache["image_url"] = image_url
             if grid:
                 _tec_cache.update(grid=grid, ts=now, source=source, error=None,
                                   updated=upd_str or datetime.now(JST).strftime("%Y-%m-%d %H:%M JST"))
-                _tec_history.append((now, grid))
+                if not (image_url and image_url == _tec_cache.get("hist_url")):
+                    _tec_history.append((now, grid))
+                    _tec_cache["hist_url"] = image_url
                 cutoff = now - TEC_HISTORY_MAX * TEC_FETCH_INTERVAL_SEC
                 _tec_history = [(t, g) for t, g in _tec_history if t >= cutoff]
             else:
@@ -5687,7 +5701,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>Earthquake-risk-map v9.07</title>
+  <title>Earthquake-risk-map v9.10</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
@@ -5782,7 +5796,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震リスクマップ</div>
-      <div>v9.07 / 研究用</div>
+      <div>v9.10 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -6313,6 +6327,9 @@ def tec_status():
         "error": c["error"],
         "image_url": c["image_url"],
         "url_pref": dict(_tec_url_pref),
+        "image_time": _tec_url_pref.get("image_time"),
+        "lookback_min": TEC_URL_LOOKBACK_MIN,
+        "url_template": TEC_URL_TEMPLATE,
         "recent_attempts": c["attempts"],
     }
 
