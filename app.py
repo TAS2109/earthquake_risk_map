@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v9.04
+地震研究統合プラットフォーム v9.05
 
+v9.05: 統合リスクマップの再計算(起動時のキャリブレーション／「このタブを再計算」)を高速化。計算式・結果は変えず、
+       ・ETAS集計をnumpyで一括化、断層/プレート応力は距離行列を1回だけ作って全65時点を行列積で処理、
+       ・quakes.csvの読み込みを65回→1回、最寄りセル割当・GNSS割当・履歴の並べ替えをキャッシュ、
+       ・GNSS履歴の取得(通信待ち)を地震側の計算と並行させた。
 v9.04: GNSS変位タブの矢印を見やすく刷新。表示倍率を 400→1500 m/mm（約3.8倍）に引き上げ、さらに
        「大きい変位を強調」（変位が大きいほど長さを非線形に上乗せ）を既定ONにして、変位の大きい観測点が目立つようにした。
        ・倍率スライダー(×0.3〜×4.0 相当)と強調ON/OFFを地図右上に追加。凡例の「10mm＝何km」も連動して更新。
@@ -1381,6 +1385,53 @@ def build_snapshots_zip(max_files=None):
 # ══════════════════════════════════════════════════════
 # ETAS 解析
 # ══════════════════════════════════════════════════════
+# (v9.05) ETAS計算の高速化。
+# 従来は「地震1件ずつ × 17×17近傍セル」をPythonのforループでdictへ加算しており、
+# キャリブレーション(65時点 × 数千件)で全体の約6割を占めていた。
+# 計算式・計算範囲(逆L字)・出力は変えず、numpyのbincountでまとめて集計する。
+_ETAS_MASK_NI0 = int(math.floor(min(b[0] for b in ETAS_REGION_BOXES) / GRID_SIZE)) - 2
+_ETAS_MASK_NJ0 = int(math.floor(min(b[2] for b in ETAS_REGION_BOXES) / GRID_SIZE)) - 2
+def _build_etas_mask_table():
+    """逆L字領域(ETAS_REGION_BOXES)の内外を、格子インデックス(ni,nj)ごとに引ける判定表にする。"""
+    ni_hi = int(math.ceil(max(b[1] for b in ETAS_REGION_BOXES) / GRID_SIZE)) + 2
+    nj_hi = int(math.ceil(max(b[3] for b in ETAS_REGION_BOXES) / GRID_SIZE)) + 2
+    ni = np.arange(_ETAS_MASK_NI0, ni_hi + 1); nj = np.arange(_ETAS_MASK_NJ0, nj_hi + 1)
+    lat_g = (ni * GRID_SIZE)[:, None]; lon_g = (nj * GRID_SIZE)[None, :]
+    m = np.zeros((len(ni), len(nj)), dtype=bool)
+    for lat_min, lat_max, lon_min, lon_max in ETAS_REGION_BOXES:
+        m |= (lat_g >= lat_min) & (lat_g <= lat_max) & (lon_g >= lon_min) & (lon_g <= lon_max)
+    return m
+_ETAS_MASK = _build_etas_mask_table()
+
+def _etas_core(lats, lons, mags, t_days, depth_factors, chunk=1500):
+    """ETAS格子スコア本体（numpy配列入力）。戻り値は {(gi,gj): 値} で従来のanalyze_etasと同じ。"""
+    n = len(lats)
+    if n == 0: return {}
+    time_decay    = depth_factors / (t_days + EP.C) ** EP.P
+    mag_scale     = EP.K * np.exp(EP.ALPHA * (mags - EP.M0))
+    spatial_scale = EP.D * np.exp(EP.GAMMA * mags)
+    contributions = time_decay * mag_scale
+    R = EP.SPACE_RADIUS
+    gi = np.round(lats / GRID_SIZE).astype(np.int64); gj = np.round(lons / GRID_SIZE).astype(np.int64)
+    di_arr = np.arange(-R, R + 1); dj_arr = np.arange(-R, R + 1)
+    DI, DJ = np.meshgrid(di_arr, dj_arr, indexing="ij")
+    dist2 = (DI * GRID_SIZE) ** 2 + (DJ * GRID_SIZE) ** 2           # (2R+1, 2R+1)
+    H, W = _ETAS_MASK.shape
+    acc = np.zeros(H * W)
+    for s in range(0, n, chunk):
+        e = min(n, s + chunk)
+        ii = gi[s:e, None, None] + DI[None] - _ETAS_MASK_NI0
+        jj = gj[s:e, None, None] + DJ[None] - _ETAS_MASK_NJ0
+        inb = (ii >= 0) & (ii < H) & (jj >= 0) & (jj < W)
+        ii = np.where(inb, ii, 0); jj = np.where(inb, jj, 0)
+        ok = inb & _ETAS_MASK[ii, jj]
+        w = contributions[s:e, None, None] / (dist2[None] + (spatial_scale[s:e, None, None]) ** 2) ** EP.Q
+        acc += np.bincount((ii * W + jj)[ok], weights=w[ok], minlength=H * W)
+    v = acc + EP.MU
+    hit = np.nonzero(v > EP.MU * 1.01)[0]
+    if len(hit) == 0: return {}
+    return {(int(i // W) + _ETAS_MASK_NI0, int(i % W) + _ETAS_MASK_NJ0): float(v[i]) for i in hit}
+
 def analyze_etas(quakes, ref_time=None):
     """ETAS格子スコアを計算する。ref_timeを指定すると「その時点」を基準に
     時間減衰を計算する（過去のある時点での統合リスクマップ再現用）。
@@ -1399,43 +1450,42 @@ def analyze_etas(quakes, ref_time=None):
             valid.append((q["lat"], q["lon"], q["mag"], dt_days, depth_factor))
         except Exception: continue
     if not valid: return {}
-    lats   = np.array([v[0] for v in valid]); lons   = np.array([v[1] for v in valid])
-    mags   = np.array([v[2] for v in valid]); t_days = np.array([v[3] for v in valid])
-    depths = np.array([v[4] for v in valid])
-    time_decay    = depths / (t_days + EP.C) ** EP.P
-    mag_scale     = EP.K * np.exp(EP.ALPHA * (mags - EP.M0))
-    spatial_scale = EP.D * np.exp(EP.GAMMA * mags)
-    contributions = time_decay * mag_scale
-    R = EP.SPACE_RADIUS
-    gi = np.round(lats / GRID_SIZE).astype(int); gj = np.round(lons / GRID_SIZE).astype(int)
-    di_arr = np.arange(-R, R+1); dj_arr = np.arange(-R, R+1)
-    DI, DJ = np.meshgrid(di_arr, dj_arr, indexing="ij")
-    # ★ Bug fix: dist2 は各グリッドオフセットの距離の2乗（2D）。
-    # 元コードは [:,:,None] で3次元にしていたため dist2[:,:,ei] が ei>=1 でエラーになっていた
-    dist2 = (DI * GRID_SIZE)**2 + (DJ * GRID_SIZE)**2  # shape: (2R+1, 2R+1)
-    from collections import defaultdict
-    agg_dict = defaultdict(float)
-    for ei in range(len(valid)):
-        sc = spatial_scale[ei]; q_val = EP.Q
-        weight = contributions[ei] / (dist2 + sc**2) ** q_val  # dist2 は2D、ブロードキャスト
-        ni = gi[ei] + DI; nj = gj[ei] + DJ
-        # 計算範囲: 逆L字型（先島諸島・沖縄・台湾近海 ＋ 九州〜北海道・千島海溝）
-        # 中国大陸・日本海北部（ロシア・朝鮮半島側）は除外。範囲の定義は
-        # ETAS_REGION_BOXES / in_etas_region() を参照。
-        lat_g = ni * GRID_SIZE; lon_g = nj * GRID_SIZE
-        mask = np.zeros(ni.shape, dtype=bool)
-        for lat_min, lat_max, lon_min, lon_max in ETAS_REGION_BOXES:
-            mask |= (lat_g>=lat_min)&(lat_g<=lat_max)&(lon_g>=lon_min)&(lon_g<=lon_max)
-        ni_m = ni[mask]; nj_m = nj[mask]; w_m = weight[mask]
-        for k in range(len(ni_m)):
-            agg_dict[(int(ni_m[k]), int(nj_m[k]))] += float(w_m[k])
-    if not agg_dict: return {}
-    grid_scores = {}
-    for (gi_k, gj_k), agg_val in agg_dict.items():
-        v = agg_val + EP.MU
-        if v > EP.MU * 1.01:
-            grid_scores[(gi_k, gj_k)] = v
-    return grid_scores
+    arr = np.array(valid, dtype=float)
+    # 計算範囲: 逆L字型（先島諸島・沖縄・台湾近海 ＋ 九州〜北海道・千島海溝）。
+    # 中国大陸・日本海北部は除外。範囲の定義は ETAS_REGION_BOXES / in_etas_region() を参照。
+    return _etas_core(arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3], arr[:, 4])
+
+def _build_quake_arrays(quakes):
+    """(v9.05) キャリブレーション用: 地震リストを時刻順に並べ、数値配列にしておく（65時点で使い回す）。
+    時刻が解釈できない/タイムゾーン無しの行は従来(load_quakes_between)と同様に除外する。"""
+    rows = []
+    for q in quakes:
+        try:
+            t = datetime.fromisoformat(q["time"].replace("Z", "+00:00"))
+            if t.tzinfo is None: continue
+            rows.append((t.timestamp(), q))
+        except Exception:
+            continue
+    rows.sort(key=lambda r: r[0])
+    qs = [r[1] for r in rows]
+    return {
+        "q":     qs,
+        "t":     np.array([r[0] for r in rows], dtype=float),
+        "lat":   np.array([q["lat"] for q in qs], dtype=float),
+        "lon":   np.array([q["lon"] for q in qs], dtype=float),
+        "mag":   np.array([q["mag"] for q in qs], dtype=float),
+        "depth": np.array([q["depth"] for q in qs], dtype=float),
+        "depth_load": np.array([(q.get("depth", 10.0) or 10.0) for q in qs], dtype=float),
+    }
+
+def _analyze_etas_window(qa, lo, hi, ref_epoch):
+    """(v9.05) _build_quake_arrays の [lo:hi) 区間から、ref_epoch基準のETAS格子スコアを求める。"""
+    dt = (ref_epoch - qa["t"][lo:hi]) / 86400.0
+    m = (dt >= 0) & (dt <= 60.0)
+    if not m.any(): return {}
+    depth = qa["depth"][lo:hi][m]
+    return _etas_core(qa["lat"][lo:hi][m], qa["lon"][lo:hi][m], qa["mag"][lo:hi][m],
+                      dt[m], np.exp(-depth / EP.DEPTH_SCALE))
 
 def _percentile_thresholds(values_arr):
     log_v = np.log(np.clip(values_arr, 0, None) + 1)
@@ -1523,13 +1573,14 @@ def _compute_risk_level_thresholds(per_time_raw, calib_pools):
 
     # S[t, セル, 成分] = 各時点の成分別スコア(0〜1)。成分が無いセルはNaN。
     S = np.full((T, n_cells, len(_RISK_HIST_KEYS)), np.nan)
+    sc = {c: {} for c in _RISK_HIST_KEYS}   # (v9.05) セルごとの並べ替え済み履歴（65時点で使い回す）
     for t, raws in enumerate(per_time_raw):
         ranks = {
-            "etas":   _absolute_rank_map(raws["etas"],   calib_pools["etas_cell"],   invert=False, log_transform=True,  domain_floor_fn=etas_floor, loo=True),
-            "bvalue": _absolute_rank_map(raws["bvalue"], calib_pools["bvalue_cell"], invert=True,  log_transform=False, domain_floor_fn=_bvalue_domain_floor, loo=True),
-            "fault":  _absolute_rank_map(raws["fault"],  calib_pools["fault_cell"],  invert=False, log_transform=False, domain_floor_fn=fault_floor, loo=True),
-            "plate":  _absolute_rank_map(raws["plate"],  calib_pools["plate_cell"],  invert=False, log_transform=False, domain_floor_fn=plate_floor, loo=True),
-            "gnss":   _absolute_rank_map(raws.get("gnss"), calib_pools.get("gnss_cell"), invert=False, log_transform=False, domain_floor_fn=gnss_floor, loo=True),
+            "etas":   _absolute_rank_map(raws["etas"],   calib_pools["etas_cell"],   invert=False, log_transform=True,  domain_floor_fn=etas_floor, loo=True, sorted_cache=sc["etas"]),
+            "bvalue": _absolute_rank_map(raws["bvalue"], calib_pools["bvalue_cell"], invert=True,  log_transform=False, domain_floor_fn=_bvalue_domain_floor, loo=True, sorted_cache=sc["bvalue"]),
+            "fault":  _absolute_rank_map(raws["fault"],  calib_pools["fault_cell"],  invert=False, log_transform=False, domain_floor_fn=fault_floor, loo=True, sorted_cache=sc["fault"]),
+            "plate":  _absolute_rank_map(raws["plate"],  calib_pools["plate_cell"],  invert=False, log_transform=False, domain_floor_fn=plate_floor, loo=True, sorted_cache=sc["plate"]),
+            "gnss":   _absolute_rank_map(raws.get("gnss"), calib_pools.get("gnss_cell"), invert=False, log_transform=False, domain_floor_fn=gnss_floor, loo=True, sorted_cache=sc["gnss"]),
         }
         for ci, comp in enumerate(_RISK_HIST_KEYS):
             for k, v in ranks[comp].items():
@@ -1613,8 +1664,8 @@ def _sample_ref_times(lookback_days=HIST_CALIB_LOOKBACK_DAYS, step_hours=HIST_CA
 def _compute_historical_calibration():
     """過去HIST_CALIB_LOOKBACK_DAYS日間を定期サンプリングし、ETAS/b値/断層・
     プレート応力それぞれの「生の値」の分布(プール)を作る。アーカイブタブの
-    再計算ロジック(load_quakes_between / analyze_etas(ref_time=...) /
-    _historical_fault_plate_raw)をそのまま流用する。
+    再計算ロジック(analyze_etas(ref_time=...) / _historical_fault_plate_raw)と同じ計算を、
+    全時点分まとめて効率よく行う。
 
     (v7.56) 従来は全セル・全時刻の値を1本の配列にまとめる「空間+時間混合プール」
     だけを作っていたが、これだと活断層が密集する地域のセルは活動量に関わらず
@@ -1622,37 +1673,74 @@ def _compute_historical_calibration():
     統合リスクマップ・ETASマップともにLv4/5が平穏な時期でも大量発生する
     原因になっていた（空間的な下駄と時間的な稀少性の混同）。
     そこでセルごとに「そのセル自身の過去HIST_CALIB_LOOKBACK_DAYS日間の値」だけを
-    集めたプール(*_cellキー)のみを作る方式に統一する。これにより絶対評価が
-    「他の場所と比べて高いか」ではなく「そのセル自身のいつもと比べて高いか」
-    という真の時間的異常度になる（統合リスクマップ・ETASマップ・アーカイブの
-    いずれもこのプールを参照する）。"""
+    集めたプール(*_cellキー)のみを作る方式に統一する。
+
+    (v9.05) 高速化（計算結果は変えない）:
+      ・quakes.csv を65回読み直していたのを1回にし、時刻の解釈も1回だけにした。
+      ・ETAS: 地震×近傍セルの集計をPythonループからnumpyの一括集計へ。
+      ・断層/プレート応力: 距離行列を基準時刻ごとに作り直していたのを、1回だけ作って
+        時間減衰の重みとの行列積で全時点を一度に出す方式へ。最寄りセルの割当もキャッシュ。
+      ・GNSS履歴の取得(通信待ち)を最初に開始し、地震側の計算と並行させる。
+      ・しきい値算出での履歴の並べ替えを使い回す。"""
     from collections import defaultdict
     if GSI_GNSS_ENABLED:
-        _gnss_wait_for_history()   # (v9.00) GNSSの履歴を基準に含めるため、先に取得を済ませる
+        _gnss_start_history_fetch()   # (v9.05) 待たずに取得だけ先に始める（計算と並行）
     ref_times = _sample_ref_times()
     etas_cell, bvalue_cell, fault_cell, plate_cell = (defaultdict(list), defaultdict(list),
                                                        defaultdict(list), defaultdict(list))
     gnss_cell = defaultdict(list)   # (v9.00) GNSS変位(水平mm)のセル別プール
-    ok = 0
     per_time_raw = []   # (v8.21) しきい値キャリブレーション用: 各時点の成分別生値
+
+    # ── 1) 地震データを1回だけ読み込み、時刻順の配列にする ──
+    win = 60 * 86400.0
+    t_lo = min(ref_times) - timedelta(days=60)
+    t_hi = max(ref_times)
+    qa = _build_quake_arrays(load_quakes_between(t_lo, t_hi))
+    qt = qa["t"]
+    samples = []   # (rt, rt_epoch, lo, hi): 各時点で使う地震の範囲 qa[lo:hi]
     for rt in ref_times:
+        rt_e = rt.timestamp()
+        lo = int(np.searchsorted(qt, rt_e - win, side="left"))
+        hi = int(np.searchsorted(qt, rt_e, side="right"))
+        if hi - lo > 0:
+            samples.append((rt, rt_e, lo, hi))
+
+    # ── 2) 時点ごとのETAS・b値 ──
+    rows = []   # 有効だった時点の(rt, rt_e, lo, hi, etas_raw, bvalue_raw)
+    for rt, rt_e, lo, hi in samples:
         try:
-            start = rt - timedelta(days=60)
-            quakes = load_quakes_between(start, rt)
-            if not quakes:
-                continue
-            etas_scores = analyze_etas(quakes, ref_time=rt)
-            etas_raw_t = _risk_etas_raw(etas_scores)
-            for k, v in etas_raw_t.items(): etas_cell[k].append(v)
-
-            bgrid = compute_bvalue_grid(quakes)
+            etas_raw_t = _risk_etas_raw(_analyze_etas_window(qa, lo, hi, rt_e))
+            bgrid = compute_bvalue_grid(qa["q"][lo:hi])
             bvalue_raw_t = _risk_bvalue_raw(bgrid)
-            for k, v in bvalue_raw_t.items(): bvalue_cell[k].append(v)
+            rows.append((rt, rt_e, lo, hi, etas_raw_t, bvalue_raw_t))
+        except Exception as e:
+            print(f"[絶対基準キャリブレーション] サンプル({rt})でエラー: {e}")
 
-            fault_raw, plate_raw = _historical_fault_plate_raw(quakes, rt)
+    # ── 3) 断層・プレート境界の応力負荷（全時点まとめて）──
+    if rows:
+        try:
+            fpts = _decimate_points(_flatten_line_points(get_japan_active_faults()), FSP.MAX_POINTS)
+            ppts = _decimate_points(_flatten_line_points(get_plate_boundaries(), bbox=FAULTS_BBOX), FSP.MAX_POINTS)
+            sp = [(r[1], r[2], r[3]) for r in rows]
+            fault_list = _load_to_grid_max_multi(fpts, _fault_plate_loads_multi(fpts, qa, sp))
+            plate_list = _load_to_grid_max_multi(ppts, _fault_plate_loads_multi(ppts, qa, sp))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f"[絶対基準キャリブレーション] 応力負荷の計算でエラー: {e}")
+            rows = []
+
+    # ── 4) GNSS（履歴の取得が終わるのをここで待つ）──
+    if rows and GSI_GNSS_ENABLED:
+        _gnss_wait_for_history()   # (v9.00) GNSSの履歴を基準に含めるため、取得を待つ
+    ok = 0
+    for n, (rt, rt_e, lo, hi, etas_raw_t, bvalue_raw_t) in enumerate(rows):
+        try:
+            fault_raw, plate_raw = fault_list[n], plate_list[n]
+            gnss_raw_t, _gsrc = _gnss_risk_raw(ref_time=rt)
+            for k, v in etas_raw_t.items(): etas_cell[k].append(v)
+            for k, v in bvalue_raw_t.items(): bvalue_cell[k].append(v)
             for k, v in fault_raw.items(): fault_cell[k].append(v)
             for k, v in plate_raw.items(): plate_cell[k].append(v)
-            gnss_raw_t, _gsrc = _gnss_risk_raw(ref_time=rt)
             for k, v in gnss_raw_t.items(): gnss_cell[k].append(v)
             per_time_raw.append({"etas": etas_raw_t, "bvalue": bvalue_raw_t,
                                  "fault": fault_raw, "plate": plate_raw, "gnss": gnss_raw_t})
@@ -1844,6 +1932,28 @@ def _hybrid_rank_map(raw_map, pool, invert=False, log_transform=False, domain_fl
 RISK_SCORE_MAX = 0.99
 RISK_NEUTRAL_SCORE = 0.5   # 履歴のあるはずの成分がそのセルに無い場合に補う中立スコア
 
+def _prep_sorted_ref(hist, log_transform):
+    """(v9.05) 履歴(hist)を(必要ならlog変換して)昇順に並べたリストにする。同じ履歴に対し何度も順位を
+    求める場面(しきい値算出: 65時点×全セル)で、毎回の並べ替えを避けるために分離した。"""
+    hist_arr = np.asarray(hist, dtype=float)
+    ref = np.log(np.clip(hist_arr, 0, None) + 1) if log_transform else hist_arr
+    return np.sort(ref).tolist()
+
+def _abs_rank_from_sorted(ref_sorted, v, invert, log_transform, loo=False):
+    n = len(ref_sorted)
+    if loo:
+        n -= 1
+    if n < HIST_CALIB_MIN_CELL_SAMPLES:
+        return None
+    x = math.log(max(v, 0) + 1) if log_transform else v
+    lo = bisect.bisect_left(ref_sorted, x)
+    hi = bisect.bisect_right(ref_sorted, x)
+    c = (lo + hi - 1) / 2.0 if loo else (lo + hi) / 2.0    # タイは中央順位
+    rank = (c + 0.5) / (n + 1)
+    if invert:
+        rank = 1.0 - rank
+    return float(min(max(rank, 0.0), RISK_SCORE_MAX))
+
 def _abs_rank_value(hist, v, invert, log_transform, loo=False):
     """1セル分: 履歴(hist)に対する値vの絶対順位(0〜RISK_SCORE_MAX)。作れなければNone。"""
     n = len(hist)
@@ -1851,22 +1961,14 @@ def _abs_rank_value(hist, v, invert, log_transform, loo=False):
         n -= 1
     if n < HIST_CALIB_MIN_CELL_SAMPLES:
         return None
-    hist_arr = np.asarray(hist, dtype=float)
-    ref = np.log(np.clip(hist_arr, 0, None) + 1) if log_transform else hist_arr
-    ref_sorted = np.sort(ref)
-    x = math.log(max(v, 0) + 1) if log_transform else v
-    lo = np.searchsorted(ref_sorted, x, side="left")
-    hi = np.searchsorted(ref_sorted, x, side="right")
-    c = (lo + hi - 1) / 2.0 if loo else (lo + hi) / 2.0    # タイは中央順位
-    rank = (c + 0.5) / (n + 1)
-    if invert:
-        rank = 1.0 - rank
-    return float(min(max(rank, 0.0), RISK_SCORE_MAX))
+    return _abs_rank_from_sorted(_prep_sorted_ref(hist, log_transform), v, invert, log_transform, loo=loo)
 
 def _absolute_rank_map(raw_map, pool, invert=False, log_transform=False,
-                       domain_floor_fn=None, loo=False):
+                       domain_floor_fn=None, loo=False, sorted_cache=None):
     """raw_mapの各セルを『そのセル自身の過去実績の中での位置』(絶対評価)のみでスコア化する。
-    履歴の無い/薄いセルは結果に含めない(=相対評価へのフォールバックはしない)。"""
+    履歴の無い/薄いセルは結果に含めない(=相対評価へのフォールバックはしない)。
+    sorted_cache(dict)を渡すと、セルごとの並べ替え済み履歴を使い回す（同じpoolに対して
+    繰り返し呼ぶ場合用。(v9.05)）"""
     out = {}
     if not raw_map or not pool:
         return out
@@ -1874,7 +1976,13 @@ def _absolute_rank_map(raw_map, pool, invert=False, log_transform=False,
         hist = pool.get(k)
         if hist is None:
             continue
-        s = _abs_rank_value(hist, v, invert, log_transform, loo=loo)
+        if sorted_cache is not None:
+            rs = sorted_cache.get(k)
+            if rs is None:
+                rs = sorted_cache[k] = _prep_sorted_ref(hist, log_transform)
+            s = _abs_rank_from_sorted(rs, v, invert, log_transform, loo=loo)
+        else:
+            s = _abs_rank_value(hist, v, invert, log_transform, loo=loo)
         if s is None:
             continue
         if domain_floor_fn is not None:
@@ -3017,6 +3125,14 @@ def _gnss_set_history(hist):
             _hist_calib_cache["ts"] = 0.0
 
 
+def _gnss_start_history_fetch():
+    """(v9.05) GNSS履歴の取得を(まだ始まっていなければ)バックグラウンドで開始するだけで、待たない。
+    キャリブレーションでは、この取得(通信待ち)と地震側の計算(CPU)を並行して進めるために使う。"""
+    with _gnss_lock:
+        if _gnss_cache.get("hist") is not None or _gnss_cache["updating"]:
+            return
+    threading.Thread(target=_refresh_gnss_cache, daemon=True).start()
+
 def _gnss_wait_for_history(timeout=150):
     """(v9.00) GNSS履歴が使えるまで待つ（キャリブレーションのバックグラウンドスレッド専用）。
     未取得なら取得を開始する。取得に失敗した/時間切れの場合はFalse（GNSSなしで続行し、
@@ -3269,25 +3385,36 @@ def _gnss_station_values(ref_time=None):
     return out
 
 
+_gnss_assign_cache = {}
+
 def _gnss_assign_cells(stations):
     """(v9.00) 観測点の値を、半径GNSS_CELL_RADIUS_KM以内で最寄りの観測点からセルへ割り当てる。
     戻り値: (raw{cell_key: 水平変位mm}, src{cell_key: (観測点名, 距離km, 基準日)})"""
     if not stations:
         return {}, {}
     cell_keys = list(_RISK_CELLS.keys())
-    cell_latlon = np.array([_RISK_CELLS[k] for k in cell_keys])
     pts = np.array([[st[2], st[3]] for st in stations])
-    cos_lat = np.cos(np.radians(cell_latlon[:, 0]))
-    dlat = (cell_latlon[:, 0:1] - pts[:, 0][None, :]) * 111.0
-    dlon = (cell_latlon[:, 1:2] - pts[:, 1][None, :]) * 111.0 * cos_lat[:, None]
-    dist = np.sqrt(dlat ** 2 + dlon ** 2)
-    nearest = np.argmin(dist, axis=1)
+    # (v9.05) 観測点の顔ぶれが同じなら(65時点でほぼ毎回そう)、距離と最寄り観測点を使い回す
+    gkey = (pts.shape, hash(pts.tobytes()))
+    cached = _gnss_assign_cache.get(gkey)
+    if cached is None:
+        cell_latlon = np.array([_RISK_CELLS[k] for k in cell_keys])
+        cos_lat = np.cos(np.radians(cell_latlon[:, 0]))
+        dlat = (cell_latlon[:, 0:1] - pts[:, 0][None, :]) * 111.0
+        dlon = (cell_latlon[:, 1:2] - pts[:, 1][None, :]) * 111.0 * cos_lat[:, None]
+        dist = np.sqrt(dlat ** 2 + dlon ** 2)
+        nearest = np.argmin(dist, axis=1)
+        nd = dist[np.arange(len(cell_keys)), nearest]
+        if len(_gnss_assign_cache) >= 6:
+            _gnss_assign_cache.clear()
+        cached = _gnss_assign_cache[gkey] = (nearest, nd)
+    nearest, nd = cached
     raw, src = {}, {}
     for i, k in enumerate(cell_keys):
         j = int(nearest[i])
-        if dist[i, j] <= GNSS_CELL_RADIUS_KM:
+        if nd[i] <= GNSS_CELL_RADIUS_KM:
             raw[k] = float(stations[j][4])
-            src[k] = (stations[j][1], float(dist[i, j]), stations[j][5])
+            src[k] = (stations[j][1], float(nd[i]), stations[j][5])
     return raw, src
 
 
@@ -4259,6 +4386,31 @@ def _fault_plate_load_at_points(points_latlon, quakes, ref_time=None,
         load[pstart:pstart + point_chunk] = batch_load
     return load
 
+_nearest_cell_cache = {}
+def _nearest_cell_idx(pts):
+    """(v9.05) 断層/プレート境界のサンプル点 → 最寄りのリスク格子セル(_RISK_CELLS内の番号)。
+    点群は(断層データの再取得が無い限り)毎回同じなので、結果をキャッシュして使い回す。"""
+    key = (pts.shape, hash(pts.tobytes()))
+    hit = _nearest_cell_cache.get(key)
+    if hit is not None:
+        return hit
+    cell_keys = list(_RISK_CELLS.keys())
+    cell_latlon = np.array([_RISK_CELLS[k] for k in cell_keys])
+    cos_lat = np.cos(np.radians(cell_latlon[:, 0]))
+    n_pts = len(pts)
+    idx = np.empty(n_pts, dtype=int)
+    chunk = 2500
+    for start in range(0, n_pts, chunk):
+        batch = pts[start:start + chunk]
+        dlat = (cell_latlon[:, 0:1] - batch[:, 0][None, :]) * 111.0
+        dlon = (cell_latlon[:, 1:2] - batch[:, 1][None, :]) * 111.0 * cos_lat[:, None]
+        dist = np.sqrt(dlat ** 2 + dlon ** 2)
+        idx[start:start + chunk] = dist.argmin(axis=0)
+    if len(_nearest_cell_cache) >= 6:
+        _nearest_cell_cache.clear()
+    _nearest_cell_cache[key] = idx
+    return idx
+
 def _load_to_grid_max(points_latlon, loads):
     """断層/プレート境界のサンプル点ごとの応力負荷を、最も近いリスク格子セルへ
     割り当てる。1セルに複数の点が対応する場合はその中の最大値をセルの代表値とする
@@ -4266,27 +4418,60 @@ def _load_to_grid_max(points_latlon, loads):
     n_pts = len(points_latlon)
     if n_pts == 0:
         return {}
+    return _load_to_grid_max_multi(points_latlon, np.asarray(loads, dtype=float).reshape(n_pts, 1))[0]
+
+def _load_to_grid_max_multi(points_latlon, loads_mat):
+    """(v9.05) loads_mat: (点数, 時点数)。時点ごとに {セルkey: 最大負荷} のdictを返す。"""
+    n_pts = len(points_latlon)
+    T = loads_mat.shape[1]
+    if n_pts == 0:
+        return [{} for _ in range(T)]
     cell_keys = list(_RISK_CELLS.keys())
-    cell_latlon = np.array([_RISK_CELLS[k] for k in cell_keys])
-    cos_lat = np.cos(np.radians(cell_latlon[:, 0]))
+    nearest = _nearest_cell_idx(np.array(points_latlon))
+    order = np.argsort(nearest, kind="stable")
+    sidx = nearest[order]
+    starts = np.concatenate(([0], np.nonzero(np.diff(sidx))[0] + 1))
+    gmax = np.maximum.reduceat(loads_mat[order], starts, axis=0)      # (セル数G, T)
+    cells = [cell_keys[c] for c in sidx[starts]]
+    return [{cells[g]: float(gmax[g, t]) for g in range(len(cells))} for t in range(T)]
+
+def _fault_plate_loads_multi(points_latlon, qa, samples, window_days=60.0):
+    """(v9.05) 複数の基準時刻について、断層/プレート境界点の応力負荷をまとめて求める。
+    応力負荷 = Σ (M0/M0_ref) / r^3 × 時間減衰 の「距離項」は基準時刻に依存しないので、
+    (点×地震)の距離行列は1回だけ作り、時間減衰の重み(地震×時点)との行列積で全時点を一度に出す。
+    各時点で使う地震(直近window_days日・MAX_QUAKES件まで直近優先)は従来と同じ。
+    samples: [(ref_epoch, lo, hi), ...]  戻り値: (点数, 時点数) のndarray"""
+    n_pts = len(points_latlon); T = len(samples)
+    out = np.zeros((n_pts, T))
+    nq = len(qa["t"])
+    if n_pts == 0 or nq == 0 or T == 0:
+        return out
+    TW = np.zeros((nq, T))
+    for ti, (rt_e, lo, hi) in enumerate(samples):
+        dt = (rt_e - qa["t"][lo:hi]) / 86400.0
+        idx = np.nonzero((dt >= 0) & (dt <= min(window_days, FSP.MAX_LOOKBACK_DAYS)))[0]
+        if len(idx) > FSP.MAX_QUAKES:
+            idx = idx[np.argsort(dt[idx])[:FSP.MAX_QUAKES]]
+        TW[lo + idx, ti] = (dt[idx] + FSP.TIME_C) ** (-FSP.TIME_P)
+    used = np.nonzero(TW.any(axis=1))[0]            # どの時点でも使われない地震は除外
+    if len(used) == 0:
+        return out
+    TW = TW[used]
+    qlat = qa["lat"][used]; qlon = qa["lon"][used]; qdepth = qa["depth_load"][used]; qmag = qa["mag"][used]
+    m0_ref = 10.0 ** (1.5 * FSP.M0_REF_MAG + 9.05)
+    moment_ratio = (10.0 ** (1.5 * qmag + 9.05)) / m0_ref
+    r_min = np.maximum((10.0 ** (-2.44 + 0.59 * qmag)) / 2.0, FSP.R_MIN_FLOOR_KM)   # Wells & Coppersmith 1994
     pts = np.array(points_latlon)
-
-    nearest_cell_idx = np.empty(n_pts, dtype=int)
-    chunk = 2500
-    for start in range(0, n_pts, chunk):
-        batch = pts[start:start + chunk]
-        dlat = (cell_latlon[:, 0:1] - batch[:, 0][None, :]) * 111.0
-        dlon = (cell_latlon[:, 1:2] - batch[:, 1][None, :]) * 111.0 * cos_lat[:, None]
-        dist = np.sqrt(dlat ** 2 + dlon ** 2)
-        nearest_cell_idx[start:start + chunk] = dist.argmin(axis=0)
-
-    best = {}
-    for i, ci in enumerate(nearest_cell_idx):
-        key = cell_keys[ci]
-        v = float(loads[i])
-        if key not in best or v > best[key]:
-            best[key] = v
-    return best
+    cos_lat = np.cos(np.radians(pts[:, 0]))
+    pc = max(8, min(FSP.POINT_CHUNK, 1_000_000 // max(len(qlat), 1)))   # ピークメモリを固定(約8MB×数本)
+    for ps in range(0, n_pts, pc):
+        pb = pts[ps:ps + pc]
+        dlat = (pb[:, 0:1] - qlat[None, :]) * 111.0
+        dlon = (pb[:, 1:2] - qlon[None, :]) * 111.0 * cos_lat[ps:ps + pc, None]
+        r = np.sqrt(dlat ** 2 + dlon ** 2 + qdepth[None, :] ** 2)
+        r = np.maximum(r, r_min[None, :])
+        out[ps:ps + pc] = (moment_ratio[None, :] / (r ** 3)) @ TW
+    return out
 
 def get_fault_stress_grid(quakes):
     """各リスク格子セル付近を通る活断層について、直近の地震活動による
@@ -4322,16 +4507,40 @@ def get_plate_stress_grid(quakes):
     print(f"[統合リスク] プレート境界 応力負荷 {len(grid)}セル計算完了（サンプル点{len(pts)}件）")
     return grid
 
+_RISK_CELL_LOOKUP = None
+def _risk_cell_lookup():
+    """(v9.05) リスク格子(gi,gj) → _RISK_CELLS 内の通し番号 を引く表（初回に1度だけ作る）。"""
+    global _RISK_CELL_LOOKUP
+    if _RISK_CELL_LOOKUP is None:
+        keys = list(_RISK_CELLS.keys())
+        gis = [k[0] for k in keys]; gjs = [k[1] for k in keys]
+        gi0, gj0 = min(gis), min(gjs)
+        tab = np.full((max(gis) - gi0 + 1, max(gjs) - gj0 + 1), -1, dtype=np.int64)
+        for n, (gi, gj) in enumerate(keys):
+            tab[gi - gi0, gj - gj0] = n
+        _RISK_CELL_LOOKUP = (keys, gi0, gj0, tab)
+    return _RISK_CELL_LOOKUP
+
 def _risk_etas_raw(etas_grid_scores):
-    """ETASの細かい格子(GRID_SIZE)を統合リスク格子(RISK_GRID_SIZE)に集約(合算)する。"""
-    from collections import defaultdict
-    raw = defaultdict(float)
-    for (fgi, fgj), score in etas_grid_scores.items():
-        lat = fgi * GRID_SIZE; lon = fgj * GRID_SIZE
-        gi = int(math.floor(lat / RISK_GRID_SIZE)); gj = int(math.floor(lon / RISK_GRID_SIZE))
-        if (gi, gj) in _RISK_CELLS:
-            raw[(gi, gj)] += score
-    return dict(raw)
+    """ETASの細かい格子(GRID_SIZE)を統合リスク格子(RISK_GRID_SIZE)に集約(合算)する。
+    (v9.05) numpyで一括集計（結果は従来と同じ）。"""
+    if not etas_grid_scores:
+        return {}
+    keys, gi0, gj0, tab = _risk_cell_lookup()
+    fk = np.array(list(etas_grid_scores.keys()), dtype=np.int64)
+    vals = np.fromiter(etas_grid_scores.values(), dtype=float, count=len(fk))
+    lat = fk[:, 0] * GRID_SIZE; lon = fk[:, 1] * GRID_SIZE
+    ii = np.floor(lat / RISK_GRID_SIZE).astype(np.int64) - gi0
+    jj = np.floor(lon / RISK_GRID_SIZE).astype(np.int64) - gj0
+    inb = (ii >= 0) & (ii < tab.shape[0]) & (jj >= 0) & (jj < tab.shape[1])
+    ci = np.full(len(fk), -1, dtype=np.int64)
+    ci[inb] = tab[ii[inb], jj[inb]]
+    sel = ci >= 0
+    if not sel.any():
+        return {}
+    sums = np.bincount(ci[sel], weights=vals[sel], minlength=len(keys))
+    cnt = np.bincount(ci[sel], minlength=len(keys))
+    return {keys[c]: float(sums[c]) for c in np.nonzero(cnt)[0]}
 
 def _risk_bvalue_raw(bvalue_grid):
     """b値格子(BVALUE_GRID_SIZE、より粗い)を統合リスク格子に割り当てる。"""
