@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震研究統合プラットフォーム v9.07
+地震リスクマップ v9.07
 
 ■ 目的と成功の定義
   統合リスクマップの目的は、地震の「発生時期の予測」ではなく、「M6以上の大きな地震が起きる場所を、
@@ -5566,7 +5566,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>地震研究統合プラットフォーム v9.07</title>
+  <title>Earthquake-risk-map v9.07</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
@@ -5660,7 +5660,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="toast"></div>
   <div id="sidebar">
     <div class="app-title">
-      <div>地震研究統合プラットフォーム</div>
+      <div>地震リスクマップ</div>
       <div>v9.07 / 研究用</div>
     </div>
 
