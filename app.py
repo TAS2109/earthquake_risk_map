@@ -2898,44 +2898,56 @@ def get_tec_grid():
         threading.Thread(target=_refresh_tec_cache, daemon=True).start()
     return dict(grid) if grid else None
 
+_tec_risk_state = {"mode": "", "why": ""}   # (v9.21) 画面に出す理由: mode=temporal/spatial/none
+
+def _plane_residual(keys, vals):
+    """値を (定数+緯度+経度) の平面で当てはめ、残差を返す。セルが少なければ中央値だけ引く。"""
+    vals = np.array(vals, dtype=float)
+    if len(keys) >= TEC_MIN_CELLS:
+        lat = np.array([_RISK_CELLS[k][0] for k in keys], dtype=float)
+        lon = np.array([_RISK_CELLS[k][1] for k in keys], dtype=float)
+        A = np.column_stack([np.ones_like(lat), lat - lat.mean(), lon - lon.mean()])
+        try:
+            coef, *_ = np.linalg.lstsq(A, vals, rcond=None)
+            return vals - A @ coef
+        except Exception:
+            pass
+    return vals - float(np.median(vals))
+
 def _risk_tec_raw():
     """(v9.21) 各セルの「局所的なTEC偏差(TECU)」を返す。
-    1) 偏差 = 現在のTEC − 直近履歴の平均（符号付き）
-    2) 偏差を (定数 + 緯度 + 経度) の平面で当てはめて引く。これで日変化・磁気嵐・太陽活動など
-       日本全体(や緯度方向のなだらかな勾配)で起きる変化を除き、局所的な異常だけが残る。
-    3) 残差の絶対値を返す。
+    履歴が2件以上たまっていれば:
+      偏差 = 現在のTEC − 直近履歴の平均 → 平面(定数+緯度+経度)を引いて日本全体の変化を除く（temporal）
+    履歴がまだ足りない時（再起動・スリープ明け直後）は、履歴なしで使える代替として:
+      現在のTEC分布から平面を引いた残差を使う（spatial。時間変化は見ないので精度は劣る）
     学術的に確立した地震前兆指標ではない点に注意（実験的）。"""
+    st = _tec_risk_state
     get_tec_grid()   # 古ければ裏で更新を起動（今回の計算には現在のキャッシュを使う）
     with _tec_lock:
         cur = _tec_cache["grid"]
         ts = _tec_cache["ts"]
         hist = list(_tec_history)
-    if not cur or len(hist) < 3 or (time.time() - ts) > TEC_LIVE_MAX_STALE_SEC:
-        return {}
+    if not cur:
+        st.update(mode="none", why="TECを取得できていません"); return {}
+    if (time.time() - ts) > TEC_LIVE_MAX_STALE_SEC:
+        st.update(mode="none", why="TECが古い(3時間超)"); return {}
     baseline = {}
     for _, g in hist[:-1]:
         for k, v in g.items():
             baseline.setdefault(k, []).append(v)
     keys, dev = [], []
     for k, v in cur.items():
-        if k in baseline and len(baseline[k]) >= 2 and k in _RISK_CELLS:
-            keys.append(k)
-            dev.append(v - float(np.mean(baseline[k])))
-    if not keys:
-        return {}
-    dev = np.array(dev, dtype=float)
-    if len(keys) >= TEC_MIN_CELLS:
-        lat = np.array([_RISK_CELLS[k][0] for k in keys], dtype=float)
-        lon = np.array([_RISK_CELLS[k][1] for k in keys], dtype=float)
-        A = np.column_stack([np.ones_like(lat), lat - lat.mean(), lon - lon.mean()])
-        try:
-            coef, *_ = np.linalg.lstsq(A, dev, rcond=None)
-            resid = dev - A @ coef
-        except Exception:
-            resid = dev - float(np.median(dev))
-    else:
-        resid = dev - float(np.median(dev))   # セルが少ない時は中央値だけ引く
-    return {k: float(abs(r)) for k, r in zip(keys, resid)}
+        if k in baseline and len(baseline[k]) >= 1 and k in _RISK_CELLS:
+            keys.append(k); dev.append(v - float(np.mean(baseline[k])))
+    if len(keys) >= TEC_MIN_CELLS and len(hist) >= 2:
+        st.update(mode="temporal", why="")
+        return {k: float(abs(r)) for k, r in zip(keys, _plane_residual(keys, dev))}
+    # 履歴が足りない → 空間残差で代替
+    skeys = [k for k in cur if k in _RISK_CELLS]
+    if len(skeys) < TEC_MIN_CELLS:
+        st.update(mode="none", why="TECのセル数が不足"); return {}
+    st.update(mode="spatial", why=f"履歴蓄積中({len(hist)}件)・空間偏差で代替")
+    return {k: float(abs(r)) for k, r in zip(skeys, _plane_residual(skeys, [cur[k] for k in skeys]))}
 
 
 def _tec_score_map(tec_raw):
@@ -5679,14 +5691,15 @@ def render_riskmap(risk_cells, updated_str):
     tec_ready = any("tec" in c["c"] for c in risk_cells)
     if tec_ready:
         tec_row = ('<div class="chk-row"><input type="checkbox" id="chk_tec" checked onchange="onToggle(\'tec\')">'
-                   f'<span class="clabel">TEC（電離圏・局所偏差）</span><span class="cweight">w={w["tec"]}</span></div>')
+                   f'<span class="clabel">TEC（電離圏・局所偏差）</span><span class="cweight">w={w["tec"]}'
+                   + ('・履歴蓄積中' if _tec_risk_state.get("mode") == "spatial" else '') + '</span></div>')
     else:
         if not TEC_ENABLED:
             _twhy = "未設定"
         elif _tec_cache.get("updating") or not _tec_cache.get("ts"):
             _twhy = "取得中"
         else:
-            _twhy = "現在値なし"
+            _twhy = _tec_risk_state.get("why") or "現在値なし"
         tec_row = ('<div class="chk-row disabled"><input type="checkbox" id="chk_tec" disabled>'
                    f'<span class="clabel">TEC（電離圏・局所偏差）</span><span class="cbadge">{_twhy}</span></div>')
     tec_ready_js = "true" if tec_ready else "false"
