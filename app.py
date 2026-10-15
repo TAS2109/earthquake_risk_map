@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震リスクマップ v9.20
+地震リスクマップ v9.21
 
 ■ 目的と成功の定義
   統合リスクマップの目的は、地震の「発生時期の予測」ではなく、「M6以上の大きな地震が起きる場所を、
@@ -13,7 +13,8 @@
 ■ 現在の統合リスクマップの仕様
   ・成分: ETAS / b値 / 活断層・プレート応力 … 過去65日の「そのセル自身の実績」との絶対評価。
           気圧 … 上限つき。GNSS変位 … 現在の水平変位(直近7日,mm)のみ・固定目盛り(GNSS_SCORE_POINTS)。過去値は使わない。
-  ・重み(RISK_DEFAULT_WEIGHTS): ETAS 0.45 / b値 0.15 / 活断層 0.15 / プレート 0.10 / 気圧 0.05 / TEC 0.10 / GNSS 0.20
+  ・重み(RISK_DEFAULT_WEIGHTS): ETAS 0.45 / b値 0.15 / 活断層 0.15 / プレート 0.10 / 気圧 0.05 / TEC 0.08 / GNSS 0.20
+          TEC・GNSSは「押し上げ専用」(他成分の水準を超えた分だけ総合を上げ、平常範囲なら総合を変えない)
           （選択成分・そのセルにある成分だけで再正規化。現在の重みは判断値で、実データでの検証は未実施）
   ・GNSSは「他の成分の水準を超えた分だけ総合を押し上げ、平常範囲なら総合を変えない」。観測点から遠いセルはGNSSなし。
   ・レベル境界は、平穏時のLv別セル数(RISK_LEVEL_TARGETS)に合うよう過去65日から自動算出（GNSSは較正に含めない）。
@@ -38,6 +39,8 @@
      共有URL/CSV出力、PWA化。通知は「時期の警報」と誤解されないよう、注目セルの変化として位置づける。
 
 ■ 更新履歴（要点のみ）
+  v9.21 TECを統合リスクマップに接続(重み0.08・GNSSと同じ「他成分を超えた分だけ押し上げ」・広域成分を除いた局所偏差を固定目盛りでスコア化・標準/全データプリセットに追加)／
+        バックテストに成分別の単独成績・AUCと的中率の95%信頼区間・年別/規模別の安定性を追加(記録形式変更のため旧記録は再計算)
   v9.20 app_35(v9.10: TEC実装更新)と app_38(v9.08: 検証タブ・日付ごとの基準)を統合。両者の変更は互いに独立で、競合なし
   v9.10 TEC取得をGNSSと同じ方式に統一(有効判定TEC_ENABLED／更新中フラグ付きの裏更新／古ければアクセス時に再取得／
         TEC_JSON_URLによる数値JSON代替経路／/tec/status・/tec/refresh_now・/tec/raw_image追加／3時間超の古いTECはリスクに使わない／
@@ -2622,6 +2625,13 @@ TEC_FETCH_INTERVAL_SEC = 600      # 元データが10分間隔のため合わせ
 TEC_HISTORY_MAX        = 6 * 24   # 直近24時間分(10分間隔換算)を基準値計算に保持
 TEC_CACHE_SEC          = TEC_FETCH_INTERVAL_SEC   # (GNSS_CACHE_SEC相当) これを過ぎたら次のアクセスで裏更新
 TEC_LIVE_MAX_STALE_SEC = 3 * 3600  # (GNSS_LIVE_MAX_STALE_DAYS相当) これより古いTECはリスクマップに使わない
+# (v9.21) TEC成分の固定目盛り: 「広域成分を除いた局所的なTEC偏差(TECU)」→スコア(0〜1)。
+#   日変化・磁気嵐・太陽活動による日本全体の増減は _risk_tec_raw で差し引くので、ここに来るのは局所的な異常だけ。
+#   TEC-地震前兆は学術的に確立していないため、上限を0.70に抑え(TEC単独ではLv4以上になりにくい)、
+#   さらに統合側では「他成分の水準を超えた分だけ押し上げる」扱い(GNSSと同じ)にする。
+TEC_SCORE_POINTS = [(0.0, 0.10), (2.0, 0.25), (4.0, 0.45), (8.0, 0.65), (15.0, 0.70)]
+TEC_SCORE_MAX    = 0.70
+TEC_MIN_CELLS    = 30   # 平面フィット(広域成分の除去)に必要な最少セル数
 
 # ── 代替取得経路（GNSS_JSON_URL と同じ考え方）──────────────
 # NICTの画像を色逆変換する代わりに、別環境(PC/GitHub Actions等)で作った数値JSONのURLを指定できる。
@@ -2889,8 +2899,12 @@ def get_tec_grid():
     return dict(grid) if grid else None
 
 def _risk_tec_raw():
-    """各セルについて「現在のTEC値 − 直近履歴の平均値」の絶対偏差を返す。
-    急激な増減を電離圏擾乱の目安として扱うが、学術的に確立した指標ではない点に注意。"""
+    """(v9.21) 各セルの「局所的なTEC偏差(TECU)」を返す。
+    1) 偏差 = 現在のTEC − 直近履歴の平均（符号付き）
+    2) 偏差を (定数 + 緯度 + 経度) の平面で当てはめて引く。これで日変化・磁気嵐・太陽活動など
+       日本全体(や緯度方向のなだらかな勾配)で起きる変化を除き、局所的な異常だけが残る。
+    3) 残差の絶対値を返す。
+    学術的に確立した地震前兆指標ではない点に注意（実験的）。"""
     get_tec_grid()   # 古ければ裏で更新を起動（今回の計算には現在のキャッシュを使う）
     with _tec_lock:
         cur = _tec_cache["grid"]
@@ -2902,11 +2916,34 @@ def _risk_tec_raw():
     for _, g in hist[:-1]:
         for k, v in g.items():
             baseline.setdefault(k, []).append(v)
-    raw = {}
+    keys, dev = [], []
     for k, v in cur.items():
-        if k in baseline and len(baseline[k]) >= 2:
-            raw[k] = abs(v - float(np.mean(baseline[k])))
-    return raw
+        if k in baseline and len(baseline[k]) >= 2 and k in _RISK_CELLS:
+            keys.append(k)
+            dev.append(v - float(np.mean(baseline[k])))
+    if not keys:
+        return {}
+    dev = np.array(dev, dtype=float)
+    if len(keys) >= TEC_MIN_CELLS:
+        lat = np.array([_RISK_CELLS[k][0] for k in keys], dtype=float)
+        lon = np.array([_RISK_CELLS[k][1] for k in keys], dtype=float)
+        A = np.column_stack([np.ones_like(lat), lat - lat.mean(), lon - lon.mean()])
+        try:
+            coef, *_ = np.linalg.lstsq(A, dev, rcond=None)
+            resid = dev - A @ coef
+        except Exception:
+            resid = dev - float(np.median(dev))
+    else:
+        resid = dev - float(np.median(dev))   # セルが少ない時は中央値だけ引く
+    return {k: float(abs(r)) for k, r in zip(keys, resid)}
+
+
+def _tec_score_map(tec_raw):
+    """(v9.21) 局所TEC偏差(TECU)を固定目盛り TEC_SCORE_POINTS でスコア(0〜1)にする。
+    旧版は「その瞬間の全セル内の順位」だったため、平穏でも必ず一部が高スコアになった。固定目盛りならその心配がない。"""
+    xs = [p[0] for p in TEC_SCORE_POINTS]
+    ys = [p[1] for p in TEC_SCORE_POINTS]
+    return {k: float(min(np.interp(v, xs, ys), TEC_SCORE_MAX)) for k, v in tec_raw.items()}
 
 
 def render_tec(updated_str):
@@ -4168,7 +4205,7 @@ RISK_DEFAULT_WEIGHTS = {
     "fault":    0.15,
     "plate":    0.10,
     "pressure": 0.05,
-    "tec":      0.10,
+    "tec":      0.08,   # (v9.21) 学術的に未確立のため低め。さらに「他成分を超えた分だけ押し上げ」扱い(GNSSと同じ)
     "gnss":     0.20,   # (v9.07) GNSS変位(現在値)。基準(他成分)を超えた分だけ総合を押し上げる扱い
 }
 RISK_LABELS = {"etas": "ETAS", "bvalue": "b値", "fault": "活断層",
@@ -4647,8 +4684,7 @@ def compute_risk_grid(etas_grid_scores, bvalue_grid, quakes):
     gnss_rank     = _gnss_score_map(gnss_raw)   # (v9.06) 現在値のみ・固定目盛りでスコア化
     pressure_rank = {k: min(v, PRESSURE_TEC_SCORE_CAP)
                       for k, v in _percentile_rank_map(pressure_raw, invert=False).items()}
-    tec_rank      = {k: min(v, PRESSURE_TEC_SCORE_CAP)
-                      for k, v in _percentile_rank_map(tec_raw, invert=False).items()}   # 偏差が大きい = 高リスク
+    tec_rank      = _tec_score_map(tec_raw)   # (v9.21) 局所偏差(TECU)を固定目盛りでスコア化
 
     cells = []
     for key, (lat, lon) in _RISK_CELLS.items():
@@ -5192,6 +5228,7 @@ class _BtRankCtx:
                 i = _BT_IDX.get(k)
                 if i is not None:
                     S[i, ci] = v
+        self.last_S = S   # (v9.21) 成分別の順位を記録に残すため、最後に計算した成分行列を保持
         w = np.array([RISK_DEFAULT_WEIGHTS[k] for k in _RISK_HIST_KEYS])
         valid = ~np.isnan(S)
         # しきい値の算出(_compute_risk_level_thresholds)・JS側と同じ: 無い成分は中立値で補い、全成分の重みで割る
@@ -5225,7 +5262,7 @@ def _bt_model_stats(vec, idx, r):
     D = _bt_maxfilter(vec, r)
     return {"tau": round(_bt_tau(vec, idx), 5), "tau_nb": round(_bt_tau(D, idx), 5)}
 
-def _bt_make_record(ev, group, prev, eval_t, anchor, score_vec, after_vec, th, st_vecs, p):
+def _bt_make_record(ev, group, prev, eval_t, anchor, score_vec, after_vec, th, st_vecs, p, comp_S=None):
     idx = ev["cell_idx"]
     r = BT_NEAR_RADIUS_CELLS
     lv = _bt_levels(score_vec, th)
@@ -5256,6 +5293,9 @@ def _bt_make_record(ev, group, prev, eval_t, anchor, score_vec, after_vec, th, s
         "st_comb": _bt_model_stats(st_vecs["st_comb"], idx, r),
         "thresholds": [round(float(t), 4) for t in th],
     }
+    # (v9.21) 成分別の震源セル順位τ(上位何%か)。どの成分が効いているかを重み見直しの根拠にする
+    if comp_S is not None:
+        rec["comp"] = {k: round(_bt_tau(comp_S[:, ci], idx), 5) for ci, k in enumerate(_RISK_HIST_KEYS)}
     return rec
 
 
@@ -5299,7 +5339,7 @@ def _bt_cfg_hash(p):
     """記録(1地震ぶん)の中身が変わる設定だけでハッシュを作る。期間・対象Mは含めない
     （期間を広げて再実行したとき、計算済みの地震は再利用できる）。"""
     import hashlib
-    key = json.dumps({"v": 1, "lead": p["lead_hours"], "after": p["after_hours"], "rebuild": p["rebuild_days"],
+    key = json.dumps({"v": 2, "lead": p["lead_hours"], "after": p["after_hours"], "rebuild": p["rebuild_days"],
                       "step": p["calib_step_hours"], "prev": p["prev_mag"], "near": BT_NEAR_RADIUS_CELLS,
                       "jma_min": JMA_CATALOG_MIN_MAG, "static": [BT_STATIC_MIN_MAG, BT_STATIC_LOOKBACK_YEARS,
                       BT_STATIC_SIGMA_CELLS, BT_STATIC_W_SEIS, BT_STATIC_W_FAULT],
@@ -5415,10 +5455,11 @@ def _bt_run(p):
             with open(out_path, "a", encoding="utf-8") as f:
                 for n, ev in enumerate(evs):
                     score_vec = ctx.composite(raws[2 * n])
+                    comp_S = ctx.last_S.copy()   # (v9.21) 直前時点の成分別スコア
                     after_vec = ctx.composite(raws[2 * n + 1])
                     st_vecs = _bt_static_vectors(st, ev["eval_t"].timestamp())
                     rec = _bt_make_record(ev, ev["group"], ev["prev"], ev["eval_t"], anchor,
-                                          score_vec, after_vec, th, st_vecs, p)
+                                          score_vec, after_vec, th, st_vecs, p, comp_S=comp_S)
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     f.flush()
                     n_done += 1
@@ -5456,18 +5497,72 @@ def _bt_sig_curve(n, alpha=0.05):
         out.append(None if len(ks) == 0 else round(1.0 - int(ks[0]) / n, 4))
     return out
 
+def _bt_wilson(k, n, z=1.96):
+    """的中率の95%信頼区間(Wilson)。件数が少ないときの不確かさを見せる。"""
+    if n <= 0:
+        return None
+    ph = k / n
+    den = 1.0 + z * z / n
+    c = (ph + z * z / (2 * n)) / den
+    h = z * math.sqrt(ph * (1 - ph) / n + z * z / (4 * n * n)) / den
+    return [round(max(0.0, c - h), 4), round(min(1.0, c + h), 4)]
+
+def _bt_auc_ci(a, n_boot=1000, seed=12345):
+    """AUC(=1−平均順位)の95%信頼区間(ブートストラップ。乱数固定で再現可能)。"""
+    n = len(a)
+    if n < 5:
+        return None
+    rng = np.random.default_rng(seed)
+    means = a[rng.integers(0, n, size=(n_boot, n))].mean(axis=1)
+    lo, hi = np.percentile(1.0 - means, [2.5, 97.5])
+    return [round(float(lo), 4), round(float(hi), 4)]
+
 def _bt_metrics(taus):
     n = len(taus)
     if n == 0:
         return {"n": 0}
     a = np.array(taus, dtype=float)
     m = {"n": n, "median_tau": round(float(np.median(a)), 4), "mean_tau": round(float(a.mean()), 4),
-         "auc": round(float(1.0 - a.mean()), 4)}
+         "auc": round(float(1.0 - a.mean()), 4), "auc_ci": _bt_auc_ci(a)}
     for x in (0.05, 0.10, 0.20):
         k = int((a <= x + 1e-12).sum())
         tag = int(round(x * 100))
         m[f"hit{tag}"] = round(k / n, 4); m[f"k{tag}"] = k; m[f"p{tag}"] = round(_bt_binom_sf(k, n, x), 5)
+        m[f"ci{tag}"] = _bt_wilson(k, n)
     return m
+
+def _bt_component_table(rs):
+    """(v9.21) 成分ごとの単独の成績(震源セル)。『その成分だけで警戒したら』のAUC・上位10%的中率。
+    成分別の記録が無い古い記録は除く(n で件数を表示)。重み・成分の取捨の根拠にする。"""
+    rows = []
+    rs = [r for r in rs if r.get("comp")]
+    for k in _RISK_HIST_KEYS:
+        taus = [r["comp"][k] for r in rs if k in r["comp"]]
+        if not taus:
+            continue
+        mt = _bt_metrics(taus)
+        rows.append({"key": k, "label": RISK_LABELS.get(k, k), "weight": RISK_DEFAULT_WEIGHTS[k], "n": mt["n"],
+                     "auc": mt["auc"], "auc_ci": mt["auc_ci"], "hit10": mt["hit10"], "p10": mt["p10"],
+                     "no_score": round(float(np.mean([t >= 0.9999 for t in taus])), 4)})   # スコアが無く警戒できなかった割合
+    return rows
+
+def _bt_breakdown(rs):
+    """(v9.21) 年別・規模別の安定性。『特定の年(例:大地震列のある年)だけ良い』を見抜く。"""
+    def row(label, sub):
+        d = _bt_metrics([r["dyn"]["tau"] for r in sub]); st = _bt_metrics([r["st_comb"]["tau"] for r in sub])
+        return {"label": label, "n": d["n"], "dyn_auc": d["auc"], "dyn_hit10": d["hit10"],
+                "st_auc": st["auc"], "st_hit10": st["hit10"]}
+    years = {}
+    for r in rs:
+        years.setdefault(r["t_jst"][:4], []).append(r)
+    by_year = [row(y + "年", years[y]) for y in sorted(years)]
+    bins = [("M6.0〜6.4", 6.0, 6.5), ("M6.5〜6.9", 6.5, 7.0), ("M7.0以上", 7.0, 99.0)]
+    by_mag = []
+    for lab, lo, hi in bins:
+        sub = [r for r in rs if lo <= r["mag"] < hi]
+        if sub:
+            by_mag.append(row(lab, sub))
+    return {"by_year": by_year, "by_mag": by_mag}
 
 def _bt_paired(a, b):
     """動的(a)と静的(b)の順位の対比較。符号検定(両側)。aが小さい=動的が良い。"""
@@ -5512,7 +5607,8 @@ def _bt_summarize(records, p):
     out = {"params": p, "n_events": len(recs), "group_labels": BT_GROUP_LABELS, "model_labels": BT_MODEL_LABELS,
            "tau_grid": BT_TAU_GRID, "groups": {}, "rows": recs}
     for g, rs in groups.items():
-        gg = {"n": len(rs), "models": {}, "levels": _bt_level_table(rs), "sig05": _bt_sig_curve(len(rs)), "paired": {}}
+        gg = {"n": len(rs), "models": {}, "levels": _bt_level_table(rs), "sig05": _bt_sig_curve(len(rs)), "paired": {},
+              "components": _bt_component_table(rs), "breakdown": _bt_breakdown(rs) if rs else {"by_year": [], "by_mag": []}}
         for m in ("dyn", "st_seis", "st_comb"):
             gg["models"][m] = {}
             for v in ("tau", "tau_nb"):
@@ -5533,7 +5629,8 @@ def _bt_csv(records, p):
     w.writerow(["時刻(JST)", "震源名", "マグニチュード", "発生直前リスク値", "発生直後リスク値(参考用)",
                 "直前Lv", "直後Lv", "震源セル順位(上位%)", "周囲の最大Lv", "高リスク面積比(Lv3以上,%)",
                 "高リスク面積比(周囲込み,Lv3以上,%)", "静的:地震分布 順位(上位%)", "静的:地震分布+活断層 順位(上位%)",
-                "区分", "直前の大地震", "震源緯度", "震源経度", "深さkm", "評価時点(JST)", "基準日時(JST)"])
+                "区分", "直前の大地震", "震源緯度", "震源経度", "深さkm", "評価時点(JST)", "基準日時(JST)"]
+               + [f"成分順位:{RISK_LABELS.get(k, k)}(上位%)" for k in _RISK_HIST_KEYS])
     for r in sorted(records.values(), key=lambda r: r["t_utc"]):
         t = datetime.fromisoformat(r["t_utc"])
         if not (start <= t < end) or r["mag"] < p["min_mag"]:
@@ -5548,7 +5645,8 @@ def _bt_csv(records, p):
                     round(r["st_seis"]["tau"] * 100, 2), round(r["st_comb"]["tau"] * 100, 2),
                     {"independent": "独立", "aftershock": "余震・続発", "unseen": "直前に発生(未観測)"}[r["group"]],
                     "" if pv is None else f"{pv['t_jst']} M{pv['mag']} {pv['place']} {pv['dist_km']}km {pv['gap_days']}日前",
-                    r["lat"], r["lon"], r["depth"], r["eval_jst"], r["anchor_jst"]])
+                    r["lat"], r["lon"], r["depth"], r["eval_jst"], r["anchor_jst"]]
+                   + [("" if not r.get("comp") or k not in r["comp"] else round(r["comp"][k] * 100, 2)) for k in _RISK_HIST_KEYS])
     return "\ufeff" + buf.getvalue()
 
 
@@ -5576,6 +5674,22 @@ def render_riskmap(risk_cells, updated_str):
         gnss_row = ('<div class="chk-row disabled"><input type="checkbox" id="chk_gnss" disabled>'
                     f'<span class="clabel">GNSS変位（地殻変動・現在値）</span><span class="cbadge">{_why}</span></div>')
     gnss_ready_js = "true" if gnss_ready else "false"
+
+    # (v9.21) TEC成分: 現在のセルにTEC値がある時だけ選択可能にする（GNSSと同じ扱い）
+    tec_ready = any("tec" in c["c"] for c in risk_cells)
+    if tec_ready:
+        tec_row = ('<div class="chk-row"><input type="checkbox" id="chk_tec" checked onchange="onToggle(\'tec\')">'
+                   f'<span class="clabel">TEC（電離圏・局所偏差）</span><span class="cweight">w={w["tec"]}</span></div>')
+    else:
+        if not TEC_ENABLED:
+            _twhy = "未設定"
+        elif _tec_cache.get("updating") or not _tec_cache.get("ts"):
+            _twhy = "取得中"
+        else:
+            _twhy = "現在値なし"
+        tec_row = ('<div class="chk-row disabled"><input type="checkbox" id="chk_tec" disabled>'
+                   f'<span class="clabel">TEC（電離圏・局所偏差）</span><span class="cbadge">{_twhy}</span></div>')
+    tec_ready_js = "true" if tec_ready else "false"
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -5697,8 +5811,7 @@ canvas.dChart{{display:block;width:100%}}
       <span class="clabel">プレート境界 応力負荷</span><span class="cweight">w={w['plate']}</span></div>
     <div class="chk-row"><input type="checkbox" id="chk_pressure" onchange="onToggle('pressure')">
       <span class="clabel">気圧偏差</span><span class="cweight">w={w['pressure']}</span></div>
-    <div class="chk-row disabled"><input type="checkbox" disabled>
-      <span class="clabel">TEC（電離圏）</span><span class="cbadge">近日公開</span></div>
+    {tec_row}
     {gnss_row}
   </div>
 
@@ -5722,7 +5835,7 @@ canvas.dChart{{display:block;width:100%}}
   <div class="note">
     重みは選択されたデータのみを使い自動的に再正規化されます。<br>
     セルをクリックすると統合リスク指数と各データの寄与度（内訳）を表示します。<br>
-    GNSS変位は、各セルに半径{GNSS_CELL_RADIUS_KM:.0f}km以内で最も近い電子基準点の直近{GNSS_LOOKBACK_DAYS}日の水平変位（現在値）を割り当て、過去の値とは比べず、変位の大きさ(mm)だけで固定の目盛りでスコア化します（ノイズ水準{GNSS_NOISE_MM:.0f}mm程度で低め、7mm・15mmで高めに評価）。観測点から遠いセルはGNSSを使わず、他の成分だけで評価します。座標値は公表に遅れがあるため、基準日は内訳に表示します。GNSSは「他の成分の水準を超えて大きい時だけ総合値を押し上げ、平常範囲なら総合値を変えない」扱いです（小さい変位を低リスクの証拠とはみなしません）。標準プリセットはETAS・b値・活断層・プレート境界＋GNSS（GNSSが使えない間は前の4つのみ）、「地殻変動」はプレート境界＋GNSSです（GNSSが使えない間はプレート境界のみ）。
+    GNSS変位は、各セルに半径{GNSS_CELL_RADIUS_KM:.0f}km以内で最も近い電子基準点の直近{GNSS_LOOKBACK_DAYS}日の水平変位（現在値）を割り当て、過去の値とは比べず、変位の大きさ(mm)だけで固定の目盛りでスコア化します（ノイズ水準{GNSS_NOISE_MM:.0f}mm程度で低め、7mm・15mmで高めに評価）。観測点から遠いセルはGNSSを使わず、他の成分だけで評価します。座標値は公表に遅れがあるため、基準日は内訳に表示します。GNSSは「他の成分の水準を超えて大きい時だけ総合値を押し上げ、平常範囲なら総合値を変えない」扱いです（小さい変位を低リスクの証拠とはみなしません）。TEC（電離圏）は、現在のTECと直近24時間平均との差から、日本全体の増減（日変化・磁気嵐など）を差し引いた「局所的な偏差(TECU)」を固定の目盛りでスコア化します（2・4・8TECUで低〜高、上限0.70）。学術的に確立した前兆指標ではないため重みは小さく（w={w['tec']}）、GNSSと同じく「他成分を超えた分だけ総合値を押し上げ、平常範囲なら変えない」扱いです。標準プリセットはETAS・b値・活断層・プレート境界＋GNSS＋TEC（GNSS・TECが使えない間は外れます）、「地殻変動」はプレート境界＋GNSSです（GNSSが使えない間はプレート境界のみ）。
   </div>
 </div>
 <div id="mp">
@@ -5773,17 +5886,19 @@ var LABELS = {labels_js};
 var THRESH = {thresh_js};   // (v8.21) レベル境界: 成分選択パターン別に自動キャリブレーション
 var GS = {gs};
 var RISK_COLOR = {{5:'{LEVEL_COLOR[5]}',4:'{LEVEL_COLOR[4]}',3:'{LEVEL_COLOR[3]}',2:'{LEVEL_COLOR[2]}',1:'{LEVEL_COLOR[1]}'}};
-var KEYS = ['etas','bvalue','fault','plate','pressure','gnss'];
+var KEYS = ['etas','bvalue','fault','plate','pressure','tec','gnss'];
 var GNSS_READY = {gnss_ready_js};   // (v9.06) 現在のGNSS値が使えるか
+var TEC_READY = {tec_ready_js};     // (v9.21) 現在のTEC値が使えるか
 
 var PRESETS = {{
-  standard: {{etas:true, bvalue:true, fault:true, plate:true, pressure:false, gnss:true}},   // (v9.07) GNSSが使えない間は自動で外れる
-  all:      {{etas:true, bvalue:true, fault:true, plate:true, pressure:true,  gnss:true}},
-  geo:      {{etas:false,bvalue:false,fault:true, plate:true, pressure:false, gnss:false}},
-  crust:    {{etas:false,bvalue:false,fault:false,plate:true, pressure:false, gnss:true}}
+  standard: {{etas:true, bvalue:true, fault:true, plate:true, pressure:false, tec:true,  gnss:true}},   // (v9.07/9.21) GNSS・TECが使えない間は自動で外れる
+  all:      {{etas:true, bvalue:true, fault:true, plate:true, pressure:true,  tec:true,  gnss:true}},
+  geo:      {{etas:false,bvalue:false,fault:true, plate:true, pressure:false, tec:false, gnss:false}},
+  crust:    {{etas:false,bvalue:false,fault:false,plate:true, pressure:false, tec:false, gnss:true}}
 }};
 var selected = Object.assign({{}}, PRESETS.standard);
 if(!GNSS_READY) selected.gnss = false;   // (v9.07)
+if(!TEC_READY) selected.tec = false;     // (v9.21)
 
 if(window.innerWidth<=768){{
   document.getElementById('panel').classList.add('closed');
@@ -5794,7 +5909,7 @@ var map=L.map('map',{{center:[36,138],zoom:5,preferCanvas:true}});
 {GEOJSON_JS}
 
 var rectLayer = null;
-var COMP_COLOR = {{etas:'#ef4444', bvalue:'#f97316', fault:'#facc15', plate:'#38bdf8', pressure:'#a78bfa', gnss:'#34d399'}};
+var COMP_COLOR = {{etas:'#ef4444', bvalue:'#f97316', fault:'#facc15', plate:'#38bdf8', pressure:'#a78bfa', tec:'#f472b6', gnss:'#34d399'}};
 var lastShownList = [];   // redraw()のたびに更新: [{{cell, comp, lv}}, ...]
 
 function applyCheckboxesFromSelected(){{
@@ -5809,6 +5924,7 @@ function applyPreset(name){{
   if(name !== 'custom'){{
     selected = Object.assign({{}}, PRESETS[name]);
     if(!GNSS_READY) selected.gnss = false;   // (v9.00) GNSSが使えない間は外す（「地殻変動」はプレートのみに戻る）
+    if(!TEC_READY) selected.tec = false;     // (v9.21)
     applyCheckboxesFromSelected();
   }}
   setActivePreset(name);
@@ -5823,25 +5939,28 @@ function onToggle(key){{
 // (v8.21) 過去履歴のある成分(ETAS/b値/活断層/プレート)がそのセルに無い場合は中立0.5で補う。
 // 成分が少ないセルの総合値が極端値に張り付くのを防ぐ（サーバー側のしきい値算出と同じ扱い）。
 var HIST_KEYS = ['etas','bvalue','fault','plate'];   // (v9.06) GNSSはそのセルに無ければ中立補完せず除外する
+// (v9.21) 「押し上げ専用」成分: GNSS・TEC。他成分の水準(base)を超えた分だけ総合を押し上げ、平常範囲なら総合を変えない。
+var BOOST_KEYS = ['gnss','tec'];
 function computeComposite(cell){{
-  var wsum=0, ssum=0, used=[], wmiss=0, g=null;
+  var wsum=0, ssum=0, used=[], wmiss=0, boost={{}};
   KEYS.forEach(function(k){{
     if(!selected[k]) return;
-    if(k === 'gnss'){{ if(cell.c.gnss) g = cell.c.gnss.s; return; }}   // GNSSは下で別扱い
+    if(BOOST_KEYS.indexOf(k) >= 0){{ if(cell.c[k]) boost[k] = cell.c[k].s; return; }}   // 下で別扱い
     var wk = WEIGHTS[k];
     if(cell.c[k]){{ wsum += wk; ssum += wk*cell.c[k].s; used.push(k); }}
     else if(HIST_KEYS.indexOf(k) >= 0){{ wmiss += wk; }}
   }});
-  // (v9.07) GNSSは「他の成分の水準(base)を超えた分だけ」総合を押し上げる。
-  //   平常範囲(baseより小さい)なら base で置き換えるので総合値は変わらない(小さい変位を低リスクの証拠にしない)。
-  //   他の成分が1つも無い時は、GNSSのスコアそのものを使う。
+  // (v9.07/9.21) 押し上げ成分は、baseを超えた分だけ総合を上げる。小さい値を低リスクの証拠にしない。
+  //   baseは「押し上げ成分を入れる前」の他成分の加重平均で固定する(GNSSとTECで順序依存にならない)。
+  //   他の成分が1つも無い時は、そのスコア自体を使う。
   var eff = {{}};
-  if(g !== null){{
-    var base = (wsum > 0) ? (ssum + 0.5*wmiss)/(wsum + wmiss) : null;
-    var ge = (base === null) ? g : Math.max(g, base);
-    eff.gnss = ge;
-    wsum += WEIGHTS.gnss; ssum += WEIGHTS.gnss*ge; used.push('gnss');
-  }}
+  var base = (wsum > 0) ? (ssum + 0.5*wmiss)/(wsum + wmiss) : null;
+  BOOST_KEYS.forEach(function(k){{
+    if(boost[k] === undefined) return;
+    var ge = (base === null) ? boost[k] : Math.max(boost[k], base);
+    eff[k] = ge;
+    wsum += WEIGHTS[k]; ssum += WEIGHTS[k]*ge; used.push(k);
+  }});
   if(wsum<=0) return null;
   var wall = wsum + wmiss;
   return {{score: (ssum + 0.5*wmiss)/wall, used: used, wsum: wall, wmiss: wmiss, eff: eff}};
@@ -5975,6 +6094,13 @@ function showDetail(cell, comp, lv){{
       '<div style="font-size:10px;color:rgba(235,238,245,.46);margin-top:4px">GNSS: ' + g.n +
       '（約' + g.d + 'km）水平' + g.r.toFixed(1) + 'mm/7日　基準日' + g.t +
       ((comp.eff && comp.eff.gnss > g.s + 1e-9) ? '　→ 他成分より大きく総合値を押し上げ' : '　→ 平常範囲のため総合値は変えません') + '</div>';
+  }}
+  if(cell.c.tec && comp.used.indexOf('tec') >= 0){{   // (v9.21) TECの内訳説明
+    var tc = cell.c.tec;
+    document.getElementById('dBreakdown').innerHTML +=
+      '<div style="font-size:10px;color:rgba(235,238,245,.46);margin-top:4px">TEC: 広域成分を除いた局所偏差 ' + tc.r.toFixed(1) + ' TECU' +
+      ((comp.eff && comp.eff.tec > tc.s + 1e-9) ? '　→ 他成分より大きく総合値を押し上げ' : '　→ 平常範囲のため総合値は変えません') +
+      '（実験的指標。地震の前兆として確立したものではありません）</div>';
   }}
   drawBarChart(document.getElementById('dBarCanvas'), labels, contribInt, colors);
 
@@ -6141,7 +6267,7 @@ svg text{fill:rgba(235,238,245,.7);font-size:11px}
 </style></head><body>
 <div id="panel">
   <h2>検証：M6以上バックテスト</h2>
-  <p class="sub">気象庁一元化カタログのM6以上について、発生の少し前の時点でアーカイブと同じ計算を行い、震源が「面積の何%の高リスクセル」に入っていたかをMolchan図で集計します。静的な長期ハザードマップと比較し、余震は分けて評価します。リスク値・レベルは確率ではありません。</p>
+  <p class="sub">気象庁一元化カタログのM6以上について、発生の少し前の時点でアーカイブと同じ計算を行い、震源が「面積の何%の高リスクセル」に入っていたかをMolchan図で集計します。静的な長期ハザードマップと比較し、余震は分けて評価します。リスク値・レベルは確率ではありません。成分別の単独成績・95%信頼区間・年別/規模別の安定性も表示します（v9.21。これらを出すため、保存済みの旧記録は再計算になります）。</p>
   <div class="sec">
     <h3>期間（JST）</h3>
     <div class="field"><label>開始日</label><input type="date" id="pStart"></div>
@@ -6179,6 +6305,8 @@ var COLORS = {dyn:'#60a5fa', st_seis:'#fb923c', st_comb:'#34d399'};
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function pct(x,d){return x==null?'-':(x*100).toFixed(d==null?1:d)+'%'}
+function ciTxt(c){return c?'<br><small>95%CI '+Math.round(c[0]*100)+'〜'+Math.round(c[1]*100)+'%</small>':''}
+function aciTxt(c){return c?'<br><small>95%CI '+c[0].toFixed(2)+'〜'+c[1].toFixed(2)+'</small>':''}
 function params(){
   return {start:$('pStart').value, end:$('pEnd').value, min_mag:$('pMag').value, max_depth_km:$('pDepth').value,
           lead_hours:$('pLead').value, after_hours:$('pAfter').value, rebuild_days:$('pRebuild').value,
@@ -6268,7 +6396,7 @@ function render(){
 
   h+='<div class="card"><h3>指標（'+(S.variant==='tau'?'震源セルのみ':'周囲込み')+'）</h3><div class="scroll"><table><tr><th>モデル</th><th>上位5%以内</th><th>上位10%以内</th><th>上位20%以内</th><th>中央順位</th><th>AUC</th><th>p(10%)</th></tr>';
   ['dyn','st_comb','st_seis'].forEach(function(m){ var x=G.models[m][S.variant].metrics;
-    h+='<tr><td>'+esc(M[m])+'</td><td>'+pct(x.hit5,0)+'（'+x.k5+'/'+x.n+'）</td><td>'+pct(x.hit10,0)+'（'+x.k10+'/'+x.n+'）</td><td>'+pct(x.hit20,0)+'（'+x.k20+'/'+x.n+'）</td><td>上位'+pct(x.median_tau)+'</td><td>'+x.auc.toFixed(3)+'</td><td>'+x.p10+'</td></tr>'; });
+    h+='<tr><td>'+esc(M[m])+'</td><td>'+pct(x.hit5,0)+'（'+x.k5+'/'+x.n+'）</td><td>'+pct(x.hit10,0)+'（'+x.k10+'/'+x.n+'）'+ciTxt(x.ci10)+'</td><td>'+pct(x.hit20,0)+'（'+x.k20+'/'+x.n+'）</td><td>上位'+pct(x.median_tau)+'</td><td>'+x.auc.toFixed(3)+aciTxt(x.auc_ci)+'</td><td>'+x.p10+'</td></tr>'; });
   h+='</table></div><div class="note">「上位10%以内」= 面積の10%だけ警戒したとき、そのうち何%の地震が入っていたか（ランダムなら10%）。AUC=1−平均順位（ランダムで0.5）。p(10%)=ランダムでこれ以上入る確率。</div>';
   h+='<h3 style="margin-top:12px">動的 vs 静的（同じ地震どうしの順位を比較）</h3><div class="scroll"><table><tr><th>比較相手</th><th>動的が上位</th><th>動的が下位</th><th>順位差の中央値</th><th>符号検定p</th></tr>';
   ['st_comb','st_seis'].forEach(function(m){ var x=G.paired[m][S.variant];
@@ -6278,6 +6406,32 @@ function render(){
   h+='<div class="card"><h3>レベル別（動的・実際の運用に近い見方）</h3><div class="scroll"><table><tr><th>レベル以上</th><th>面積比</th><th>的中率(震源セル)</th><th>倍率</th><th>面積比(周囲込み)</th><th>的中率(周囲込み)</th><th>倍率</th></tr>';
   G.levels.forEach(function(r){ h+='<tr><td>'+levelCell(r.level)+'</td><td>'+pct(r.area,2)+'</td><td>'+pct(r.hit,0)+'</td><td>'+(r.lift==null?'-':'×'+r.lift)+'</td><td>'+pct(r.area_nb,2)+'</td><td>'+pct(r.hit_nb,0)+'</td><td>'+(r.lift_nb==null?'-':'×'+r.lift_nb)+'</td></tr>'; });
   h+='</table></div><div class="note">倍率=的中率÷面積比（1ならランダムと同じ）。面積比は評価した各時点の平均。</div></div>';
+
+  // (v9.21) 成分別の単独成績: どの成分が効いているか（重み・成分の取捨の根拠）
+  var comps = G.components || [];
+  if(comps.length){
+    h+="<div class='card'><h3>成分別の単独成績（震源セル・動的の各成分だけで警戒した場合）</h3><div class='scroll'><table><tr><th>成分</th><th>現在の重み</th><th>件数</th><th>AUC</th><th>上位10%以内</th><th>p(10%)</th><th>スコア無し</th></tr>";
+    comps.forEach(function(c){
+      var cls = (c.auc_ci && c.auc_ci[0] > 0.5) ? "lv1" : ((c.auc_ci && c.auc_ci[1] < 0.5) ? "lv4" : "");
+      h+="<tr><td>"+esc(c.label)+"</td><td>"+c.weight+"</td><td>"+c.n+"</td><td class='"+cls+"'>"+c.auc.toFixed(3)+aciTxt(c.auc_ci)+"</td><td>"+pct(c.hit10,0)+"</td><td>"+c.p10+"</td><td>"+pct(c.no_score,0)+"</td></tr>";
+    });
+    h+="</table></div><div class='note'>AUC 0.5=ランダム。緑=95%信頼区間が0.5より上(偶然とは言いにくい)、赤=0.5より下(逆効果)。「スコア無し」=その成分が無く警戒できなかった割合。成分どうしは相関があるので、単独成績が良くても合成で効くとは限りません。重みを変える際はこの表と上の合成成績を併せて見てください。TEC・GNSS・気圧は過去値を保持していないためバックテストの対象外です。</div></div>";
+  }
+  // (v9.21) 年別・規模別の安定性
+  var bd = G.breakdown || {};
+  function bdTable(title, rows){
+    if(!rows || !rows.length) return "";
+    var t="<h3 style='margin-top:12px'>"+title+"</h3><div class='scroll'><table><tr><th></th><th>件数</th><th>動的AUC</th><th>動的 上位10%</th><th>静的(地震+断層)AUC</th><th>静的 上位10%</th></tr>";
+    rows.forEach(function(r){
+      var cls = r.n<5 ? "warn" : "";
+      t+="<tr><td>"+esc(r.label)+"</td><td class='"+cls+"'>"+r.n+"</td><td>"+(r.dyn_auc==null?"-":r.dyn_auc.toFixed(3))+"</td><td>"+pct(r.dyn_hit10,0)+"</td><td>"+(r.st_auc==null?"-":r.st_auc.toFixed(3))+"</td><td>"+pct(r.st_hit10,0)+"</td></tr>";
+    });
+    return t+"</table></div>";
+  }
+  if((bd.by_year||[]).length || (bd.by_mag||[]).length){
+    h+="<div class='card'><h3>安定性（震源セルのみ・区分ごと）</h3>"+bdTable("年別", bd.by_year)+bdTable("規模別", bd.by_mag)+
+       "<div class='note'>特定の年（大地震列があった年など）だけ成績が良い場合、全体の成績はその年に引っ張られています。件数が5件未満の行（黄色）は参考程度です。</div></div>";
+  }
 
   h+='<div class="card"><h3>地震ごとの記録（'+esc(L[S.group])+'）</h3><div class="scroll"><table><tr><th>時刻(JST)</th><th>震源名</th><th>M</th><th>直前</th><th>直後(参考)</th><th>順位</th><th>周囲Lv</th><th>静的順位</th><th>区分</th></tr>';
   var rows=(D.rows||[]).filter(function(r){ return S.group==='all'||r.group===S.group; });
