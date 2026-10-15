@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震リスクマップ v9.21
+地震リスクマップ v9.22
 
 ■ 目的と成功の定義
   統合リスクマップの目的は、地震の「発生時期の予測」ではなく、「M6以上の大きな地震が起きる場所を、
@@ -39,6 +39,9 @@
      共有URL/CSV出力、PWA化。通知は「時期の警報」と誤解されないよう、注目セルの変化として位置づける。
 
 ■ 更新履歴（要点のみ）
+  v9.22 画面サイズへの追従とスマホUI修正: 画面の高さをJSで実測(100vhのままだとスマホのアドレスバー分だけ下が切れる)／
+        スマホはメニューボタンを専用の上部バーに分離(地図のズームボタンや各タブの左上要素と重ならない)／
+        サイドバーが縦に長い時はスクロール／下端のホームバー領域を避ける／「設定・一覧」を開くボタンをズームボタンの下へ移動
   v9.21 TECを統合リスクマップに接続(重み0.08・GNSSと同じ「他成分を超えた分だけ押し上げ」・広域成分を除いた局所偏差を固定目盛りでスコア化・標準/全データプリセットに追加)／
         バックテストに成分別の単独成績・AUCと的中率の95%信頼区間・年別/規模別の安定性を追加(記録形式変更のため旧記録は再計算)
   v9.20 app_35(v9.10: TEC実装更新)と app_38(v9.08: 検証タブ・日付ごとの基準)を統合。両者の変更は互いに独立で、競合なし
@@ -5718,7 +5721,7 @@ body{{display:flex;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%
 #panelClose{{flex-shrink:0;width:22px;height:22px;border:none;border-radius:12px;background:rgba(255,255,255,.18);backdrop-filter:blur(10px) saturate(160%);-webkit-backdrop-filter:blur(10px) saturate(160%);color:rgba(235,238,245,.72);
     cursor:pointer;font-size:13px;line-height:1;display:flex;align-items:center;justify-content:center}}
 #panelClose:hover{{background:rgba(255,255,255,.3);color:#fff}}
-#panelReopen{{position:absolute;top:70px;left:0;z-index:5000;width:34px;height:78px;border:none;
+#panelReopen{{position:absolute;top:96px;left:0;z-index:5000;width:34px;height:78px;border:none;
     border-radius:0 18px 18px 0;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);color:rgba(235,238,245,.62);cursor:pointer;font-size:12px;
     display:none;flex-direction:column;align-items:center;justify-content:center;gap:6px;
     box-shadow:2px 0 8px rgba(0,0,0,.4)}}
@@ -6824,22 +6827,24 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>Earthquake-risk-map v9.20</title>
+  <title>Earthquake-risk-map v9.22</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <meta name="theme-color" content="#05070d">
   <style>
+    :root{--app-h:100vh;--bar-h:0px}
+    @supports (height:100dvh){:root{--app-h:100dvh}}   /* JSで実測値(px)に上書きする */
     *{box-sizing:border-box;margin:0;padding:0}
     html,body{height:100%;overflow:hidden;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif}
     #sidebar{
-      position:fixed;top:0;left:0;width:188px;height:100%;
+      position:fixed;top:0;left:0;width:188px;height:var(--app-h);overflow-y:auto;overscroll-behavior:contain;
       background:rgba(255,255,255,.05);backdrop-filter:blur(30px) saturate(180%);-webkit-backdrop-filter:blur(30px) saturate(180%);border-right:1px solid rgba(255,255,255,.14);
       display:flex;flex-direction:column;padding-top:0;z-index:100;
       transition:transform 0.25s ease;
     }
-    #menuBtn{display:none}
+    #menuBtn,#topbar{display:none}
     #sbOverlay{display:none}
     .app-title{
       padding:14px 14px 12px;
@@ -6884,42 +6889,51 @@ SHELL_HTML = """<!DOCTYPE html>
       background:rgba(20,24,38,.86);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
       border:1px solid rgba(255,255,255,.16);box-shadow:0 4px 16px rgba(0,0,0,.5);pointer-events:none;
     }
-    #main{margin-left:188px;height:100vh;overflow:hidden}
+    #main{margin-left:188px;margin-top:var(--bar-h);height:calc(var(--app-h) - var(--bar-h));overflow:hidden}
     iframe{width:100%;height:100%;border:none;display:none}
     iframe.active{display:block}
 
     @media (max-width:768px){
+      :root{--bar-h:calc(48px + env(safe-area-inset-top,0px))}
+      #topbar{
+        display:flex;align-items:center;gap:10px;
+        position:fixed;top:0;left:0;right:0;height:var(--bar-h);
+        padding:env(safe-area-inset-top,0px) 10px 0;z-index:300;
+        background:rgba(10,14,26,.86);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
+        border-bottom:1px solid rgba(255,255,255,.14);
+      }
+      #topTitle{font-size:13px;font-weight:600;color:#f3f4f6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       #menuBtn{
-        display:flex;align-items:center;justify-content:center;
-        position:fixed;top:10px;left:10px;z-index:300;
+        display:flex;align-items:center;justify-content:center;flex-shrink:0;
         width:38px;height:38px;border-radius:18px;border:none;
-        background:rgba(255,255,255,.14);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);color:#f3f4f6;font-size:18px;
-        box-shadow:0 2px 8px rgba(0,0,0,.5);
+        background:rgba(255,255,255,.14);color:#f3f4f6;font-size:18px;
       }
       #sidebar{
         width:78vw;max-width:280px;
         transform:translateX(-100%);
-        box-shadow:2px 0 16px rgba(0,0,0,.6);
+        box-shadow:2px 0 16px rgba(0,0,0,.6);z-index:320;
+        background:rgba(14,18,32,.97);   /* 背後の上部バー・地図が透けて見えないように */
+        padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
       }
       #sidebar.open{transform:translateX(0)}
       #sbOverlay{
-        display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:99;
+        display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:310;
       }
       #sbOverlay.show{display:block}
-      #main{margin-left:0}
+      #main{margin-left:0;padding-bottom:env(safe-area-inset-bottom,0px)}
       .tab-btn{padding:12px 14px 12px 16px;font-size:14px}
       .tab-btn.active{padding-left:13px}
     }
   </style>
 </head>
 <body>
-  <button id="menuBtn" onclick="toggleSb()">&#9776;</button>
+  <div id="topbar"><button id="menuBtn" onclick="toggleSb()" aria-label="メニュー">&#9776;</button><div id="topTitle">統合リスクマップ</div></div>
   <div id="sbOverlay" onclick="toggleSb()"></div>
   <div id="toast"></div>
   <div id="sidebar">
     <div class="app-title">
       <div>地震リスクマップ</div>
-      <div>v9.20 / 研究用</div>
+      <div>v9.22 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -6994,10 +7008,21 @@ SHELL_HTML = """<!DOCTYPE html>
     <iframe id="f9" src=""></iframe>
   </div>
   <script>
+    // 画面の高さを実測して反映（スマホはアドレスバーの出入りで100vhが実際の表示領域とずれ、下が切れるため）
+    function fitH(){
+      var h = window.innerHeight || document.documentElement.clientHeight;
+      document.documentElement.style.setProperty('--app-h', Math.round(h) + 'px');
+    }
+    fitH();
+    window.addEventListener('resize', fitH);
+    window.addEventListener('orientationchange', function(){ setTimeout(fitH, 250); });
+    if(window.visualViewport) window.visualViewport.addEventListener('resize', fitH);
+
     var URLS=['riskmap','history','etas','bvalue','faultmap','tec','gnss','pressure','snapshots','backtest'];
     var loaded=[true,false,false,false,false,false,false,false,false,false];
     function sw(idx){
       curTab=idx;
+      var tt=document.getElementById('topTitle'); if(tt && typeof TAB_LABELS!=='undefined') tt.textContent=TAB_LABELS[idx];
       document.querySelectorAll('.tab-btn').forEach(function(b,i){b.classList.toggle('active',i===idx)});
       document.querySelectorAll('iframe').forEach(function(f,i){f.classList.toggle('active',i===idx)});
       if(!loaded[idx]){
