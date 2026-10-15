@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震リスクマップ v9.22
+地震リスクマップ v9.23
 
 ■ 目的と成功の定義
   統合リスクマップの目的は、地震の「発生時期の予測」ではなく、「M6以上の大きな地震が起きる場所を、
@@ -39,6 +39,8 @@
      共有URL/CSV出力、PWA化。通知は「時期の警報」と誤解されないよう、注目セルの変化として位置づける。
 
 ■ 更新履歴（要点のみ）
+  v9.23 一元化カタログの探索を強化: 置き場所を起動場所(cwd)だけでなくアプリの場所基準でも探す／環境変数JMA_CATALOG_DIRは絶対パス可／
+        ファイル名の大文字小文字・拡張子(.txt/.dat/.zip/なし)・サブフォルダ・接尾辞を許容／見つからない時は探した場所と中身をエラーとバックテスト画面に表示
   v9.22 画面サイズへの追従とスマホUI修正: 画面の高さをJSで実測(100vhのままだとスマホのアドレスバー分だけ下が切れる)／
         スマホはメニューボタンを専用の上部バーに分離(地図のズームボタンや各タブの左上要素と重ならない)／
         サイドバーが縦に長い時はスクロール／下端のホームバー領域を避ける／「設定・一覧」を開くボタンをズームボタンの下へ移動
@@ -670,13 +672,82 @@ _JMA_CATALOG_MAXI = {"1": "1", "2": "2", "3": "3", "4": "4",
                      "A": "5-", "B": "5+", "C": "6-", "D": "6+", "7": "7"}
 _jma_catalog_span_cache = {}   # path -> ((mtime, size), first_utc, last_utc)
 
+_JMA_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_jma_listing_cache = {}   # dir -> (mtime, [ファイル名...])
+
+def _jma_catalog_dirs():
+    """(v9.23) カタログを探すフォルダの候補（実在するものだけ・重複なし）。
+    従来は相対パス data/jma_catalog を『起動した場所(cwd)』から探していたため、起動場所が違うと見つからなかった。
+    環境変数 JMA_CATALOG_DIR（絶対パス可）→ アプリの置き場所基準 → cwd基準 → アプリ直下の jma_catalog の順に探す。"""
+    cands = []
+    d = JMA_CATALOG_DIR
+    if os.path.isabs(d):
+        cands.append(d)
+    else:
+        cands += [os.path.join(_JMA_APP_DIR, d), os.path.join(os.getcwd(), d)]
+    cands += [os.path.join(_JMA_APP_DIR, "jma_catalog"), os.path.join(_JMA_APP_DIR, "data", "jma_catalog")]
+    out, seen = [], set()
+    for c in cands:
+        c = os.path.normpath(c)
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+def _jma_listing(d):
+    """フォルダ内の（サブフォルダも含む）ファイル一覧。フォルダの更新時刻が変わるまで使い回す。"""
+    try:
+        mt = os.path.getmtime(d)
+    except OSError:
+        return []
+    hit = _jma_listing_cache.get(d)
+    if hit and hit[0] == mt:
+        return hit[1]
+    files = []
+    try:
+        for root, _dirs, names in os.walk(d):
+            if root[len(d):].count(os.sep) > 2:   # 深入りしない
+                continue
+            for n in names:
+                files.append(os.path.join(root, n))
+    except OSError:
+        pass
+    _jma_listing_cache[d] = (mt, files)
+    return files
+
+_JMA_EXT_PREF = {"": 0, ".txt": 1, ".dat": 2, ".zip": 3}
+
 def _jma_catalog_find(year):
-    """JMA_CATALOG_DIR 内の年別ファイルのパスを返す（展開済み優先、無ければzip）。無ければ None。"""
-    base = os.path.join(JMA_CATALOG_DIR, f"h{year}")
-    for path in (base, base + ".txt", base + ".zip"):
-        if os.path.isfile(path):
-            return path
-    return None
+    """年別ファイルのパスを返す（展開済み優先、無ければzip）。無ければ None。
+    (v9.23) 大文字小文字・拡張子(.txt/.dat/.zip/なし)・サブフォルダ・多少の接尾辞(h2023_xxx.zip 等)を許容する。
+    ファイル名は h2023 / H2023.TXT / h2023.zip など。"""
+    import re
+    pat = re.compile(r"^h?%d(?!\d)" % int(year), re.I)
+    best = None
+    for d in _jma_catalog_dirs():
+        for path in _jma_listing(d):
+            name = os.path.basename(path)
+            if not pat.match(name):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in _JMA_EXT_PREF:
+                continue
+            exact = 0 if re.fullmatch(r"h?%d(\.\w+)?" % int(year), name, re.I) else 1
+            key = (exact, _JMA_EXT_PREF[ext], len(path))
+            if best is None or key < best[0]:
+                best = (key, path)
+    return best[1] if best else None
+
+def _jma_catalog_diagnose():
+    """(v9.23) 見つからないときの原因調査用: どこを探し、何が置かれているかを文字列で返す。"""
+    lines = []
+    for d in _jma_catalog_dirs():
+        if os.path.isdir(d):
+            files = sorted(os.path.basename(x) for x in _jma_listing(d))
+            lines.append(f"{d} : あり（{len(files)}ファイル）" + (" 例: " + ", ".join(files[:6]) if files else "（空）"))
+        else:
+            lines.append(f"{d} : フォルダが存在しません")
+    return " / ".join(lines)
 
 def _jma_catalog_iter_lines(path):
     """年別ファイルを1行ずつ読む（zipの場合は中の最初のファイルを展開せずに読む）。"""
@@ -5113,7 +5184,8 @@ def _bt_load_events(start_utc, end_utc, min_mag, prev_mag):
     余震判定のため、start より BT_SEQ_MAX_DAYS 日前から読む。"""
     cov = _jma_catalog_coverage()
     if not cov:
-        raise RuntimeError("一元化カタログ(data/jma_catalog/ の年別ファイル)が見つかりません")
+        raise RuntimeError("一元化カタログ(data/jma_catalog/ の年別ファイル h2023 など)が見つかりません。探した場所: "
+                           + _jma_catalog_diagnose() + "。ファイルを置くか、環境変数 JMA_CATALOG_DIR で置き場所を指定してください")
     if not cov["contiguous"]:
         raise RuntimeError(f"年別ファイルが連続していません（{cov['years'][0]}〜{cov['years'][-1]} の欠けを確認してください）")
     lo = max(start_utc - timedelta(days=BT_SEQ_MAX_DAYS), cov["first"])
@@ -6337,7 +6409,7 @@ function init(){
     ['Mag:min_mag','Depth:max_depth_km','Lead:lead_hours','After:after_hours','Rebuild:rebuild_days','Step:calib_step_hours','Prev:prev_mag'].forEach(function(s){
       var a=s.split(':'); if(p[a[1]]!=null) $('p'+a[0]).value=p[a[1]];
     });
-    $('covHint').textContent = d.coverage ? ('カタログ収録: '+d.coverage.first+' 〜 '+d.coverage.last+'（基準に約125日必要なため、先頭から約4か月ぶんは評価できません）') : 'カタログ(data/jma_catalog/)が見つかりません';
+    $('covHint').innerHTML = d.coverage ? ('カタログ収録: '+d.coverage.first+' 〜 '+d.coverage.last+'（基準に約125日必要なため、先頭から約4か月ぶんは評価できません）') : ('<span style="color:#fca5a5">一元化カタログ(h2023 など年別ファイル)が見つかりません。</span><br>'+esc(d.catalog_diag||''));
     if(d.job && d.job.running){ watch(); }
     else if(d.has_records){ loadResult(); }
   }).catch(function(e){ setStat('初期化に失敗: '+esc(e.message), true) });
@@ -6827,7 +6899,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>Earthquake-risk-map v9.22</title>
+  <title>Earthquake-risk-map v9.23</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
@@ -6933,7 +7005,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震リスクマップ</div>
-      <div>v9.22 / 研究用</div>
+      <div>v9.23 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -7670,7 +7742,8 @@ def backtest_info():
     return {"coverage": None if not cov else {"first": cov["first"].astimezone(JST).strftime("%Y-%m-%d"),
                                               "last": cov["last"].astimezone(JST).strftime("%Y-%m-%d"),
                                               "contiguous": cov["contiguous"]},
-            "defaults": BT_DEFAULT_PARAMS, "last_params": last, "job": job, "has_records": has}
+            "defaults": BT_DEFAULT_PARAMS, "last_params": last, "job": job, "has_records": has,
+            "catalog_diag": None if cov else _jma_catalog_diagnose()}
 
 @app.route("/backtest/start", methods=["POST"])
 def backtest_start():
