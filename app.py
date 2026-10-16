@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震リスクマップ v9.30
+地震リスクマップ v9.40
 
 ■ 目的と成功の定義
   統合リスクマップの目的は、地震の「発生時期の予測」ではなく、「M6以上の大きな地震が起きる場所を、
@@ -39,6 +39,11 @@
      共有URL/CSV出力、PWA化。通知は「時期の警報」と誤解されないよう、注目セルの変化として位置づける。
 
 ■ 更新履歴（要点のみ）
+  v9.40 新タブ「長期の地震分布」を追加(バックテストの静的ハザードと同じ作り方: 過去10年のM4.5以上を平滑化して順位づけ。
+        「地震分布のみ」「＋活断層への近さ」の切替、M6以上の震央の重ね表示。一元化カタログ優先・足りない期間はUSGS)／
+        サイドバーをバックテストの区分に合わせて整理: 動的(統合/地震活動/観測データ)・静的(長期)・検証ログ／
+        各タブ内に再計算アイコン(SVG。絵文字は使わない)を追加し、何を再計算するかをツールチップとサイドバーに表示／
+        アーカイブ・バックテストの実行ボタンにも同じアイコンを付与
   v9.30 バックテストタブを目的(大地震を高リスクの場所に集める/低リスクで起きた地震に何の情報があれば高められたか)に合わせて作り直し:
         ①結論(的中率・ランダム比・静的との比較を平易な文で表示。「高リスク」とみなす範囲を上位10/20/30%から選択)／
         ②見逃し分析(見逃しの原因の内訳、ETAS・b値・活断層・プレート・静的ハザード・周囲拡大のどれなら入っていたか、
@@ -81,6 +86,8 @@
   7. GNSS         - 地殻変動 (GEONET SFTP実データ変位ベクトル、未設定時はプレースホルダー)
   8. 海面気圧     - アメダス海面気圧マップ
   10. 検証       - M6以上のバックテスト(Molchan図)。静的ハザードとの比較、余震は分けて評価。CSV出力あり
+  11. 長期の地震分布 - 過去10年のM4.5以上の地震分布(静的ハザード。バックテストの比較対象と同じ作り方)。＋活断層への近さ、M6以上の震央
+  ※サイドバーの区分(v9.40): 動的=統合リスクマップ/地震履歴・ETAS・b値/TEC・GNSS・海面気圧、静的=長期の地震分布・活断層・プレート境界、検証・ログ=バックテスト・アーカイブ
   9. アーカイブ   - 日時指定で、その時点から過去1か月分の地震データで統合リスクマップを再計算（GNSSは未実装）
                   （直近60日以内はJMA/P2P統合データ、それより古い日時は気象庁一元化震源カタログ
                     (data/jma_catalog/ のファイル)、無ければUSGS過去カタログを都度取得）
@@ -369,6 +376,63 @@ GEOJSON_JS = """
     fetch('https://raw.githubusercontent.com/dataofjapan/land/master/japan.geojson')
       .then(r=>r.json())
       .then(d=>L.geoJSON(d,{interactive:false,style:{fillOpacity:0,color:'#555',weight:1}}).addTo(map));"""
+
+# ── (v9.40) 各タブ内の「再計算」アイコン ─────────────────
+# サイドバーの「このタブを再計算」だけでは何が再計算されるのか分かりにくいため、各タブの見出し(更新時刻の横)に
+# SVGのアイコンボタンを置く。押すと親画面(サイドバー側)の recalcByName() を呼び、同じ再計算を実行する。
+# 絵文字は使わず、インラインSVGで描く。ツールチップに「再計算の範囲」を出す。
+_RECALC_ICON_SVG = ('<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" '
+                    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+                    '<polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>')
+
+_RECALC_SCOPE = {
+    "riskmap":  "保存済みの地震データからETAS・b値を作り直し、活断層/プレート境界の応力負荷・気圧・TEC・レベル基準(過去65日)まで再計算します。約2分。",
+    "history":  "保存済みの地震データ(quakes.csv)から、地震履歴・ETAS・b値の元データを作り直します。APIの再取得はしません。",
+    "etas":     "保存済みの地震データからETAS・b値を作り直し、レベル基準(過去65日)も再計算します。",
+    "bvalue":   "保存済みの地震データからETAS・b値を作り直します。",
+    "faultmap": "活断層(GEM)・プレート境界のデータを取得し直します。",
+    "tec":      "NICTからTEC(電離圏全電子数)を取得し直します。",
+    "gnss":     "GEONETの電子基準点の変位を取得し直します。",
+    "pressure": "気象庁アメダスの海面気圧を取得し直します。",
+    "longterm": "過去10年・M4.5以上の地震分布(と活断層への近さ)を作り直します。一元化カタログ(無ければUSGS)を読むため、数十秒かかります。",
+}
+_TAB_URLS = ["riskmap", "history", "etas", "bvalue", "faultmap", "tec", "gnss", "pressure", "snapshots", "backtest", "longterm"]
+
+def _tab_scopes_json():
+    """サイドバーに出す「このボタンで何を再計算するか」(_TAB_URLS と同じ順)。"""
+    d = dict(_RECALC_SCOPE)
+    d["snapshots"] = "このタブは、日時を入力して「この時点のリスクマップを取得」を押すとその時点で再計算します。"
+    d["backtest"] = "このタブは、左側で期間を指定して「実行」を押すと計算します。このボタンでは動きません。"
+    return json.dumps([d.get(u, "") for u in _TAB_URLS], ensure_ascii=False)
+
+_RECALC_SNIPPET = """<style>
+.rcbtn{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;font-size:11.5px;font-weight:600;line-height:1.2;color:#dbeafe;cursor:pointer;font-family:inherit;border:1px solid rgba(255,255,255,.24);border-radius:12px;background:rgba(10,132,255,.3);vertical-align:middle;white-space:nowrap}
+.rcbtn:hover{filter:brightness(1.2)}
+.rcbtn:disabled{opacity:.6;cursor:default;filter:none}
+.rcbtn svg{flex-shrink:0}
+.rcbtn.busy svg{animation:rcspin 1s linear infinite}
+@keyframes rcspin{to{transform:rotate(360deg)}}
+</style>
+<script>
+function rcGo(n){
+  try{
+    if(window.parent && window.parent!==window && typeof window.parent.recalcByName==='function'){ window.parent.recalcByName(n); return; }
+  }catch(e){}
+  document.querySelectorAll('.rcbtn').forEach(function(b){ b.disabled=true; b.classList.add('busy'); });
+  fetch('/recalc/'+n,{method:'POST'}).then(function(r){return r.json()}).then(function poll(){
+    fetch('/recalc/'+n+'/status').then(function(r){return r.json()}).then(function(st){
+      if(st.running){ setTimeout(poll,1500); } else { location.reload(); }
+    });
+  }).catch(function(){ location.reload(); });
+}
+</script>"""
+
+def _recalc_btn_html(name):
+    """タブ内に置く再計算ボタン(アイコン＋「再計算」)。ツールチップに再計算の範囲を出す。"""
+    scope = _RECALC_SCOPE.get(name, "").replace("&", "&amp;").replace('"', "&quot;")
+    return (f'<button type="button" class="rcbtn" data-rc="{name}" title="再計算の範囲: {scope}" '
+            f'aria-label="このタブを再計算" onclick="rcGo(\'{name}\')">{_RECALC_ICON_SVG}再計算</button>') + _RECALC_SNIPPET
+
 
 
 # ══════════════════════════════════════════════════════
@@ -2317,7 +2381,7 @@ thead th{{padding:6px 5px;font-size:10px;color:rgba(235,238,245,.62);text-align:
       <h2>統合地震履歴（直近31日: {total}件 / 有感:{felt_n}件）</h2>
       <button id="lpClose" onclick="toggleHistoryPanel()" title="地震一覧を閉じる">✕</button>
     </div>
-    <p>更新: {updated_str}</p>
+    <p>更新: {updated_str} {_recalc_btn_html('history')}</p>
   </div>
   <div id="fbar">
     <button class="fb on" onclick="filter('all',this)">すべて</button>
@@ -2487,7 +2551,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
   <span>表示レイヤー:</span>
   <button class="tog on" id="togEtas" onclick="toggleLayer('etas',this)">ETASグリッド</button>
   <button class="tog" id="togRecent" onclick="toggleLayer('recent',this)">直近72h地震</button>
-  <span style="margin-left:auto;color:rgba(235,238,245,.46);font-size:11px">更新: {updated_str}</span>
+  <span style="margin-left:auto;display:inline-flex;align-items:center;gap:8px;color:rgba(235,238,245,.46);font-size:11px">更新: {updated_str}{_recalc_btn_html('etas')}</span>
 </div>
 <div id="map"></div>
 <div id="lg">
@@ -2619,7 +2683,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
   <div class="stat">b平均: <span>{b_mean}</span></div>
   <div class="stat">b最小: <span style="color:#ef4444">{b_min}</span></div>
   <div class="stat">b最大: <span style="color:#60a5fa">{b_max}</span></div>
-  <div style="margin-left:auto;color:rgba(235,238,245,.46)">更新: {updated_str}</div>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:10px;color:rgba(235,238,245,.46)">更新: {updated_str}{_recalc_btn_html('bvalue')}</div>
 </div>
 <div id="map"></div>
 <div id="lg">
@@ -3118,7 +3182,7 @@ body{{background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-g
 </style></head><body>
 <div id="hdr">
   <h2>TEC（電離圏全電子数）モニタリング</h2>
-  <p>NICT GEONET TEC / {date_str} / 更新: {updated_str} / 取得状況: {status_html}</p>
+  <p>NICT GEONET TEC / {date_str} / 更新: {updated_str} / 取得状況: {status_html} {_recalc_btn_html('tec')}</p>
 </div>
 <div id="body">
   {"<div id='map'></div>" if grid else ""}
@@ -3712,7 +3776,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
 <div id="hdr">
   <div>
     <h2>GNSS 地殻変動モニタリング（GEONET）</h2>
-    <p>国土地理院 電子基準点ネットワーク / {date_str} / 地震データ更新: {updated_str} / GNSS更新: {gnss_updated_str}</p>
+    <p>国土地理院 電子基準点ネットワーク / {date_str} / 地震データ更新: {updated_str} / GNSS更新: {gnss_updated_str} {_recalc_btn_html('gnss')}</p>
   </div>
   <span class="hbadge" style="background:{badge_bg};color:{badge_fg};margin-left:auto">{badge_txt}</span>
 </div>
@@ -4055,7 +4119,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
   <div class="stat">最低: <span style="color:#c084fc">{pr_min:.1f}hPa</span></div>
   <div class="stat">最高: <span style="color:#93c5fd">{pr_max:.1f}hPa</span></div>
   <div class="stat">平均: <span>{pr_mean}hPa</span></div>
-  <div style="margin-left:auto;color:rgba(235,238,245,.46)">{time_label} / 更新: {updated_str}</div>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:10px;color:rgba(235,238,245,.46)">{time_label} / 更新: {updated_str}{_recalc_btn_html('pressure')}</div>
 </div>
 <div id="map"></div>
 <div id="lg">
@@ -4210,7 +4274,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
   <b>活断層・プレート境界マップ</b>
   <button class="tog on" id="togFault" onclick="toggleFault(this)">活断層</button>
   <button class="tog on" id="togPlate" onclick="togglePlate(this)">プレート境界</button>
-  <div style="margin-left:auto;color:rgba(235,238,245,.46)">更新: {updated_str}</div>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:10px;color:rgba(235,238,245,.46)">更新: {updated_str}{_recalc_btn_html('faultmap')}</div>
 </div>
 <div id="mp">
   <div id="map"></div>
@@ -5312,6 +5376,312 @@ def _bt_static_vectors(st, eval_epoch):
     return {"st_seis": seis, "st_comb": comb}
 
 
+# ══════════════════════════════════════════════════════
+# 長期の地震分布タブ (v9.40)
+# バックテストの「静的ハザード」と同じ作り方を、今日時点の地図として見られるようにしたもの。
+#   過去 BT_STATIC_LOOKBACK_YEARS 年の M>=BT_STATIC_MIN_MAG の地震を 0.5°格子に数え、
+#   ガウス平滑(_bt_smooth)した値の順位 =「長期の地震分布」。
+#   活断層への近さを 0.3 の重みで加えたものが「＋活断層への近さ」(バックテストの st_comb)。
+# 動的(統合リスクマップ)と違い、日々は変わらない背景の分布。確率ではない。
+# 気象庁一元化カタログ(data/jma_catalog/)があれば優先し、カタログが覆わない期間だけUSGS(M4.5以上)で補う。
+# ══════════════════════════════════════════════════════
+LONGTERM_TTL_SEC = 24 * 3600
+LONGTERM_EVENT_MAG = 6.0          # 地図に重ねる震央の下限M
+LONGTERM_MAX_EVENTS = 300
+_longterm_cache = {"data": None, "ts": 0.0, "error": None, "err_ts": 0.0, "running": False, "started": 0.0}
+_longterm_lock = threading.Lock()
+
+def _longterm_fetch_usgs(start_utc, end_utc, min_mag):
+    """USGSから M>=min_mag の地震を取得(ETAS対象領域内のみ)。2年ずつ区切って取る。"""
+    lat_min, lat_max, lon_min, lon_max = ETAS_FETCH_BBOX
+    out, seen = [], set()
+    cur = start_utc
+    while cur < end_utc:
+        nxt = min(cur + timedelta(days=730), end_utc)
+        url = (f"https://earthquake.usgs.gov/fdsnws/event/1/query"
+               f"?format=geojson&starttime={cur.strftime('%Y-%m-%dT%H:%M:%S')}"
+               f"&endtime={nxt.strftime('%Y-%m-%dT%H:%M:%S')}"
+               f"&minlatitude={lat_min}&maxlatitude={lat_max}"
+               f"&minlongitude={lon_min}&maxlongitude={lon_max}"
+               f"&minmagnitude={min_mag}&orderby=time&limit=20000")
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        for feat in resp.json().get("features", []):
+            try:
+                props = feat["properties"]; coords = feat["geometry"]["coordinates"]
+                lat, lon = float(coords[1]), float(coords[0])
+                if not in_etas_region(lat, lon):
+                    continue
+                t = datetime.fromtimestamp(props["time"] / 1000, tz=timezone.utc)
+                key = (props["time"], round(lat, 3), round(lon, 3))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"time": t.isoformat(), "lat": lat, "lon": lon,
+                            "mag": float(props["mag"]), "depth": float(coords[2]), "source": "usgs"})
+            except Exception:
+                continue
+        cur = nxt
+    return out
+
+def _longterm_fault_pct():
+    """各セルの活断層への近さ(近いほど1に近い順位)。作れなければ None。"""
+    try:
+        fpts = _decimate_points(_flatten_line_points(get_japan_active_faults()), FSP.MAX_POINTS)
+        d = _min_dist_km_grid(fpts)
+        if d:
+            fd = np.array([d.get(k, np.inf) for k in _BT_KEYS], dtype=float)
+            return _bt_pct_rank(-fd)
+    except Exception as e:
+        print(f"[長期の地震分布] 活断層への近さを作れません（『＋活断層』は表示しません）: {e}")
+    return None
+
+def _lt_area_tau(vec):
+    """面積(緯度で補正)で重みづけした順位τ。小さいほど上位(0=最上位, 1=最下位)。"""
+    vec = np.asarray(vec, dtype=float)
+    order = np.argsort(-vec, kind="stable")
+    w = _BT_W[order]
+    cum = np.cumsum(w)
+    tau = np.empty(len(vec))
+    tau[order] = (cum - w / 2.0) / _BT_WTOT
+    return tau
+
+def _longterm_build():
+    """長期の地震分布を作って dict で返す(失敗したら例外)。"""
+    end_utc = datetime.now(timezone.utc)
+    start_utc = end_utc - timedelta(days=365.25 * BT_STATIC_LOOKBACK_YEARS)
+    qs, srcs, warnings, gaps = [], [], [], []
+    cov = None
+    try:
+        cov = _jma_catalog_coverage()
+    except Exception as e:
+        print(f"[長期の地震分布] 一元化カタログの確認に失敗: {e}")
+    got = None
+    if cov:
+        s0 = max(start_utc, cov["first"]); e0 = min(end_utc, cov["last"])
+        if s0 < e0:
+            got = fetch_quakes_jma_catalog_range(s0, e0, min_mag=BT_STATIC_MIN_MAG)
+            if got is not None:
+                qs += got
+                srcs.append({"name": "気象庁一元化カタログ", "start": _bt_jst(s0)[:10], "end": _bt_jst(e0)[:10], "n": len(got)})
+                if s0 - start_utc > timedelta(days=1):
+                    gaps.append((start_utc, s0))
+                if end_utc - e0 > timedelta(days=1):
+                    gaps.append((e0, end_utc))
+    if got is None:
+        gaps = [(start_utc, end_utc)]
+    for a, b in gaps:
+        try:
+            u = _longterm_fetch_usgs(a, b, BT_STATIC_MIN_MAG)
+            qs += u
+            srcs.append({"name": "USGS", "start": _bt_jst(a)[:10], "end": _bt_jst(b)[:10], "n": len(u)})
+        except Exception as e:
+            if got is None:
+                raise RuntimeError(f"地震カタログを取得できませんでした（一元化カタログ data/jma_catalog/ が無く、USGSも失敗: {e}）")
+            warnings.append(f"{_bt_jst(a)[:10]}〜{_bt_jst(b)[:10]}はUSGSの取得に失敗したため含まれていません")
+    if not qs:
+        raise RuntimeError("対象期間の地震が0件でした")
+
+    cnt = np.zeros(_BT_N)
+    for q in qs:
+        i = _bt_cell_index(q["lat"], q["lon"])
+        if i is not None:
+            cnt[i] += 1
+    grid = np.zeros(_BT_SHAPE)
+    grid[_BT_CI, _BT_CJ] = cnt
+    seis = _bt_smooth(grid)[_BT_CI, _BT_CJ]
+    fault_pct = _longterm_fault_pct()
+    ts = _lt_area_tau(seis)
+    ts[seis <= 1e-12] = 1.0                      # 近くに地震が無いセルは色を付けない
+    tc = None
+    if fault_pct is not None:
+        comb = BT_STATIC_W_SEIS * _bt_pct_rank(seis) + BT_STATIC_W_FAULT * fault_pct
+        tc = _lt_area_tau(comb)
+
+    cells = []
+    for i, key in enumerate(_BT_KEYS):
+        keep = ts[i] <= 0.6 or (tc is not None and tc[i] <= 0.6)
+        if not keep:
+            continue
+        cells.append([round(key[0] * RISK_GRID_SIZE, 4), round(key[1] * RISK_GRID_SIZE, 4), int(cnt[i]),
+                      round(float(ts[i]), 4), (round(float(tc[i]), 4) if tc is not None else None)])
+    big = sorted((q for q in qs if q["mag"] >= LONGTERM_EVENT_MAG), key=lambda q: -q["mag"])[:LONGTERM_MAX_EVENTS]
+    events = [[round(q["lat"], 3), round(q["lon"], 3), round(q["mag"], 1), datetime.fromisoformat(q["time"].replace("Z", "+00:00")).astimezone(JST).strftime("%Y-%m-%d")] for q in big]
+    n_sources = {s["name"] for s in srcs}
+    print(f"[長期の地震分布] 作成: {len(qs)}件 / セル{len(cells)} / 出典 {', '.join(sorted(n_sources))}")
+    return {"cells": cells, "events": events, "gs": RISK_GRID_SIZE, "n_events": len(qs),
+            "years": BT_STATIC_LOOKBACK_YEARS, "min_mag": BT_STATIC_MIN_MAG, "event_mag": LONGTERM_EVENT_MAG,
+            "has_fault": tc is not None, "sources": srcs, "warnings": warnings,
+            "period": f"{_bt_jst(start_utc)[:10]}〜{_bt_jst(end_utc)[:10]}",
+            "built": datetime.now(JST).strftime("%Y-%m-%d %H:%M JST")}
+
+def _longterm_run():
+    """作成してキャッシュへ入れる(running は呼び出し側が先に立てておく)。失敗は例外のまま投げる。"""
+    try:
+        d = _longterm_build()
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        with _longterm_lock:
+            _longterm_cache.update(error=(str(e) or e.__class__.__name__), err_ts=time.time(), running=False)
+        raise
+    with _longterm_lock:
+        _longterm_cache.update(data=d, ts=time.time(), error=None, running=False)
+    return d
+
+def _longterm_job():
+    try:
+        _longterm_run()
+    except Exception:
+        pass
+
+def _longterm_view():
+    """/longterm/data の中身。無い・古いときは背景スレッドで作り始める。"""
+    start = False
+    with _longterm_lock:
+        c = _longterm_cache
+        stale = c["data"] is None or time.time() - c["ts"] > LONGTERM_TTL_SEC
+        retry_ok = c["error"] is None or time.time() - c["err_ts"] > 600
+        if stale and not c["running"] and retry_ok:
+            c.update(running=True, started=time.time(), error=None)
+            start = True
+        if c["data"] is not None:
+            view = dict(c["data"]); view["status"] = "ready"; view["refreshing"] = c["running"]
+        elif c["error"]:
+            view = {"status": "error", "error": c["error"]}
+        else:
+            view = {"status": "running", "elapsed": round(time.time() - c["started"], 1)}
+    if start:
+        threading.Thread(target=_longterm_job, daemon=True).start()
+    return view
+
+def render_longterm(updated_str):
+    html = r"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+__LEAFLET__
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{display:flex;flex-direction:column;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif;color:#f3f4f6}
+#hdr{padding:8px 16px;background:rgba(255,255,255,.06);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);border-bottom:1px solid rgba(255,255,255,.14);flex-shrink:0;display:flex;align-items:center;gap:10px;font-size:12px;color:rgba(235,238,245,.62);flex-wrap:wrap}
+#hdr b{color:#f3f4f6;font-size:14px}
+.tog{padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;border:none;border-radius:12px;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);color:rgba(235,238,245,.62)}
+.tog.on{background:rgba(10,132,255,.55);color:#fff}
+.tog:disabled{opacity:.4;cursor:default}
+#mp{flex:1;overflow:hidden;position:relative}
+#map{width:100%;height:100%}
+.glass{background:rgba(26,29,44,.55);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);border:1px solid rgba(255,255,255,.18)}
+#lg{position:absolute;bottom:20px;left:20px;z-index:1000;padding:11px 14px;border-radius:18px;font-size:11px;line-height:1.85;max-width:300px}
+#lg small{color:rgba(235,238,245,.55);line-height:1.6;display:block}
+#state{position:absolute;top:14px;right:56px;z-index:1000;padding:6px 12px;border-radius:14px;font-size:11px;color:rgba(235,238,245,.75);max-width:60vw}
+#state.err{color:#fca5a5}
+.sw{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-1px;margin-right:5px;opacity:.85}
+@media (max-width:768px){
+  #hdr{gap:6px;padding:6px 10px}
+  #hdr>div[style*="margin-left:auto"]{flex-basis:100%;order:5;margin-left:0!important}
+  #lg{left:8px;bottom:8px;right:8px;max-width:none;font-size:10.5px;padding:9px 11px;line-height:1.7}
+  #state{right:8px;top:8px}
+}
+</style></head><body>
+<div id="hdr">
+  <b>長期の地震分布</b>
+  <button class="tog on" id="mSeis" onclick="setMode('seis')">地震分布のみ</button>
+  <button class="tog" id="mComb" onclick="setMode('comb')" disabled>＋活断層への近さ</button>
+  <button class="tog" id="tEv" onclick="toggleEv(this)" disabled>M6以上の震央</button>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:10px;color:rgba(235,238,245,.46)">作成: <span id="built">―</span> __RCBTN__</div>
+</div>
+<div id="mp">
+  <div id="map"></div>
+  <div id="state" class="glass">計算中…</div>
+  <div id="lg" class="glass">
+    <b>長期の地震分布（静的）</b><br>
+    <span id="lgTiers"></span>
+    <small id="lgNote">過去の地震の数から作る、日々は変わらない背景の分布です。地震の発生確率ではありません。色が付いていない場所は、上位40%の外です。</small>
+    <small id="lgSrc"></small>
+  </div>
+</div>
+<script>
+var map=L.map('map',{center:[36,138],zoom:5,preferCanvas:true,zoomControl:false});
+L.control.zoom({position:'topright'}).addTo(map);
+__DARK_TILE__
+__GEOJSON__
+
+var gs=__GS__;
+var TIERS=[[0.05,'#ff2d55','上位5%'],[0.10,'#ff7a1a','上位10%'],[0.20,'#ffb703','上位20%'],[0.30,'#ffe066','上位30%'],[0.40,'#bfe3ff','上位40%']];
+var D=null, mode='seis', cellLayer=L.layerGroup().addTo(map), evLayer=L.layerGroup();
+var polls=0;
+
+function pct(t){ var p=t*100; return p<10 ? p.toFixed(1) : String(Math.round(p)); }
+function esc(s){ return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]}); }
+function tierOf(t){ for(var i=0;i<TIERS.length;i++){ if(t<=TIERS[i][0]) return i; } return -1; }
+function setState(msg,err){ var s=document.getElementById('state'); s.style.display='block'; s.className='glass'+(err?' err':''); s.textContent=msg; }
+
+function legend(){
+  var h='';
+  TIERS.forEach(function(t){ h+='<span class="sw" style="background:'+t[1]+'"></span>'+t[2]+'<br>'; });
+  document.getElementById('lgTiers').innerHTML=h;
+}
+
+function draw(){
+  cellLayer.clearLayers();
+  var useComb=(mode==='comb' && D.has_fault);
+  var k=useComb?4:3;
+  D.cells.forEach(function(c){
+    var t=c[k]; if(t==null) return;
+    var ti=tierOf(t); if(ti<0) return;
+    var tip='過去'+D.years+'年のM'+D.min_mag+'以上: <b>'+c[2]+'件</b><br>地震分布の順位: 上位'+pct(c[3])+'%';
+    if(D.has_fault && c[4]!=null) tip+='<br>＋活断層への近さ: 上位'+pct(c[4])+'%';
+    L.rectangle([[c[0],c[1]],[c[0]+gs,c[1]+gs]],{color:null,weight:0,fill:true,fillColor:TIERS[ti][1],fillOpacity:0.6})
+     .bindTooltip(tip).addTo(cellLayer);
+  });
+}
+
+function setMode(m){
+  if(!D) return;
+  mode=m;
+  document.getElementById('mSeis').classList.toggle('on',m==='seis');
+  document.getElementById('mComb').classList.toggle('on',m==='comb');
+  draw();
+}
+
+function toggleEv(btn){
+  btn.classList.toggle('on');
+  if(map.hasLayer(evLayer)) map.removeLayer(evLayer); else evLayer.addTo(map);
+}
+
+function ready(d){
+  D=d; polls=0;
+  document.getElementById('built').textContent=d.built+(d.refreshing?'（更新中）':'');
+  document.getElementById('mComb').disabled=!d.has_fault;
+  document.getElementById('tEv').disabled=false;
+  document.getElementById('tEv').textContent='M'+d.event_mag.toFixed(0)+'以上の震央';
+  evLayer.clearLayers();
+  d.events.forEach(function(e){
+    L.circleMarker([e[0],e[1]],{radius:Math.max(4,(e[2]-4.5)*3.2),color:'#fff',weight:1,fillColor:'#38bdf8',fillOpacity:0.8})
+     .bindTooltip('M'+e[2].toFixed(1)+' '+e[3]).addTo(evLayer);
+  });
+  legend();
+  var src=d.sources.map(function(s){ return esc(s.name)+' '+s.start+'〜'+s.end+'（'+s.n+'件）'; }).join('<br>');
+  var warn=(d.warnings||[]).map(function(w){ return '<span style="color:#fca5a5">⚠ '+esc(w)+'</span>'; }).join('<br>');
+  document.getElementById('lgSrc').innerHTML='対象: 過去'+d.years+'年・M'+d.min_mag+'以上（計'+d.n_events+'件）<br>'+src+(warn?'<br>'+warn:'')+
+    (d.has_fault?'':'<br>※活断層データが無いため「＋活断層」は表示できません');
+  draw();
+  document.getElementById('state').style.display='none';
+}
+
+function load(){
+  fetch('/longterm/data').then(function(r){return r.json()}).then(function(d){
+    if(d.status==='ready'){ ready(d); }
+    else if(d.status==='error'){ setState('作成に失敗しました: '+d.error+'（右上の「再計算」でやり直せます）',true); }
+    else { polls++; setState('長期の地震分布を作成中… '+Math.round(d.elapsed||polls*3)+'秒（初回は数十秒かかります）'); setTimeout(load,3000); }
+  }).catch(function(e){ setState('取得に失敗しました: '+e.message,true); });
+}
+load();
+</script></body></html>"""
+    return (html.replace("__LEAFLET__", LEAFLET_CDN).replace("__DARK_TILE__", DARK_TILE)
+                .replace("__GEOJSON__", GEOJSON_JS).replace("__GS__", str(RISK_GRID_SIZE))
+                .replace("__RCBTN__", _recalc_btn_html("longterm")))
+
+
+
 # ── 動的(統合リスクマップ)のスコア ────────────────────
 class _BtRankCtx:
     """1つの基準(calib)に対するランク計算の下準備（ドメイン下限・並べ替え済み履歴）を使い回す。
@@ -6054,7 +6424,7 @@ canvas.dChart{{display:block;width:100%}}
 </div>
 <div id="mp">
   <div id="map"></div>
-  <div id="hdr">更新: {updated_str}</div>
+  <div id="hdr">更新: {updated_str} {_recalc_btn_html('riskmap')}</div>
   <div id="lg">
     <b>統合リスクレベル</b><br>
     <span style="color:{LEVEL_COLOR[5]};background:{LEVEL_COLOR[5]};opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特に稀な高リスク）<br>
@@ -6547,7 +6917,7 @@ tr.det td{white-space:normal;text-align:left;background:rgba(255,255,255,.035);p
       <div class="hint">近く(50〜400km)・直前(30〜365日)の範囲は、前の大地震の規模から自動で決めます。</div>
     </div>
   </details>
-  <div class="row"><button id="runBtn" onclick="startRun()">2. 実行</button><button id="cancelBtn" class="sec2" onclick="cancelRun()" disabled>中止</button></div>
+  <div class="row"><button id="runBtn" onclick="startRun()"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>2. 実行</button><button id="cancelBtn" class="sec2" onclick="cancelRun()" disabled>中止</button></div>
   <div id="bar"><div id="barIn"></div></div>
   <div id="stat"></div>
   <div class="row" style="margin-top:10px"><button class="sec2" onclick="loadResult()">結果を再読み込み</button><button class="sec2" onclick="dlCsv()">CSV</button></div>
@@ -6915,7 +7285,7 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
     <div class="field"><label>時刻</label><input type="time" id="inTime" value="00:00"></div>
     <div style="margin-bottom:10px;font-size:11.5px;color:rgba(235,238,245,.75);line-height:1.5"><label><input type="checkbox" id="inCalib" style="width:auto;margin-right:6px">この日付で基準を作り直す（古い日付向け）</label>
       <div style="font-size:10px;color:rgba(235,238,245,.42);margin-top:3px">基準日より前の65日だけで基準を作ります（一元化カタログの範囲のみ。初回は数十秒〜数分）。</div></div>
-    <button id="fetchBtn" onclick="runFetch()">この時点のリスクマップを取得</button>
+    <button id="fetchBtn" onclick="runFetch()"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>この時点のリスクマップを取得</button>
     <div id="statusBox"></div>
   </div>
 
@@ -7126,6 +7496,7 @@ function fmtStatus(d){
          '使用した地震データ: <b>' + d.quake_count + '</b>件 ／ セル数: <b>' + d.cells.length + '</b>';
 }
 
+var RC_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>';
 function runFetch(){
   var dateVal = document.getElementById('inDate').value;
   var timeVal = document.getElementById('inTime').value || '00:00';
@@ -7174,7 +7545,7 @@ function runFetch(){
     })
     .finally(function(){
       if(pendingRetry) return;
-      btn.disabled = false; btn.textContent = 'この時点のリスクマップを取得';
+      btn.disabled = false; btn.innerHTML = RC_ICON + 'この時点のリスクマップを取得';
     });
 }
 </script></body></html>"""
@@ -7194,7 +7565,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>Earthquake-risk-map v9.30</title>
+  <title>Earthquake-risk-map v9.40</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
@@ -7242,6 +7613,7 @@ SHELL_HTML = """<!DOCTYPE html>
     .version{margin-top:0;padding:10px 14px;font-size:10px;color:rgba(235,238,245,.32);border-top:1px solid rgba(255,255,255,.14)}
     .recalc-box{margin-top:auto;padding:10px 12px}
     #recalcBtn{
+      display:flex;align-items:center;justify-content:center;gap:7px;
       width:100%;padding:10px 10px;font-size:13px;font-weight:600;color:#fff;cursor:pointer;
       border:1px solid rgba(255,255,255,.2);border-radius:10px;
       background:linear-gradient(135deg,rgba(10,132,255,.45),rgba(124,92,255,.32));
@@ -7249,6 +7621,14 @@ SHELL_HTML = """<!DOCTYPE html>
     }
     #recalcBtn:hover{filter:brightness(1.15)}
     #recalcBtn:disabled{opacity:.55;cursor:default;filter:none}
+    #recalcBtn.busy svg{animation:rcspin 1s linear infinite}
+    @keyframes rcspin{to{transform:rotate(360deg)}}
+    .recalc-scope{margin-top:7px;font-size:10px;line-height:1.55;color:rgba(235,238,245,.52);white-space:pre-line}
+    .group-title .gt{display:inline-block;margin-right:6px;padding:1px 6px;border-radius:6px;font-size:9px;letter-spacing:.5px}
+    .gt-dyn{background:rgba(59,130,246,.28);color:#93c5fd}
+    .gt-sta{background:rgba(245,158,11,.25);color:#fcd34d}
+    .gt-ver{background:rgba(255,255,255,.12);color:rgba(235,238,245,.62)}
+    .group-note{padding:0 14px 4px;font-size:10px;line-height:1.5;color:rgba(235,238,245,.38)}
     #toast{
       display:none;position:fixed;left:50%;transform:translateX(-50%);
       bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:400;
@@ -7300,65 +7680,72 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震リスクマップ</div>
-      <div>v9.30 / 研究用</div>
+      <div>v9.40 / 研究用</div>
     </div>
 
-    <div class="group-title">地震データ</div>
-    <button class="tab-btn active" onclick="sw(0)">
+    <div class="group-title"><span class="gt gt-dyn">動的</span>統合</div>
+    <div class="group-note">直近の地震活動・観測値で日々変わる</div>
+    <button class="tab-btn active" data-idx="0" onclick="sw(0)">
       <span class="label">統合リスクマップ</span>
       <span class="badge">β</span>
     </button>
-    <button class="tab-btn" onclick="sw(1)">
+
+    <div class="sep"></div>
+    <div class="group-title"><span class="gt gt-dyn">動的</span>地震活動</div>
+    <button class="tab-btn" data-idx="1" onclick="sw(1)">
       <span class="label">地震履歴</span>
       <span class="badge">JMA/P2P/USGS/Hi-net</span>
     </button>
-    <button class="tab-btn" onclick="sw(2)">
+    <button class="tab-btn" data-idx="2" onclick="sw(2)">
       <span class="label">ETASマップ</span>
       <span class="badge">JMA/P2P/USGS/Hi-net</span>
     </button>
-    <button class="tab-btn" onclick="sw(3)">
+    <button class="tab-btn" data-idx="3" onclick="sw(3)">
       <span class="label">b値マップ</span>
       <span class="badge">JMA/P2P/USGS/Hi-net</span>
     </button>
-    <button class="tab-btn" onclick="sw(4)">
-      <span class="label">活断層・プレート境界</span>
-      <span class="badge">GEM</span>
-    </button>
 
     <div class="sep"></div>
-    <div class="group-title">地球物理データ</div>
-    <button class="tab-btn" onclick="sw(5)">
+    <div class="group-title"><span class="gt gt-dyn">動的</span>観測データ</div>
+    <button class="tab-btn" data-idx="5" onclick="sw(5)">
       <span class="label">TEC</span>
       <span class="badge">NICT</span>
     </button>
-    <button class="tab-btn" onclick="sw(6)">
+    <button class="tab-btn" data-idx="6" onclick="sw(6)">
       <span class="label">GNSS変位</span>
       <span class="badge">GSI</span>
     </button>
-
-    <div class="sep"></div>
-    <div class="group-title">気象</div>
-    <button class="tab-btn" onclick="sw(7)">
+    <button class="tab-btn" data-idx="7" onclick="sw(7)">
       <span class="label">海面気圧</span>
       <span class="badge">AMeDAS</span>
     </button>
 
     <div class="sep"></div>
-    <div class="group-title">ログ</div>
-    <button class="tab-btn" onclick="sw(8)">
+    <div class="group-title"><span class="gt gt-sta">静的</span>長期</div>
+    <div class="group-note">過去の実績・地質データで作る。日々は変わらない</div>
+    <button class="tab-btn" data-idx="10" onclick="sw(10)">
+      <span class="label">長期の地震分布</span>
+      <span class="badge">10年・M4.5+</span>
+    </button>
+    <button class="tab-btn" data-idx="4" onclick="sw(4)">
+      <span class="label">活断層・プレート境界</span>
+      <span class="badge">GEM</span>
+    </button>
+
+    <div class="sep"></div>
+    <div class="group-title"><span class="gt gt-ver">検証</span>ログ</div>
+    <button class="tab-btn" data-idx="9" onclick="sw(9)">
+      <span class="label">バックテスト</span>
+      <span class="badge">Molchan</span>
+    </button>
+    <button class="tab-btn" data-idx="8" onclick="sw(8)">
       <span class="label">アーカイブ</span>
       <span class="badge">JMA/USGS</span>
     </button>
 
-    <div class="sep"></div>
-    <div class="group-title">検証</div>
-    <button class="tab-btn" onclick="sw(9)">
-      <span class="label">バックテスト</span>
-      <span class="badge">Molchan</span>
-    </button>
-
     <div class="recalc-box">
-      <button id="recalcBtn" onclick="recalc()">&#8635; このタブを再計算</button>
+      <button id="recalcBtn" onclick="recalc()"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg><span id="recalcLbl">このタブを再計算</span></button>
+      <div id="recalcScope" class="recalc-scope"></div>
     </div>
     <div class="version">ETAS残差研究プロジェクト</div>
   </div>
@@ -7373,6 +7760,7 @@ SHELL_HTML = """<!DOCTYPE html>
     <iframe id="f7" src=""></iframe>
     <iframe id="f8" src=""></iframe>
     <iframe id="f9" src=""></iframe>
+    <iframe id="f10" src=""></iframe>
   </div>
   <script>
     // 画面の高さを実測して反映（スマホはアドレスバーの出入りで100vhが実際の表示領域とずれ、下が切れるため）
@@ -7385,12 +7773,12 @@ SHELL_HTML = """<!DOCTYPE html>
     window.addEventListener('orientationchange', function(){ setTimeout(fitH, 250); });
     if(window.visualViewport) window.visualViewport.addEventListener('resize', fitH);
 
-    var URLS=['riskmap','history','etas','bvalue','faultmap','tec','gnss','pressure','snapshots','backtest'];
-    var loaded=[true,false,false,false,false,false,false,false,false,false];
+    var URLS=['riskmap','history','etas','bvalue','faultmap','tec','gnss','pressure','snapshots','backtest','longterm'];
+    var loaded=[true,false,false,false,false,false,false,false,false,false,false];
     function sw(idx){
-      curTab=idx;
+      curTab=idx; if(typeof updateScope==='function') updateScope(idx);
       var tt=document.getElementById('topTitle'); if(tt && typeof TAB_LABELS!=='undefined') tt.textContent=TAB_LABELS[idx];
-      document.querySelectorAll('.tab-btn').forEach(function(b,i){b.classList.toggle('active',i===idx)});
+      document.querySelectorAll('.tab-btn').forEach(function(b){b.classList.toggle('active',Number(b.dataset.idx)===idx)});
       document.querySelectorAll('iframe').forEach(function(f,i){f.classList.toggle('active',i===idx)});
       if(!loaded[idx]){
         document.getElementById('f'+idx).src='/tab/'+URLS[idx];
@@ -7408,7 +7796,9 @@ SHELL_HTML = """<!DOCTYPE html>
     }
 
     // ── 各タブの「再計算」 ──
-    var TAB_LABELS=['統合リスクマップ','地震履歴','ETASマップ','b値マップ','活断層・プレート境界','TEC','GNSS変位','海面気圧','アーカイブ','バックテスト'];
+    // サイドバーのボタンは「いま開いているタブ」を、各タブ内のアイコンは「そのタブ」を再計算する(recalcByName)。
+    var TAB_LABELS=['統合リスクマップ','地震履歴','ETASマップ','b値マップ','活断層・プレート境界','TEC','GNSS変位','海面気圧','アーカイブ','バックテスト','長期の地震分布'];
+    var TAB_SCOPES=__TAB_SCOPES__;
     var curTab=0, recalcBusy=false, toastTimer=null;
     function showToast(msg,ms){
       var t=document.getElementById('toast');
@@ -7420,9 +7810,22 @@ SHELL_HTML = """<!DOCTYPE html>
       document.getElementById('f'+idx).src='/tab/'+URLS[idx]+'?_='+Date.now();
       loaded[idx]=true;
     }
-    function recalc(){
+    function updateScope(idx){
+      var el=document.getElementById('recalcScope'); if(!el) return;
+      var sc=TAB_SCOPES[idx]||'';
+      el.textContent='対象: 「'+TAB_LABELS[idx]+'」'+(sc?'\\n'+sc:'');
+    }
+    // タブ内のアイコンを回転表示にする(同一オリジンのiframeのみ)
+    function setRcBusy(idx,b){
+      try{
+        var d=document.getElementById('f'+idx).contentDocument; if(!d) return;
+        d.querySelectorAll('.rcbtn').forEach(function(x){ x.classList.toggle('busy',b); x.disabled=b; });
+      }catch(e){}
+    }
+    function recalcByName(name){ var i=URLS.indexOf(name); if(i>=0) recalc(i); }
+    function recalc(i){
       if(recalcBusy) return;
-      var idx=curTab, name=URLS[idx], label=TAB_LABELS[idx];
+      var idx=(typeof i==='number')?i:curTab, name=URLS[idx], label=TAB_LABELS[idx];
       if(window.innerWidth<=768){closeSb()}
       if(idx===9){
         showToast('バックテストは、タブ左側の「実行」ボタンで計算します',4000);
@@ -7435,14 +7838,14 @@ SHELL_HTML = """<!DOCTYPE html>
         else { showToast('日時を入力して「この時点のリスクマップを取得」を押してください',4000); }
         return;
       }
-      var btn=document.getElementById('recalcBtn');
+      var btn=document.getElementById('recalcBtn'), lbl=document.getElementById('recalcLbl');
       var t0=Date.now();
-      recalcBusy=true; btn.disabled=true; btn.textContent='↻ 再計算中…';
+      recalcBusy=true; btn.disabled=true; btn.classList.add('busy'); lbl.textContent='再計算中…'; setRcBusy(idx,true);
       showToast(label+' 再計算中…');
       function finish(ok,msg){
-        recalcBusy=false; btn.disabled=false; btn.innerHTML='&#8635; このタブを再計算';
+        recalcBusy=false; btn.disabled=false; btn.classList.remove('busy'); lbl.textContent='このタブを再計算';
         if(ok){ reloadTab(idx); showToast('✓ '+label+' を再計算しました（'+msg+'）',8000); }
-        else { showToast('⚠ '+label+' の再計算に失敗: '+msg,10000); }
+        else { setRcBusy(idx,false); showToast('⚠ '+label+' の再計算に失敗: '+msg,10000); }
       }
       function poll(){
         fetch('/recalc/'+name+'/status').then(function(r){return r.json()}).then(function(s){
@@ -7461,6 +7864,7 @@ SHELL_HTML = """<!DOCTYPE html>
         return r.json();
       }).then(poll).catch(function(e){ finish(false,e.message) });
     }
+    updateScope(0);
   </script>
 </body>
 </html>"""
@@ -7640,7 +8044,7 @@ def apple_touch_icon():
 def index():
     with _cache_lock: phase = _ready_phase
     if phase < 2: return Response(LOADING_HTML, mimetype="text/html")
-    return Response(SHELL_HTML, mimetype="text/html")
+    return Response(SHELL_HTML.replace("__TAB_SCOPES__", _tab_scopes_json()), mimetype="text/html")
 
 @app.route("/tab/<name>")
 def tab(name):
@@ -7660,6 +8064,7 @@ def tab(name):
     elif name == "pressure": html = render_pressure(upd)
     elif name == "snapshots": html = render_snapshots(upd)
     elif name == "backtest":  html = render_backtest(upd)
+    elif name == "longterm":  html = render_longterm(upd)
     else: return Response("Not found", status=404)
     return Response(html, mimetype="text/html")
 
@@ -7686,6 +8091,11 @@ def risk_cell_trend():
     selected_keys = _risk_component_keys_from_param(request.args.get("sel"))
     points, prev_day_score = compute_risk_trend_for_cell(gi, gj, selected_keys)
     return {"points": points, "prev_day_score": prev_day_score}
+
+@app.route("/longterm/data")
+def longterm_data():
+    """(v9.40) 長期の地震分布タブのデータ。未作成なら背景で作り始め、status=running を返す。"""
+    return Response(json.dumps(_longterm_view(), ensure_ascii=False), mimetype="application/json")
 
 @app.route("/status")
 def status():
@@ -8426,6 +8836,15 @@ def _recalc_riskmap():
         msg += "／⚠ " + " / ".join(problems)
     return msg
 
+def _recalc_longterm():
+    """(v9.40) 長期の地震分布を作り直す(一元化カタログ/USGSを読むので数十秒)。"""
+    with _longterm_lock:
+        if _longterm_cache["running"]:
+            raise RuntimeError("長期の地震分布は作成中です。しばらくしてからもう一度お試しください")
+        _longterm_cache.update(running=True, started=time.time(), error=None)
+    d = _longterm_run()
+    return f"過去{d['years']}年・M{d['min_mag']}以上 {d['n_events']}件"
+
 _RECALC_HANDLERS = {
     "riskmap":  _recalc_riskmap,
     "history":  _recalc_core_cache,
@@ -8435,6 +8854,7 @@ _RECALC_HANDLERS = {
     "tec":      _recalc_tec,
     "gnss":     _recalc_gnss,
     "pressure": _recalc_pressure,
+    "longterm": _recalc_longterm,
 }
 
 def _recalc_job_view(job):
