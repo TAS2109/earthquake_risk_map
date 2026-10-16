@@ -6917,7 +6917,7 @@ tr.det td{white-space:normal;text-align:left;background:rgba(255,255,255,.035);p
       <div class="hint">近く(50〜400km)・直前(30〜365日)の範囲は、前の大地震の規模から自動で決めます。</div>
     </div>
   </details>
-  <div class="row"><button id="runBtn" onclick="startRun()"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>2. 実行</button><button id="cancelBtn" class="sec2" onclick="cancelRun()" disabled>中止</button></div>
+  <div class="row"><button id="runBtn" onclick="startRun()"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor"/></svg>2. 実行</button><button id="cancelBtn" class="sec2" onclick="cancelRun()" disabled>中止</button></div>
   <div id="bar"><div id="barIn"></div></div>
   <div id="stat"></div>
   <div class="row" style="margin-top:10px"><button class="sec2" onclick="loadResult()">結果を再読み込み</button><button class="sec2" onclick="dlCsv()">CSV</button></div>
@@ -7285,7 +7285,7 @@ canvas.dChart{display:block;width:100%;margin-top:6px}
     <div class="field"><label>時刻</label><input type="time" id="inTime" value="00:00"></div>
     <div style="margin-bottom:10px;font-size:11.5px;color:rgba(235,238,245,.75);line-height:1.5"><label><input type="checkbox" id="inCalib" style="width:auto;margin-right:6px">この日付で基準を作り直す（古い日付向け）</label>
       <div style="font-size:10px;color:rgba(235,238,245,.42);margin-top:3px">基準日より前の65日だけで基準を作ります（一元化カタログの範囲のみ。初回は数十秒〜数分）。</div></div>
-    <button id="fetchBtn" onclick="runFetch()"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>この時点のリスクマップを取得</button>
+    <button id="fetchBtn" onclick="runFetch()"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor"/></svg>この時点のリスクマップを取得</button>
     <div id="statusBox"></div>
   </div>
 
@@ -7496,7 +7496,7 @@ function fmtStatus(d){
          '使用した地震データ: <b>' + d.quake_count + '</b>件 ／ セル数: <b>' + d.cells.length + '</b>';
 }
 
-var RC_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>';
+var RC_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor"/></svg>';
 function runFetch(){
   var dateVal = document.getElementById('inDate').value;
   var timeVal = document.getElementById('inTime').value || '00:00';
@@ -7610,7 +7610,7 @@ SHELL_HTML = """<!DOCTYPE html>
     .tab-btn .badge{font-size:9px;padding:1px 5px;border-radius:7px;background:rgba(56,132,255,.25);color:#93c5fd;flex-shrink:0}
     .tab-btn.active .badge{background:rgba(10,132,255,.55)}
     .sep{height:1px;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);margin:6px 12px}
-    .version{margin-top:0;padding:10px 14px;font-size:10px;color:rgba(235,238,245,.32);border-top:1px solid rgba(255,255,255,.14)}
+    .version{margin-top:auto;padding:10px 14px;font-size:10px;color:rgba(235,238,245,.32);border-top:1px solid rgba(255,255,255,.14)}
     .recalc-box{margin-top:auto;padding:10px 12px}
     #recalcBtn{
       display:flex;align-items:center;justify-content:center;gap:7px;
@@ -7743,10 +7743,6 @@ SHELL_HTML = """<!DOCTYPE html>
       <span class="badge">JMA/USGS</span>
     </button>
 
-    <div class="recalc-box">
-      <button id="recalcBtn" onclick="recalc()"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg><span id="recalcLbl">このタブを再計算</span></button>
-      <div id="recalcScope" class="recalc-scope"></div>
-    </div>
     <div class="version">ETAS残差研究プロジェクト</div>
   </div>
   <div id="main">
@@ -7838,12 +7834,11 @@ SHELL_HTML = """<!DOCTYPE html>
         else { showToast('日時を入力して「この時点のリスクマップを取得」を押してください',4000); }
         return;
       }
-      var btn=document.getElementById('recalcBtn'), lbl=document.getElementById('recalcLbl');
       var t0=Date.now();
-      recalcBusy=true; btn.disabled=true; btn.classList.add('busy'); lbl.textContent='再計算中…'; setRcBusy(idx,true);
+      recalcBusy=true; setRcBusy(idx,true);
       showToast(label+' 再計算中…');
       function finish(ok,msg){
-        recalcBusy=false; btn.disabled=false; btn.classList.remove('busy'); lbl.textContent='このタブを再計算';
+        recalcBusy=false;
         if(ok){ reloadTab(idx); showToast('✓ '+label+' を再計算しました（'+msg+'）',8000); }
         else { setRcBusy(idx,false); showToast('⚠ '+label+' の再計算に失敗: '+msg,10000); }
       }
