@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震リスクマップ v9.24
+地震リスクマップ v9.25
 
 ■ 目的と成功の定義
   統合リスクマップの目的は、地震の「発生時期の予測」ではなく、「M6以上の大きな地震が起きる場所を、
@@ -39,6 +39,8 @@
      共有URL/CSV出力、PWA化。通知は「時期の警報」と誤解されないよう、注目セルの変化として位置づける。
 
 ■ 更新履歴（要点のみ）
+  v9.25 バックテストの既定を、直前・直後とも0.05時間(3分)に変更／直前は0.01時間(36秒)から指定可に／
+        既定を変えたので、以前の画面の入力値(last_params)は引き継がず新しい既定で始める／遅いときの目安を画面に表示
   v9.24 一元化カタログ: 1年が複数ファイルに分かれている年(h199701+h199710 など)に対応／年別ファイルに欠けがあっても、
         最新年から連続している範囲(例: 1983〜2024)だけを使う(従来は欠けがあるとバックテストが止まっていた)
   v9.23 一元化カタログの探索を強化: 置き場所を起動場所(cwd)だけでなくアプリの場所基準でも探す／環境変数JMA_CATALOG_DIRは絶対パス可／
@@ -4978,7 +4980,7 @@ def compute_risk_trend_for_cell(gi, gj, selected_keys):
 #   これまで人力でアーカイブタブを使って記録していた作業（直前・直後のリスク値）の自動化。
 #
 # ■ 評価の手順（1地震ごと）
-#   1) 発生の lead_hours 前(既定24時間前)を評価時点とし、その時点までの地震だけで
+#   1) 発生の lead_hours 前(既定0.05時間=3分前)を評価時点とし、その時点までの地震だけで
 #      アーカイブと同じ計算（ETAS/b値/活断層/プレート → 絶対評価 → 合成）を行う。
 #   2) 震源セルの「順位」τ = そのセルより高スコアのセルの面積比（上位τ。0に近いほど良い）。
 #      面積はセルの緯度による縮み(cos)で重み付け。スコアの無いセルは「警戒できない」扱いで
@@ -5408,9 +5410,9 @@ def _bt_make_record(ev, group, prev, eval_t, anchor, score_vec, after_vec, th, s
 
 
 # ── 実行・保存 ────────────────────────────────────
-BT_DEFAULT_PARAMS = {"start": None, "end": None, "min_mag": 6.0, "lead_hours": 24.0, "after_hours": 1.0,
+BT_DEFAULT_PARAMS = {"start": None, "end": None, "min_mag": 6.0, "lead_hours": 0.05, "after_hours": 0.05,
                      "rebuild_days": 30.0, "calib_step_hours": float(HIST_CALIB_SAMPLE_HOURS),
-                     "prev_mag": 6.0, "max_depth_km": 0.0}
+                     "prev_mag": 6.0, "max_depth_km": 0.0, "defaults_ver": 2}
 
 def _bt_parse_params(d):
     """画面/APIの入力を検証して実行パラメータにする。start/end は JST の 'YYYY-MM-DD'。"""
@@ -5425,8 +5427,8 @@ def _bt_parse_params(d):
         raise ValueError("開始日・終了日は YYYY-MM-DD で、数値の項目は数字で入力してください")
     if not (4.5 <= p["min_mag"] <= 9.5):
         raise ValueError("対象のマグニチュードは 4.5〜9.5 の範囲で指定してください")
-    if not (1.0 <= p["lead_hours"] <= 24 * 30):
-        raise ValueError("直前の時点は 1〜720 時間で指定してください")
+    if not (0.01 <= p["lead_hours"] <= 24 * 30):
+        raise ValueError("直前の時点は 0.01〜720 時間で指定してください（0.05=3分前）")
     if not (0.0 <= p["after_hours"] <= 48):
         raise ValueError("直後の時点は 0〜48 時間で指定してください")
     if not (0.0 <= p["rebuild_days"] <= 365):
@@ -6387,14 +6389,14 @@ svg text{fill:rgba(235,238,245,.7);font-size:11px}
   </div>
   <div class="sec">
     <h3>評価する時点</h3>
-    <div class="field"><label>直前(発生の何時間前)</label><input type="number" id="pLead" step="1" value="24"></div>
-    <div class="field"><label>直後(発生の何時間後・参考用)</label><input type="number" id="pAfter" step="0.5" value="1"></div>
+    <div class="field"><label>直前(発生の何時間前)</label><input type="number" id="pLead" step="0.01" min="0.01" value="0.05"></div>
+    <div class="field"><label>直後(発生の何時間後・参考用)</label><input type="number" id="pAfter" step="0.01" min="0" value="0.05"></div>
   </div>
   <div class="sec">
     <h3>基準の作り直し（日付ごとの基準）</h3>
     <div class="field"><label>作り直す間隔(日, 0=1地震ごと)</label><input type="number" id="pRebuild" step="1" value="30"></div>
     <div class="field"><label>基準のサンプル間隔(時間)</label><input type="number" id="pStep" step="6" value="24"></div>
-    <div class="hint">基準は「評価時点より前の65日」だけで作ります（先読みなし）。作り直し間隔を短くするほど厳密ですが、基準1回ぶんの計算が地震の数だけ増えます。間隔0は最も厳密で最も遅い設定です。</div>
+    <div class="hint">基準は「評価時点より前の65日」だけで作ります（先読みなし）。作り直し間隔を短くするほど厳密ですが、基準1回ぶんの計算が地震の数だけ増えます。間隔0は最も厳密で最も遅い設定です。<br>遅いとき: 時間の大半は「基準の作成」(約65時点ぶんのETAS・b値計算)です。「作り直す間隔」を90〜180日、「基準のサンプル間隔」を48時間にすると、基準の作成回数と1回あたりの重さが減ります（基準が少し古く・粗くなりますが、評価時点より後のデータは使いません）。</div>
   </div>
   <div class="sec">
     <h3>余震の判定</h3>
@@ -6425,7 +6427,7 @@ function qs(o){return Object.keys(o).map(function(k){return encodeURIComponent(k
 function setStat(msg, err){var s=$('stat'); s.className=err?'err':''; s.innerHTML=msg}
 function init(){
   fetch('/backtest/info').then(function(r){return r.json()}).then(function(d){
-    var p = d.last_params || DEF;
+    var p = (d.last_params && d.last_params.defaults_ver === DEF.defaults_ver) ? d.last_params : DEF;
     $('pStart').value=p.start; $('pEnd').value=p.end;
     ['Mag:min_mag','Depth:max_depth_km','Lead:lead_hours','After:after_hours','Rebuild:rebuild_days','Step:calib_step_hours','Prev:prev_mag'].forEach(function(s){
       var a=s.split(':'); if(p[a[1]]!=null) $('p'+a[0]).value=p[a[1]];
@@ -6920,7 +6922,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>Earthquake-risk-map v9.24</title>
+  <title>Earthquake-risk-map v9.25</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
@@ -7026,7 +7028,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震リスクマップ</div>
-      <div>v9.24 / 研究用</div>
+      <div>v9.25 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
