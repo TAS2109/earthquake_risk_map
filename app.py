@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震リスクマップ v9.25
+地震リスクマップ v9.30
 
 ■ 目的と成功の定義
   統合リスクマップの目的は、地震の「発生時期の予測」ではなく、「M6以上の大きな地震が起きる場所を、
@@ -39,6 +39,12 @@
      共有URL/CSV出力、PWA化。通知は「時期の警報」と誤解されないよう、注目セルの変化として位置づける。
 
 ■ 更新履歴（要点のみ）
+  v9.30 バックテストタブを目的(大地震を高リスクの場所に集める/低リスクで起きた地震に何の情報があれば高められたか)に合わせて作り直し:
+        ①結論(的中率・ランダム比・静的との比較を平易な文で表示。「高リスク」とみなす範囲を上位10/20/30%から選択)／
+        ②見逃し分析(見逃しの原因の内訳、ETAS・b値・活断層・プレート・静的ハザード・周囲拡大のどれなら入っていたか、
+          全地震での的中率との併記、深さ別、ワースト見逃し)／設定は「詳細設定」に畳み、用語説明を追加／
+        地震ごとの記録に的中/見逃しの判定・タップで成分別順位の詳細・「見逃しだけ」表示／CSVに判定・救えた情報を追加／指標に上位30%を追加
+        (保存済みの記録はそのまま使える。見逃し分析は既存の記録から計算するので再計算は不要)
   v9.25 バックテストの既定を、直前・直後とも0.05時間(3分)に変更／直前は0.01時間(36秒)から指定可に／
         既定を変えたので、以前の画面の入力値(last_params)は引き継がず新しい既定で始める／遅いときの目安を画面に表示
   v9.24 一元化カタログ: 1年が複数ファイルに分かれている年(h199701+h199710 など)に対応／年別ファイルに欠けがあっても、
@@ -5634,7 +5640,7 @@ def _bt_metrics(taus):
     a = np.array(taus, dtype=float)
     m = {"n": n, "median_tau": round(float(np.median(a)), 4), "mean_tau": round(float(a.mean()), 4),
          "auc": round(float(1.0 - a.mean()), 4), "auc_ci": _bt_auc_ci(a)}
-    for x in (0.05, 0.10, 0.20):
+    for x in (0.05, 0.10, 0.20, 0.30):   # (v9.30) 上位30%を追加(画面の「高リスクとみなす範囲」の選択肢)
         k = int((a <= x + 1e-12).sum())
         tag = int(round(x * 100))
         m[f"hit{tag}"] = round(k / n, 4); m[f"k{tag}"] = k; m[f"p{tag}"] = round(_bt_binom_sf(k, n, x), 5)
@@ -5673,6 +5679,92 @@ def _bt_breakdown(rs):
         if sub:
             by_mag.append(row(lab, sub))
     return {"by_year": by_year, "by_mag": by_mag}
+
+# ── 見逃し分析 (v9.30) ────────────────────────────
+# 目的: 「震源セルが上位X%に入らなかった地震(見逃し)」について、どの情報を使っていれば入っていたかを調べる。
+#   ・動的の各成分(ETAS/b値/活断層/プレート)を“単独で”警戒マップにした場合
+#   ・静的な長期ハザード(地震分布／＋活断層への近さ)
+#   ・警戒範囲を震源セルの周囲±1セルまで広げた場合
+# いずれも「同じ面積X%だけ警戒したとき震源セルが入っていたか」で比べる(面積を揃えた公平な比較)。
+# 事後の分析なので、探せば何かは当たる(多重比較)。全地震での的中率(誤警報の代わり)も併記して判断する。
+BT_MISS_THRS = (0.10, 0.20, 0.30)
+BT_SRC_LABELS = {"etas": "ETAS(直近の地震活動)", "bvalue": "b値(小地震の比率)",
+                 "fault": "活断層への応力負荷", "plate": "プレート境界への応力負荷",
+                 "st_seis": "長期の地震分布(過去10年のM4.5以上)", "st_comb": "長期の地震分布＋活断層への近さ",
+                 "nb": "警戒範囲を周囲±1セル(約55km)まで広げる"}
+BT_DEPTH_BINS = [("浅い(〜30km)", 0.0, 30.0), ("中間(30〜70km)", 30.0, 70.0), ("深い(70km〜)", 70.0, 1e9)]
+_BT_EPS = 1e-12
+
+def _bt_src_taus(r):
+    """1地震について {情報源: 震源セルの順位τ}。動的の各成分・静的2種・動的の周囲込み(nb)。"""
+    t = {k: v for k, v in (r.get("comp") or {}).items() if k in _RISK_HIST_KEYS}
+    t["st_seis"] = r["st_seis"]["tau"]
+    t["st_comb"] = r["st_comb"]["tau"]
+    t["nb"] = r["dyn"]["tau_nb"]
+    return t
+
+def _bt_rescue_keys(r, thr):
+    """上位thrの面積だけ警戒したとき、震源セルが入っていた情報源の一覧。"""
+    return [k for k, v in _bt_src_taus(r).items() if v <= thr + _BT_EPS]
+
+def _bt_best_source(r):
+    """周囲拡大を除く情報源のうち、震源セルの順位が最も良かったもの (key, τ)。"""
+    t = {k: v for k, v in _bt_src_taus(r).items() if k != "nb"}
+    k = min(t, key=lambda x: t[x])
+    return k, t[k]
+
+def _bt_miss_analysis(rs):
+    """見逃し(震源セルが上位thrに入らなかった地震)の内訳と、救えた情報源。thr=10/20/30%ごと。"""
+    out = {}
+    n = len(rs)
+    if n == 0:
+        return out
+    src_keys = list(_RISK_HIST_KEYS) + ["st_seis", "st_comb", "nb"]
+    for thr in BT_MISS_THRS:
+        tag = str(int(round(thr * 100)))
+        hit = [r for r in rs if r["dyn"]["tau"] <= thr + _BT_EPS]
+        miss = [r for r in rs if r["dyn"]["tau"] > thr + _BT_EPS]
+        cause = {"no_score": 0, "dyn_comp": 0, "static_only": 0, "widen_only": 0, "none": 0}
+        resc = {k: 0 for k in src_keys}
+        for r in miss:
+            ks = _bt_rescue_keys(r, thr)
+            for k in ks:
+                resc[k] += 1
+            if not r["dyn"]["valid"]:
+                cause["no_score"] += 1          # 震源セルに動的スコアが無く、警戒の対象に入れなかった
+            elif any(k in _RISK_HIST_KEYS for k in ks):
+                cause["dyn_comp"] += 1          # 動的の成分のどれかを単独で使えば入っていた(合成で薄まった)
+            elif "st_seis" in ks or "st_comb" in ks:
+                cause["static_only"] += 1       # 動的の成分では無理だが、長期の静的ハザードなら入っていた
+            elif "nb" in ks:
+                cause["widen_only"] += 1        # 周囲±1セルまで広げれば入っていた(位置のずれ)
+            else:
+                cause["none"] += 1              # どの情報でも入らない → 新しい情報が必要
+        sources = []
+        for k in src_keys:
+            vals = [v for v in (_bt_src_taus(r).get(k) for r in rs) if v is not None]
+            sources.append({"key": k, "label": BT_SRC_LABELS[k], "rescued": resc[k],
+                            "rescued_pct": round(resc[k] / len(miss), 4) if miss else None,
+                            "hit_all": round(float(np.mean([v <= thr + _BT_EPS for v in vals])), 4) if vals else None,
+                            "n_all": len(vals)})
+        depth = []
+        for lab, lo, hi in BT_DEPTH_BINS:
+            sub = [r for r in rs if lo <= (r.get("depth") or 0.0) < hi]
+            if not sub:
+                continue
+            depth.append({"label": lab, "n": len(sub),
+                          "dyn_hit": round(float(np.mean([r["dyn"]["tau"] <= thr + _BT_EPS for r in sub])), 4),
+                          "st_hit": round(float(np.mean([r["st_comb"]["tau"] <= thr + _BT_EPS for r in sub])), 4)})
+        worst = []
+        for r in sorted(miss, key=lambda r: -r["dyn"]["tau"])[:10]:
+            bk, bt = _bt_best_source(r)
+            worst.append({"t_jst": r["t_jst"], "place": r["place"], "mag": r["mag"], "depth": r.get("depth"),
+                          "group": r["group"], "tau": r["dyn"]["tau"], "score": r["dyn"]["score"],
+                          "level": r["dyn"]["level"], "valid": r["dyn"]["valid"],
+                          "best": bk, "best_tau": bt, "rescue": _bt_rescue_keys(r, thr)})
+        out[tag] = {"thr": thr, "n": n, "n_hit": len(hit), "n_miss": len(miss), "cause": cause,
+                    "sources": sources, "depth": depth, "worst": worst}
+    return out
 
 def _bt_paired(a, b):
     """動的(a)と静的(b)の順位の対比較。符号検定(両側)。aが小さい=動的が良い。"""
@@ -5714,11 +5806,18 @@ def _bt_summarize(records, p):
     groups = {"all": recs}
     for g in ("independent", "aftershock", "unseen"):
         groups[g] = [r for r in recs if r["group"] == g]
+    rows = []
+    for r in recs:   # (v9.30) 地震ごとに「救えた情報源」「最も良かった情報源」を付ける(画面の表示用。保存済みの記録は変えない)
+        bk, bt = _bt_best_source(r)
+        rows.append(dict(r, rescue={str(int(round(t * 100))): _bt_rescue_keys(r, t) for t in BT_MISS_THRS},
+                         best=[bk, bt]))
     out = {"params": p, "n_events": len(recs), "group_labels": BT_GROUP_LABELS, "model_labels": BT_MODEL_LABELS,
-           "tau_grid": BT_TAU_GRID, "groups": {}, "rows": recs}
+           "tau_grid": BT_TAU_GRID, "groups": {}, "rows": rows, "src_labels": BT_SRC_LABELS,
+           "miss_thrs": list(BT_MISS_THRS)}
     for g, rs in groups.items():
         gg = {"n": len(rs), "models": {}, "levels": _bt_level_table(rs), "sig05": _bt_sig_curve(len(rs)), "paired": {},
-              "components": _bt_component_table(rs), "breakdown": _bt_breakdown(rs) if rs else {"by_year": [], "by_mag": []}}
+              "components": _bt_component_table(rs), "breakdown": _bt_breakdown(rs) if rs else {"by_year": [], "by_mag": []},
+              "miss": _bt_miss_analysis(rs)}
         for m in ("dyn", "st_seis", "st_comb"):
             gg["models"][m] = {}
             for v in ("tau", "tau_nb"):
@@ -5740,7 +5839,8 @@ def _bt_csv(records, p):
                 "直前Lv", "直後Lv", "震源セル順位(上位%)", "周囲の最大Lv", "高リスク面積比(Lv3以上,%)",
                 "高リスク面積比(周囲込み,Lv3以上,%)", "静的:地震分布 順位(上位%)", "静的:地震分布+活断層 順位(上位%)",
                 "区分", "直前の大地震", "震源緯度", "震源経度", "深さkm", "評価時点(JST)", "基準日時(JST)"]
-               + [f"成分順位:{RISK_LABELS.get(k, k)}(上位%)" for k in _RISK_HIST_KEYS])
+               + [f"成分順位:{RISK_LABELS.get(k, k)}(上位%)" for k in _RISK_HIST_KEYS]
+               + ["判定(上位20%基準)", "上位20%に入れた情報(見逃し分析)", "最も順位が良かった情報"])
     for r in sorted(records.values(), key=lambda r: r["t_utc"]):
         t = datetime.fromisoformat(r["t_utc"])
         if not (start <= t < end) or r["mag"] < p["min_mag"]:
@@ -5756,7 +5856,10 @@ def _bt_csv(records, p):
                     {"independent": "独立", "aftershock": "余震・続発", "unseen": "直前に発生(未観測)"}[r["group"]],
                     "" if pv is None else f"{pv['t_jst']} M{pv['mag']} {pv['place']} {pv['dist_km']}km {pv['gap_days']}日前",
                     r["lat"], r["lon"], r["depth"], r["eval_jst"], r["anchor_jst"]]
-                   + [("" if not r.get("comp") or k not in r["comp"] else round(r["comp"][k] * 100, 2)) for k in _RISK_HIST_KEYS])
+                   + [("" if not r.get("comp") or k not in r["comp"] else round(r["comp"][k] * 100, 2)) for k in _RISK_HIST_KEYS]
+                   + ["的中" if d["tau"] <= 0.20 + _BT_EPS else "見逃し",
+                      " / ".join(BT_SRC_LABELS[k] for k in _bt_rescue_keys(r, 0.20)),
+                      "{}(上位{:.1f}%)".format(BT_SRC_LABELS[_bt_best_source(r)[0]], _bt_best_source(r)[1] * 100)])
     return "\ufeff" + buf.getvalue()
 
 
@@ -6335,20 +6438,27 @@ if(!THRESH.calibrated){{
 # data/backtest/records_<設定>.jsonl へ保存される（途中で止めても、期間を広げても、
 # 計算済みの地震は再利用される）。結果は /backtest/result、CSVは /backtest/events.csv。
 def render_backtest(updated_str):
-    html = """<!DOCTYPE html><html><head><meta charset="utf-8">
+    # (v9.30) 画面を作り直し: ①結論 ②見逃し分析(何の情報があれば高リスクにできたか) を最上段に置き、
+    #   従来のMolchan図・指標・レベル別・成分別・安定性・地震ごとの記録は下へ。設定は「詳細設定」に畳んだ。
+    html = r"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{display:flex;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif;color:#f3f4f6}
 #panel{width:310px;flex-shrink:0;background:rgba(255,255,255,.055);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);border-right:1px solid rgba(255,255,255,.14);overflow-y:auto;padding:14px}
 #panel h2{font-size:14px;margin-bottom:4px}
-.sub{font-size:11px;color:rgba(235,238,245,.55);line-height:1.6;margin-bottom:10px}
+.sub{font-size:11px;color:rgba(235,238,245,.6);line-height:1.65;margin-bottom:10px}
 .sec{margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid rgba(255,255,255,.09)}
 .sec h3{font-size:11px;color:#93c5fd;margin-bottom:6px;letter-spacing:.5px}
 .field{display:flex;align-items:center;gap:6px;margin-bottom:6px;font-size:12px}
 .field label{flex:1;color:rgba(235,238,245,.75);line-height:1.35}
 .field input{width:104px;padding:5px 6px;border-radius:7px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:#f3f4f6;font-size:12px}
-.hint{font-size:10px;color:rgba(235,238,245,.42);line-height:1.5;margin:-2px 0 6px}
+.hint{font-size:10px;color:rgba(235,238,245,.45);line-height:1.5;margin:-2px 0 6px}
+details{margin-bottom:10px}
+details>summary{cursor:pointer;font-size:11.5px;color:#93c5fd;padding:4px 0;list-style:none}
+details>summary::before{content:'▸ '} details[open]>summary::before{content:'▾ '}
+details .body{font-size:11px;color:rgba(235,238,245,.62);line-height:1.7;padding:4px 0 2px}
+details .body b{color:#e5e7eb}
 button{cursor:pointer;font-size:12.5px;font-weight:600;color:#fff;border:1px solid rgba(255,255,255,.2);border-radius:10px;padding:9px 12px;background:linear-gradient(135deg,rgba(10,132,255,.45),rgba(124,92,255,.32))}
 button:hover{filter:brightness(1.15)} button:disabled{opacity:.5;cursor:default;filter:none}
 button.sec2{background:rgba(255,255,255,.08)}
@@ -6360,13 +6470,17 @@ button.sec2{background:rgba(255,255,255,.08)}
 #main{flex:1;overflow-y:auto;padding:16px 18px 40px}
 #empty{margin-top:12vh;text-align:center;color:rgba(235,238,245,.45);font-size:13px;line-height:1.8}
 .card{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px 14px;margin-bottom:14px}
-.card h3{font-size:12.5px;margin-bottom:8px}
-.tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.card h3{font-size:13px;margin-bottom:8px}
+.card h4{font-size:12px;margin:14px 0 6px;color:#cbd5e1}
+.card .lead{font-size:11.5px;color:rgba(235,238,245,.7);line-height:1.7;margin-bottom:8px}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
 .tabs button{padding:6px 10px;font-size:11.5px;background:rgba(255,255,255,.07)}
 .tabs button.on{background:linear-gradient(135deg,rgba(10,132,255,.6),rgba(124,92,255,.4))}
+.ctl{font-size:10.5px;color:rgba(235,238,245,.5);margin:2px 0 4px}
 table{width:100%;border-collapse:collapse;font-size:11.5px}
 th,td{padding:5px 6px;text-align:right;border-bottom:1px solid rgba(255,255,255,.08);white-space:nowrap}
 th{color:rgba(235,238,245,.55);font-weight:600} th:first-child,td:first-child{text-align:left}
+td.l,th.l{text-align:left}
 .scroll{overflow-x:auto}
 .note{font-size:11px;color:rgba(235,238,245,.55);line-height:1.65;margin-top:8px}
 .warn{color:#fcd34d}
@@ -6374,50 +6488,91 @@ th{color:rgba(235,238,245,.55);font-weight:600} th:first-child,td:first-child{te
 .legend i{display:inline-block;width:18px;height:3px;vertical-align:middle;margin-right:5px}
 svg text{fill:rgba(235,238,245,.7);font-size:11px}
 .lv0{color:#94a3b8}.lv1{color:#86efac}.lv2{color:#fde047}.lv3{color:#fdba74}.lv4{color:#f87171}.lv5{color:#f0abfc}
-@media (max-width:768px){body{flex-direction:column;overflow-y:auto;height:auto}#panel{width:100%;border-right:none;border-bottom:1px solid rgba(255,255,255,.14)}#main{overflow:visible}}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-bottom:10px}
+.kpi{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:10px 12px}
+.kpi .big{font-size:26px;font-weight:700;line-height:1.1}
+.kpi .lab{font-size:11px;color:rgba(235,238,245,.7);line-height:1.55;margin-top:4px}
+.kpi small{display:block;font-size:10.5px;color:rgba(235,238,245,.45);margin-top:3px}
+.good{color:#86efac}.mid{color:#fde047}.bad{color:#fca5a5}
+.verdict{font-size:12px;line-height:1.75;padding:9px 12px;border-radius:10px;background:rgba(255,255,255,.05);border-left:3px solid #60a5fa;margin-top:4px}
+.verdict p{margin:2px 0}
+.badge{display:inline-block;padding:1px 7px;border-radius:8px;font-size:10.5px;font-weight:600}
+.badge.ok{background:rgba(134,239,172,.18);color:#86efac}.badge.ng{background:rgba(252,165,165,.18);color:#fca5a5}
+.stack{display:flex;height:22px;border-radius:7px;overflow:hidden;margin:6px 0 4px;background:rgba(255,255,255,.07)}
+.stack div{height:100%;min-width:0}
+.sleg{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:11px;color:rgba(235,238,245,.75);margin-bottom:6px}
+.sleg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.tag{display:inline-block;margin:1px 3px 1px 0;padding:0 6px;border-radius:7px;font-size:10.5px;background:rgba(96,165,250,.18);color:#bfdbfe}
+.tag.st{background:rgba(251,146,60,.18);color:#fed7aa}.tag.nb{background:rgba(167,139,250,.18);color:#ddd6fe}
+tr.clk{cursor:pointer} tr.clk:hover td{background:rgba(255,255,255,.04)}
+tr.det td{white-space:normal;text-align:left;background:rgba(255,255,255,.035);padding:8px 10px;font-size:11px;line-height:1.7}
+.rk{display:flex;align-items:center;gap:8px;margin:2px 0;font-size:11px}
+.rk span.n{width:210px;flex-shrink:0;color:rgba(235,238,245,.75)}
+.rk .tr{flex:1;height:8px;background:rgba(255,255,255,.08);border-radius:4px;overflow:hidden;max-width:260px}
+.rk .tr i{display:block;height:100%}
+.rk span.v{width:86px;flex-shrink:0}
+@media (max-width:768px){body{flex-direction:column;overflow-y:auto;height:auto}#panel{width:100%;border-right:none;border-bottom:1px solid rgba(255,255,255,.14)}#main{overflow:visible}.rk span.n{width:130px}}
 </style></head><body>
 <div id="panel">
-  <h2>検証：M6以上バックテスト</h2>
-  <p class="sub">気象庁一元化カタログのM6以上について、発生の少し前の時点でアーカイブと同じ計算を行い、震源が「面積の何%の高リスクセル」に入っていたかをMolchan図で集計します。静的な長期ハザードマップと比較し、余震は分けて評価します。リスク値・レベルは確率ではありません。成分別の単独成績・95%信頼区間・年別/規模別の安定性も表示します（v9.21。これらを出すため、保存済みの旧記録は再計算になります）。</p>
+  <h2>検証：大地震は高リスクの場所で起きていたか</h2>
+  <p class="sub">過去のM6以上の地震について、発生の直前に震源のセルが全セル中で何位だったかを調べます。高リスクで起きていれば成功。低リスクで起きていた(見逃し)なら、どの情報があれば高くできたかを調べます。地震の予測ではありません。リスク値・レベルは確率ではありません。</p>
+  <details>
+    <summary>このタブの見方・用語</summary>
+    <div class="body">
+      <b>順位(上位○%)</b>：震源のセルが、全セルのうち上から何%の面積に入るか。小さいほど「高リスクと判定されていた」。<br>
+      <b>的中</b>：震源セルが上位X%(画面上部で選択)に入っていたこと。ランダムに警戒すれば、的中率はXと同じになる。<br>
+      <b>見逃し</b>：上位X%に入らなかった地震。ここを調べると改善のヒントが得られる。<br>
+      <b>動的</b>：統合リスクマップ(直近の地震活動などを毎回計算)。<b>静的</b>：過去10年の地震分布などで作った、変化しない長期のマップ。動的が静的に勝てなければ、日々の更新に意味が薄い。<br>
+      <b>Molchan図</b>：横軸=警戒した面積、縦軸=外れ率。左下ほど良い。<br>
+      <b>評価する時点</b>：発生の少し前(既定3分前)。発生後は本震・余震で必ず上がるので成績には使わない。
+    </div>
+  </details>
   <div class="sec">
-    <h3>期間（JST）</h3>
+    <h3>1. 期間(JST)と対象</h3>
     <div class="field"><label>開始日</label><input type="date" id="pStart"></div>
     <div class="field"><label>終了日</label><input type="date" id="pEnd"></div>
     <div class="hint" id="covHint"></div>
     <div class="field"><label>対象のM以上</label><input type="number" id="pMag" step="0.1" value="6.0"></div>
-    <div class="field"><label>震源の深さ上限(km, 0=なし)</label><input type="number" id="pDepth" step="10" value="0"></div>
   </div>
-  <div class="sec">
-    <h3>評価する時点</h3>
-    <div class="field"><label>直前(発生の何時間前)</label><input type="number" id="pLead" step="0.01" min="0.01" value="0.05"></div>
-    <div class="field"><label>直後(発生の何時間後・参考用)</label><input type="number" id="pAfter" step="0.01" min="0" value="0.05"></div>
-  </div>
-  <div class="sec">
-    <h3>基準の作り直し（日付ごとの基準）</h3>
-    <div class="field"><label>作り直す間隔(日, 0=1地震ごと)</label><input type="number" id="pRebuild" step="1" value="30"></div>
-    <div class="field"><label>基準のサンプル間隔(時間)</label><input type="number" id="pStep" step="6" value="24"></div>
-    <div class="hint">基準は「評価時点より前の65日」だけで作ります（先読みなし）。作り直し間隔を短くするほど厳密ですが、基準1回ぶんの計算が地震の数だけ増えます。間隔0は最も厳密で最も遅い設定です。<br>遅いとき: 時間の大半は「基準の作成」(約65時点ぶんのETAS・b値計算)です。「作り直す間隔」を90〜180日、「基準のサンプル間隔」を48時間にすると、基準の作成回数と1回あたりの重さが減ります（基準が少し古く・粗くなりますが、評価時点より後のデータは使いません）。</div>
-  </div>
-  <div class="sec">
-    <h3>余震の判定</h3>
-    <div class="field"><label>前の大地震のM以上</label><input type="number" id="pPrev" step="0.1" value="6.0"></div>
-    <div class="hint">近く(50〜400km)・直前(30〜365日)の範囲は、前の大地震の規模から自動で決めます。</div>
-  </div>
-  <div class="row"><button id="runBtn" onclick="startRun()">実行</button><button id="cancelBtn" class="sec2" onclick="cancelRun()" disabled>中止</button></div>
+  <details>
+    <summary>詳細設定(通常は変えなくてよい)</summary>
+    <div class="body">
+      <div class="field"><label>震源の深さ上限(km, 0=なし)</label><input type="number" id="pDepth" step="10" value="0"></div>
+      <div class="field"><label>直前(発生の何時間前)</label><input type="number" id="pLead" step="0.01" min="0.01" value="0.05"></div>
+      <div class="field"><label>直後(何時間後・参考用)</label><input type="number" id="pAfter" step="0.01" min="0" value="0.05"></div>
+      <div class="field"><label>基準の作り直し間隔(日, 0=1地震ごと)</label><input type="number" id="pRebuild" step="1" value="30"></div>
+      <div class="field"><label>基準のサンプル間隔(時間)</label><input type="number" id="pStep" step="6" value="24"></div>
+      <div class="hint">基準は「評価時点より前の65日」だけで作ります(先読みなし)。作り直し間隔が短いほど厳密ですが遅くなります。遅いときは間隔を90〜180日、サンプル間隔を48時間にすると軽くなります(基準が少し古く・粗くなります)。</div>
+      <div class="field"><label>余震判定:前の大地震のM以上</label><input type="number" id="pPrev" step="0.1" value="6.0"></div>
+      <div class="hint">近く(50〜400km)・直前(30〜365日)の範囲は、前の大地震の規模から自動で決めます。</div>
+    </div>
+  </details>
+  <div class="row"><button id="runBtn" onclick="startRun()">2. 実行</button><button id="cancelBtn" class="sec2" onclick="cancelRun()" disabled>中止</button></div>
   <div id="bar"><div id="barIn"></div></div>
   <div id="stat"></div>
   <div class="row" style="margin-top:10px"><button class="sec2" onclick="loadResult()">結果を再読み込み</button><button class="sec2" onclick="dlCsv()">CSV</button></div>
+  <div class="hint" style="margin-top:8px">計算済みの地震は保存されます。中断しても、期間を広げても続きから進みます。</div>
 </div>
-<div id="main"><div id="empty">期間を決めて「実行」を押すと、結果がここに表示されます。<br>計算済みの地震は保存されるので、中断しても期間を広げても続きから進みます。</div></div>
+<div id="main"><div id="empty">期間を決めて「実行」を押すと、結果がここに表示されます。<br>最初に「結論」と「見逃し分析」が出ます。</div></div>
 <script>
 var DEF = __DEFAULTS__;
-var S = {data:null, group:'all', variant:'tau', zoom:false, timer:null, t0:0};
+var S = {data:null, group:'all', variant:'tau', zoom:false, thr:0.2, rows:'all', timer:null, t0:0};
 var COLORS = {dyn:'#60a5fa', st_seis:'#fb923c', st_comb:'#34d399'};
+var CAUSE = [
+  ['dyn_comp','#60a5fa','動的の成分を単独で使えば入っていた(合成で薄まった)'],
+  ['static_only','#fb923c','動的の成分では無理だが、長期の静的ハザードなら入っていた'],
+  ['widen_only','#a78bfa','周囲±1セルまで広げれば入っていた(位置のずれ)'],
+  ['no_score','#64748b','震源セルに動的スコアが無く、警戒の対象外だった'],
+  ['none','#ef4444','どの情報でも入らない(新しい情報が必要)']
+];
 function $(id){return document.getElementById(id)}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 function pct(x,d){return x==null?'-':(x*100).toFixed(d==null?1:d)+'%'}
 function ciTxt(c){return c?'<br><small>95%CI '+Math.round(c[0]*100)+'〜'+Math.round(c[1]*100)+'%</small>':''}
 function aciTxt(c){return c?'<br><small>95%CI '+c[0].toFixed(2)+'〜'+c[1].toFixed(2)+'</small>':''}
+function tagOf(){return String(Math.round(S.thr*100))}
+function srcLab(k){var L=(S.data&&S.data.src_labels)||{}; return L[k]||k}
+function srcTag(k){var c=(k==='nb')?'tag nb':(k.indexOf('st_')===0?'tag st':'tag'); return '<span class="'+c+'">'+esc(srcLab(k))+'</span>'}
 function params(){
   return {start:$('pStart').value, end:$('pEnd').value, min_mag:$('pMag').value, max_depth_km:$('pDepth').value,
           lead_hours:$('pLead').value, after_hours:$('pAfter').value, rebuild_days:$('pRebuild').value,
@@ -6468,7 +6623,9 @@ function loadResult(quiet){
 }
 function dlCsv(){ window.location='/backtest/events.csv?'+qs(params()); }
 function pick(k,v){ S[k]=v; render(); }
+function toggleDet(i){ var e=$('det'+i); if(e) e.style.display = (e.style.display==='none'?'table-row':'none'); }
 
+/* ── Molchan図 ── */
 function drawMolchan(G){
   var W=540,H=450,ml=54,mr=16,mt=14,mb=50, pw=W-ml-mr, ph=H-mt-mb;
   var xmax = S.zoom?0.3:1.0, grid=S.data.tau_grid;
@@ -6477,6 +6634,8 @@ function drawMolchan(G){
   var xt = S.zoom?[0,.05,.1,.15,.2,.25,.3]:[0,.2,.4,.6,.8,1];
   xt.forEach(function(t){ s+='<line x1="'+X(t)+'" x2="'+X(t)+'" y1="'+mt+'" y2="'+(mt+ph)+'" stroke="rgba(255,255,255,.08)"/><text x="'+X(t)+'" y="'+(mt+ph+16)+'" text-anchor="middle">'+Math.round(t*100)+'%</text>'; });
   [0,.2,.4,.6,.8,1].forEach(function(v){ s+='<line x1="'+ml+'" x2="'+(ml+pw)+'" y1="'+Y(v)+'" y2="'+Y(v)+'" stroke="rgba(255,255,255,.08)"/><text x="'+(ml-6)+'" y="'+(Y(v)+4)+'" text-anchor="end">'+Math.round(v*100)+'%</text>'; });
+  /* 選択中の「高リスクとみなす範囲」を縦線で示す */
+  if(S.thr<=xmax) s+='<line x1="'+X(S.thr)+'" x2="'+X(S.thr)+'" y1="'+mt+'" y2="'+(mt+ph)+'" stroke="#fcd34d" stroke-dasharray="3 3" stroke-width="1"/>';
   s+='<text x="'+(ml+pw/2)+'" y="'+(H-8)+'" text-anchor="middle">警戒した面積の割合（高リスクセルから順に）</text>';
   s+='<text transform="translate(14,'+(mt+ph/2)+') rotate(-90)" text-anchor="middle">外れ率（入らなかった地震の割合）</text>';
   s+='<line x1="'+X(0)+'" y1="'+Y(1)+'" x2="'+X(1)+'" y2="'+Y(0)+'" stroke="#9ca3af" stroke-dasharray="5 4"/>';
@@ -6491,65 +6650,178 @@ function drawMolchan(G){
   return s+'</svg>';
 }
 function levelCell(l){ return '<span class="lv'+l+'">Lv'+l+'</span>'; }
-function render(){
-  var D=S.data, G=D.groups[S.group], L=D.group_labels, M=D.model_labels, h='';
-  if(!D.n_events){ $('main').innerHTML='<div id="empty">この条件で保存済みの結果はまだありません。「実行」を押してください。</div>'; return; }
-  h+='<div class="card"><div class="tabs">';
-  Object.keys(L).forEach(function(g){ h+='<button class="'+(S.group===g?'on':'')+'" onclick="pick(\\'group\\',\\''+g+'\\')">'+esc(L[g])+'（'+D.groups[g].n+'件）</button>'; });
-  h+='</div><div class="tabs"><button class="'+(S.variant==='tau'?'on':'')+'" onclick="pick(\\'variant\\',\\'tau\\')">震源セルだけで判定</button>'+
-     '<button class="'+(S.variant==='tau_nb'?'on':'')+'" onclick="pick(\\'variant\\',\\'tau_nb\\')">周囲±1セル(約55km)も含める</button>'+
-     '<button class="'+(S.zoom?'on':'')+'" onclick="pick(\\'zoom\\','+(!S.zoom)+')">横軸 0〜30%に拡大</button></div>';
-  if(G.n<10) h+='<div class="note warn">この区分は '+G.n+' 件しかないため、結果は参考程度です（偶然で説明できる範囲が広い）。</div>';
-  if(G.n===0){ $('main').innerHTML=h+'</div>'; return; }
-  h+='<h3>Molchan図（'+esc(L[S.group])+'・'+G.n+'件）</h3>'+drawMolchan(G);
-  h+='<div class="legend"><span><i style="background:'+COLORS.dyn+'"></i>'+esc(M.dyn)+'</span><span><i style="background:'+COLORS.st_comb+'"></i>'+esc(M.st_comb)+'</span><span><i style="background:'+COLORS.st_seis+'"></i>'+esc(M.st_seis)+'</span><span><i style="background:#9ca3af"></i>ランダム</span><span><i style="background:#c084fc"></i>ランダムより有意に良い境界(片側5%)</span></div>';
-  h+='<div class="note">左下に近いほど良い（少ない面積で多くの地震を捉えている）。ランダム（点線の対角線）より下にあり、紫の境界よりも下なら、偶然とは言いにくい水準です。</div></div>';
 
-  h+='<div class="card"><h3>指標（'+(S.variant==='tau'?'震源セルのみ':'周囲込み')+'）</h3><div class="scroll"><table><tr><th>モデル</th><th>上位5%以内</th><th>上位10%以内</th><th>上位20%以内</th><th>中央順位</th><th>AUC</th><th>p(10%)</th></tr>';
+/* ── 画面上部: 表示の切り替え ── */
+function controlsCard(D){
+  var L=D.group_labels, h='<div class="card">';
+  h+='<div class="ctl">表示する地震の区分</div><div class="tabs">';
+  Object.keys(L).forEach(function(g){ h+='<button class="'+(S.group===g?'on':'')+'" onclick="pick(\'group\',\''+g+'\')">'+esc(L[g])+'（'+D.groups[g].n+'件）</button>'; });
+  h+='</div><div class="ctl">「高リスク」とみなす範囲（面積の上位何%を警戒するか。結論・見逃し分析・記録の判定に使います）</div><div class="tabs">';
+  (D.miss_thrs||[0.1,0.2,0.3]).forEach(function(t){ h+='<button class="'+(Math.abs(S.thr-t)<1e-9?'on':'')+'" onclick="pick(\'thr\','+t+')">上位'+Math.round(t*100)+'%</button>'; });
+  h+='</div><div class="ctl">判定のしかた</div><div class="tabs"><button class="'+(S.variant==='tau'?'on':'')+'" onclick="pick(\'variant\',\'tau\')">震源セルだけで判定</button>'+
+     '<button class="'+(S.variant==='tau_nb'?'on':'')+'" onclick="pick(\'variant\',\'tau_nb\')">周囲±1セル(約55km)も含める</button></div>';
+  if(S.variant==='tau_nb') h+='<div class="note">「周囲込み」はMolchan図・指標・結論に反映されます。見逃し分析は震源セルだけで判定し、周囲を広げた場合は別項目として扱います。</div>';
+  return h+'</div>';
+}
+
+/* ── ① 結論 ── */
+function summaryCard(G){
+  var tg=tagOf(), thr=S.thr;
+  var m=G.models.dyn[S.variant].metrics, st=G.models.st_comb[S.variant].metrics;
+  var hit=m['hit'+tg], k=m['k'+tg], p=m['p'+tg], ci=m['ci'+tg], n=m.n;
+  var lift = thr>0 ? hit/thr : null;
+  var lv = (G.levels||[])[2], lvHit=null, lvArea=null, lvLift=null;
+  if(lv){ if(S.variant==='tau'){lvHit=lv.hit;lvArea=lv.area;lvLift=lv.lift;} else {lvHit=lv.hit_nb;lvArea=lv.area_nb;lvLift=lv.lift_nb;} }
+  var cls = (hit>thr && p<0.05) ? 'good' : (hit>thr ? 'mid' : 'bad');
+  var h='<div class="card"><h3>① 結論：大地震は高リスクの場所で起きていたか</h3><div class="kpis">';
+  h+='<div class="kpi"><div class="big '+cls+'">'+pct(hit,0)+'</div><div class="lab">M'+esc(String(S.data.params.min_mag))+'以上 '+n+'件のうち、震源セルが<b>上位'+tg+'%の高リスク側</b>に入っていた割合（'+k+'/'+n+'件）</div><small>ランダムに警戒した場合は'+tg+'%'+(ci?'　／　95%CI '+Math.round(ci[0]*100)+'〜'+Math.round(ci[1]*100)+'%':'')+'</small></div>';
+  h+='<div class="kpi"><div class="big">'+(lift==null?'-':'×'+lift.toFixed(1))+'</div><div class="lab">ランダムに対する倍率（的中率 ÷ 警戒面積）</div><small>1ならランダムと同じ。偶然である確率 p='+p+'</small></div>';
+  h+='<div class="kpi"><div class="big '+(n-k>0?'mid':'good')+'">'+(n-k)+'件</div><div class="lab"><b>見逃し</b>（上位'+tg+'%に入らなかった地震）。下の②で原因を調べます。</div><small>全体の'+pct(n?(n-k)/n:null,0)+'</small></div>';
+  if(lvHit!=null) h+='<div class="kpi"><div class="big">'+pct(lvHit,0)+'</div><div class="lab">実際の画面の<b>Lv3以上</b>のセルに入っていた割合（Lv3以上は全面積の'+pct(lvArea,1)+'）</div><small>倍率 '+(lvLift==null?'-':'×'+lvLift)+'（レベル境界は自動算出）</small></div>';
+  h+='</div><div class="verdict">';
+  var v1;
+  if(hit>thr && p<0.05) v1='<b class="good">○ ランダムより有意に高リスク側に集まっています。</b>面積'+tg+'%の警戒で'+pct(hit,0)+'を捉えました（偶然では説明しにくい水準）。';
+  else if(hit>thr) v1='<b class="mid">△ ランダムよりは高いものの、偶然でも起こりうる差です。</b>件数が少ない可能性があります。';
+  else v1='<b class="bad">× ランダム以下です。</b>現状の統合リスクマップは、この条件では大地震の場所を高リスクに集められていません。';
+  h+='<p>'+v1+'</p>';
+  var pr=G.paired.st_comb[S.variant];
+  var stHit=st['hit'+tg];
+  var v2='静的な長期ハザード(地震分布＋活断層)の的中率は'+pct(stHit,0)+'。';
+  if(pr.p<0.05 && pr.dyn_better>pr.dyn_worse) v2+='同じ地震どうしの比較で、<b class="good">動的のほうが有意に上位</b>でした(動的が上位'+pr.dyn_better+'件／下位'+pr.dyn_worse+'件)。日々の更新に価値があります。';
+  else if(pr.p<0.05 && pr.dyn_worse>pr.dyn_better) v2+='同じ地震どうしの比較で、<b class="bad">静的のほうが有意に上位</b>でした(動的が上位'+pr.dyn_better+'件／下位'+pr.dyn_worse+'件)。動的の更新がかえって精度を下げている可能性があります。';
+  else v2+='同じ地震どうしの比較では動的と静的に有意な差はありません(動的が上位'+pr.dyn_better+'件／下位'+pr.dyn_worse+'件・p='+pr.p+')。動的更新の上乗せ効果はまだ示せていません。';
+  h+='<p>'+v2+'</p>';
+  if(n<20) h+='<p class="warn">この区分は'+n+'件しかないため、結果は参考程度です。</p>';
+  return h+'</div></div>';
+}
+
+/* ── ② 見逃し分析 ── */
+function missCard(G){
+  var tg=tagOf(), M=(G.miss||{})[tg];
+  if(!M) return '';
+  var h='<div class="card"><h3>② 見逃し分析：低リスクで起きた地震は、何の情報があれば高リスクにできたか</h3>';
+  h+='<div class="lead">「見逃し」=震源セルが上位'+tg+'%に入らなかった地震('+M.n_miss+'件／'+M.n+'件)。それぞれの情報を<b>単独で</b>使い、同じ面積(上位'+tg+'%)だけ警戒したとき、震源セルが入っていたかを調べました。</div>';
+  if(!M.n_miss){ return h+'<div class="note">この条件では見逃しはありません。</div></div>'; }
+  /* 原因の内訳(積み上げ棒) */
+  h+='<h4>見逃しの原因の内訳</h4><div class="stack">';
+  CAUSE.forEach(function(c){ var v=M.cause[c[0]]||0; if(v>0) h+='<div style="width:'+(100*v/M.n_miss)+'%;background:'+c[1]+'" title="'+esc(c[2])+' '+v+'件"></div>'; });
+  h+='</div><div class="sleg">';
+  CAUSE.forEach(function(c){ var v=M.cause[c[0]]||0; h+='<span><i style="background:'+c[1]+'"></i>'+esc(c[2])+'：<b>'+v+'件</b></span>'; });
+  h+='</div>';
+  /* 情報源ごとの表 */
+  h+='<h4>どの情報なら見逃しを救えたか</h4><div class="scroll"><table><tr><th class="l">情報(単独で使った場合)</th><th>見逃しのうち入っていた件数</th><th>見逃しに占める割合</th><th>全地震での的中率</th></tr>';
+  var srcs=M.sources.slice().sort(function(a,b){return b.rescued-a.rescued});
+  srcs.forEach(function(r){
+    var c=(r.rescued_pct!=null && r.rescued_pct>=0.3)?'good':'';
+    h+='<tr><td class="l">'+srcTag(r.key)+'</td><td class="'+c+'">'+r.rescued+'件</td><td>'+pct(r.rescued_pct,0)+'</td><td>'+pct(r.hit_all,0)+'<small>（n='+r.n_all+'）</small></td></tr>';
+  });
+  h+='</table></div><div class="note">「全地震での的中率」は、その情報だけで上位'+tg+'%を警戒したとき全地震の何%が入るか(ランダムなら'+tg+'%)。<b>見逃しを多く救えても、全地震での的中率が低い情報は、広く当てずに偶然当たっただけの可能性があります。</b>探せば何かは当たるので、救えた数と全体の的中率を併せて見てください。TEC・GNSS・気圧は過去値を保持していないため、この分析の対象外です。</div>';
+  /* 深さ別 */
+  if(M.depth && M.depth.length){
+    h+='<h4>震源の深さ別の的中率(上位'+tg+'%)</h4><div class="scroll"><table><tr><th class="l">深さ</th><th>件数</th><th>動的</th><th>静的(地震+断層)</th></tr>';
+    M.depth.forEach(function(r){ h+='<tr><td class="l">'+esc(r.label)+'</td><td>'+r.n+'</td><td>'+pct(r.dyn_hit,0)+'</td><td>'+pct(r.st_hit,0)+'</td></tr>'; });
+    h+='</table></div><div class="note">特定の深さで極端に低ければ、その深さの地震に効く情報(例: 沈み込むプレート内など)が足りていない可能性があります。</div>';
+  }
+  /* ワースト見逃し */
+  if(M.worst && M.worst.length){
+    h+='<h4>特に順位が低かった見逃し(ワースト'+M.worst.length+'件)</h4><div class="scroll"><table><tr><th class="l">時刻(JST)</th><th class="l">震源名</th><th>M</th><th>深さ</th><th>動的の順位</th><th class="l">最も順位が良かった情報</th><th class="l">上位'+tg+'%に入れた情報</th></tr>';
+    M.worst.forEach(function(w){
+      h+='<tr><td class="l">'+esc(w.t_jst.slice(0,16))+'</td><td class="l">'+esc(w.place)+'</td><td>'+w.mag+'</td><td>'+(w.depth==null?'-':Math.round(w.depth)+'km')+'</td><td>'+(w.valid?'上位'+pct(w.tau):'<span class="warn">スコア無し</span>')+'</td><td class="l">'+srcTag(w.best)+' <small>上位'+pct(w.best_tau)+'</small></td><td class="l">'+(w.rescue.length?w.rescue.map(srcTag).join(''):'<span class="bad">なし</span>')+'</td></tr>';
+    });
+    h+='</table></div>';
+  }
+  h+='<div class="note">読み方の目安：<b>「動的の成分を単独で使えば入っていた」が多い</b>→合成の重みづけが原因(重みの見直しを検討)。<b>「静的なら入っていた」が多い</b>→長期の背景リスク(過去の地震分布・活断層)の重みが足りない。<b>「どの情報でも入らない」が多い</b>→現在の成分に無い情報(長期評価・プレート固着・GNSSなど)の追加が必要。<b>「スコア無し」が多い</b>→データの薄いセルの扱いを見直す。</div></div>';
+  return h;
+}
+
+/* ── ③ Molchan図 ほか ── */
+function molchanCard(G,L,M){
+  var h='<div class="card"><h3>③ Molchan図（'+esc(L[S.group])+'・'+G.n+'件）</h3>';
+  h+='<div class="tabs"><button class="'+(S.zoom?'on':'')+'" onclick="pick(\'zoom\','+(!S.zoom)+')">横軸 0〜30%に拡大</button></div>'+drawMolchan(G);
+  h+='<div class="legend"><span><i style="background:'+COLORS.dyn+'"></i>'+esc(M.dyn)+'</span><span><i style="background:'+COLORS.st_comb+'"></i>'+esc(M.st_comb)+'</span><span><i style="background:'+COLORS.st_seis+'"></i>'+esc(M.st_seis)+'</span><span><i style="background:#9ca3af"></i>ランダム</span><span><i style="background:#c084fc"></i>ランダムより有意に良い境界(片側5%)</span><span><i style="background:#fcd34d"></i>選択中の高リスク範囲</span></div>';
+  h+='<div class="note">左下に近いほど良い（少ない面積で多くの地震を捉えている）。ランダム（点線の対角線）より下にあり、紫の境界よりも下なら、偶然とは言いにくい水準です。</div></div>';
+  return h;
+}
+function metricsCard(G,M){
+  var h='<div class="card"><h3>④ 指標の詳細（'+(S.variant==='tau'?'震源セルのみ':'周囲込み')+'）</h3><div class="scroll"><table><tr><th>モデル</th><th>上位5%以内</th><th>上位10%以内</th><th>上位20%以内</th><th>上位30%以内</th><th>中央順位</th><th>AUC</th><th>p(10%)</th></tr>';
   ['dyn','st_comb','st_seis'].forEach(function(m){ var x=G.models[m][S.variant].metrics;
-    h+='<tr><td>'+esc(M[m])+'</td><td>'+pct(x.hit5,0)+'（'+x.k5+'/'+x.n+'）</td><td>'+pct(x.hit10,0)+'（'+x.k10+'/'+x.n+'）'+ciTxt(x.ci10)+'</td><td>'+pct(x.hit20,0)+'（'+x.k20+'/'+x.n+'）</td><td>上位'+pct(x.median_tau)+'</td><td>'+x.auc.toFixed(3)+aciTxt(x.auc_ci)+'</td><td>'+x.p10+'</td></tr>'; });
+    h+='<tr><td>'+esc(M[m])+'</td><td>'+pct(x.hit5,0)+'（'+x.k5+'/'+x.n+'）</td><td>'+pct(x.hit10,0)+'（'+x.k10+'/'+x.n+'）'+ciTxt(x.ci10)+'</td><td>'+pct(x.hit20,0)+'（'+x.k20+'/'+x.n+'）</td><td>'+(x.hit30==null?'-':pct(x.hit30,0)+'（'+x.k30+'/'+x.n+'）')+'</td><td>上位'+pct(x.median_tau)+'</td><td>'+x.auc.toFixed(3)+aciTxt(x.auc_ci)+'</td><td>'+x.p10+'</td></tr>'; });
   h+='</table></div><div class="note">「上位10%以内」= 面積の10%だけ警戒したとき、そのうち何%の地震が入っていたか（ランダムなら10%）。AUC=1−平均順位（ランダムで0.5）。p(10%)=ランダムでこれ以上入る確率。</div>';
-  h+='<h3 style="margin-top:12px">動的 vs 静的（同じ地震どうしの順位を比較）</h3><div class="scroll"><table><tr><th>比較相手</th><th>動的が上位</th><th>動的が下位</th><th>順位差の中央値</th><th>符号検定p</th></tr>';
+  h+='<h4>動的 vs 静的（同じ地震どうしの順位を比較）</h4><div class="scroll"><table><tr><th>比較相手</th><th>動的が上位</th><th>動的が下位</th><th>順位差の中央値</th><th>符号検定p</th></tr>';
   ['st_comb','st_seis'].forEach(function(m){ var x=G.paired[m][S.variant];
     h+='<tr><td>'+esc(M[m])+'</td><td>'+x.dyn_better+'件</td><td>'+x.dyn_worse+'件</td><td>'+(x.median_diff==null?'-':(x.median_diff*100).toFixed(1)+'pt')+'</td><td>'+x.p+'</td></tr>'; });
   h+='</table></div><div class="note">順位差は「動的−静的」。負なら動的のほうが上位。pが大きい(目安0.05以上)なら、どちらが良いとは言えません。</div></div>';
-
-  h+='<div class="card"><h3>レベル別（動的・実際の運用に近い見方）</h3><div class="scroll"><table><tr><th>レベル以上</th><th>面積比</th><th>的中率(震源セル)</th><th>倍率</th><th>面積比(周囲込み)</th><th>的中率(周囲込み)</th><th>倍率</th></tr>';
+  return h;
+}
+function levelCard(G){
+  var h='<div class="card"><h3>⑤ レベル別（動的・実際の運用に近い見方）</h3><div class="scroll"><table><tr><th>レベル以上</th><th>面積比</th><th>的中率(震源セル)</th><th>倍率</th><th>面積比(周囲込み)</th><th>的中率(周囲込み)</th><th>倍率</th></tr>';
   G.levels.forEach(function(r){ h+='<tr><td>'+levelCell(r.level)+'</td><td>'+pct(r.area,2)+'</td><td>'+pct(r.hit,0)+'</td><td>'+(r.lift==null?'-':'×'+r.lift)+'</td><td>'+pct(r.area_nb,2)+'</td><td>'+pct(r.hit_nb,0)+'</td><td>'+(r.lift_nb==null?'-':'×'+r.lift_nb)+'</td></tr>'; });
-  h+='</table></div><div class="note">倍率=的中率÷面積比（1ならランダムと同じ）。面積比は評価した各時点の平均。</div></div>';
-
-  // (v9.21) 成分別の単独成績: どの成分が効いているか（重み・成分の取捨の根拠）
-  var comps = G.components || [];
-  if(comps.length){
-    h+="<div class='card'><h3>成分別の単独成績（震源セル・動的の各成分だけで警戒した場合）</h3><div class='scroll'><table><tr><th>成分</th><th>現在の重み</th><th>件数</th><th>AUC</th><th>上位10%以内</th><th>p(10%)</th><th>スコア無し</th></tr>";
-    comps.forEach(function(c){
-      var cls = (c.auc_ci && c.auc_ci[0] > 0.5) ? "lv1" : ((c.auc_ci && c.auc_ci[1] < 0.5) ? "lv4" : "");
-      h+="<tr><td>"+esc(c.label)+"</td><td>"+c.weight+"</td><td>"+c.n+"</td><td class='"+cls+"'>"+c.auc.toFixed(3)+aciTxt(c.auc_ci)+"</td><td>"+pct(c.hit10,0)+"</td><td>"+c.p10+"</td><td>"+pct(c.no_score,0)+"</td></tr>";
-    });
-    h+="</table></div><div class='note'>AUC 0.5=ランダム。緑=95%信頼区間が0.5より上(偶然とは言いにくい)、赤=0.5より下(逆効果)。「スコア無し」=その成分が無く警戒できなかった割合。成分どうしは相関があるので、単独成績が良くても合成で効くとは限りません。重みを変える際はこの表と上の合成成績を併せて見てください。TEC・GNSS・気圧は過去値を保持していないためバックテストの対象外です。</div></div>";
-  }
-  // (v9.21) 年別・規模別の安定性
-  var bd = G.breakdown || {};
+  return h+'</table></div><div class="note">倍率=的中率÷面積比（1ならランダムと同じ）。面積比は評価した各時点の平均。</div></div>';
+}
+function componentCard(G){
+  var comps=G.components||[]; if(!comps.length) return '';
+  var h="<div class='card'><h3>⑥ 成分別の単独成績（震源セル・動的の各成分だけで警戒した場合）</h3><div class='scroll'><table><tr><th>成分</th><th>現在の重み</th><th>件数</th><th>AUC</th><th>上位10%以内</th><th>p(10%)</th><th>スコア無し</th></tr>";
+  comps.forEach(function(c){
+    var cls = (c.auc_ci && c.auc_ci[0] > 0.5) ? "lv1" : ((c.auc_ci && c.auc_ci[1] < 0.5) ? "lv4" : "");
+    h+="<tr><td>"+esc(c.label)+"</td><td>"+c.weight+"</td><td>"+c.n+"</td><td class='"+cls+"'>"+c.auc.toFixed(3)+aciTxt(c.auc_ci)+"</td><td>"+pct(c.hit10,0)+"</td><td>"+c.p10+"</td><td>"+pct(c.no_score,0)+"</td></tr>";
+  });
+  return h+"</table></div><div class='note'>AUC 0.5=ランダム。緑=95%信頼区間が0.5より上(偶然とは言いにくい)、赤=0.5より下(逆効果)。「スコア無し」=その成分が無く警戒できなかった割合。成分どうしは相関があるので、単独成績が良くても合成で効くとは限りません。</div></div>";
+}
+function stabilityCard(G){
+  var bd=G.breakdown||{};
   function bdTable(title, rows){
     if(!rows || !rows.length) return "";
-    var t="<h3 style='margin-top:12px'>"+title+"</h3><div class='scroll'><table><tr><th></th><th>件数</th><th>動的AUC</th><th>動的 上位10%</th><th>静的(地震+断層)AUC</th><th>静的 上位10%</th></tr>";
+    var t="<h4>"+title+"</h4><div class='scroll'><table><tr><th></th><th>件数</th><th>動的AUC</th><th>動的 上位10%</th><th>静的(地震+断層)AUC</th><th>静的 上位10%</th></tr>";
     rows.forEach(function(r){
       var cls = r.n<5 ? "warn" : "";
       t+="<tr><td>"+esc(r.label)+"</td><td class='"+cls+"'>"+r.n+"</td><td>"+(r.dyn_auc==null?"-":r.dyn_auc.toFixed(3))+"</td><td>"+pct(r.dyn_hit10,0)+"</td><td>"+(r.st_auc==null?"-":r.st_auc.toFixed(3))+"</td><td>"+pct(r.st_hit10,0)+"</td></tr>";
     });
     return t+"</table></div>";
   }
-  if((bd.by_year||[]).length || (bd.by_mag||[]).length){
-    h+="<div class='card'><h3>安定性（震源セルのみ・区分ごと）</h3>"+bdTable("年別", bd.by_year)+bdTable("規模別", bd.by_mag)+
-       "<div class='note'>特定の年（大地震列があった年など）だけ成績が良い場合、全体の成績はその年に引っ張られています。件数が5件未満の行（黄色）は参考程度です。</div></div>";
-  }
+  if(!((bd.by_year||[]).length || (bd.by_mag||[]).length)) return '';
+  return "<div class='card'><h3>⑦ 安定性（震源セルのみ・区分ごと）</h3>"+bdTable("年別", bd.by_year)+bdTable("規模別", bd.by_mag)+
+     "<div class='note'>特定の年（大地震列があった年など）だけ成績が良い場合、全体の成績はその年に引っ張られています。件数が5件未満の行（黄色）は参考程度です。</div></div>";
+}
 
-  h+='<div class="card"><h3>地震ごとの記録（'+esc(L[S.group])+'）</h3><div class="scroll"><table><tr><th>時刻(JST)</th><th>震源名</th><th>M</th><th>直前</th><th>直後(参考)</th><th>順位</th><th>周囲Lv</th><th>静的順位</th><th>区分</th></tr>';
+/* ── ⑧ 地震ごとの記録（クリックで詳細） ── */
+function rankBar(label, tau, ok){
+  var w=Math.max(1, Math.round((1-tau)*100));
+  return '<div class="rk"><span class="n">'+label+'</span><span class="tr"><i style="width:'+w+'%;background:'+(ok?'#34d399':'#64748b')+'"></i></span><span class="v">上位'+pct(tau)+'</span></div>';
+}
+function recordsCard(D){
+  var thr=S.thr, tg=tagOf(), EPS=1e-9;
   var rows=(D.rows||[]).filter(function(r){ return S.group==='all'||r.group===S.group; });
-  rows.slice(-400).reverse().forEach(function(r){
+  var nMiss=rows.filter(function(r){return r.dyn.tau>thr+EPS}).length;
+  if(S.rows==='miss') rows=rows.filter(function(r){return r.dyn.tau>thr+EPS});
+  var h='<div class="card"><h3>⑧ 地震ごとの記録（行をタップすると詳細）</h3><div class="tabs"><button class="'+(S.rows==='all'?'on':'')+'" onclick="pick(\'rows\',\'all\')">すべて</button><button class="'+(S.rows==='miss'?'on':'')+'" onclick="pick(\'rows\',\'miss\')">見逃しだけ（'+nMiss+'件）</button></div>';
+  h+='<div class="scroll"><table><tr><th>時刻(JST)</th><th class="l">震源名</th><th>M</th><th>判定(上位'+tg+'%)</th><th>直前</th><th>直後(参考)</th><th>順位</th><th>静的順位</th><th class="l">区分</th></tr>';
+  var shown=rows.slice(-400).reverse();
+  shown.forEach(function(r,i){
+    var ok=r.dyn.tau<=thr+EPS;
     var g={independent:'独立',aftershock:'余震・続発',unseen:'直前発生'}[r.group];
-    h+='<tr><td>'+esc(r.t_jst.slice(0,16))+'</td><td>'+esc(r.place)+'</td><td>'+r.mag+'</td><td>'+(r.dyn.score==null?'-':r.dyn.score)+' '+levelCell(r.dyn.level)+'</td><td>'+(r.after.score==null?'-':r.after.score)+' '+levelCell(r.after.level)+'</td><td>上位'+pct(r.dyn.tau)+'</td><td>'+levelCell(r.dyn.nb_level)+'</td><td>上位'+pct(r.st_comb.tau)+'</td><td>'+g+(r.prev?'<br><small>M'+r.prev.mag+' '+r.prev.dist_km+'km '+r.prev.gap_days+'日前</small>':'')+'</td></tr>'; });
-  h+='</table></div><div class="note">直前/直後はリスク値(0〜100)とレベル。「順位」は震源セルが全セル中の上位何%か。震源名はカタログの英語表記です。全件はCSVで取得できます。</div></div>';
+    h+='<tr class="clk" onclick="toggleDet('+i+')"><td>'+esc(r.t_jst.slice(0,16))+'</td><td class="l">'+esc(r.place)+'</td><td>'+r.mag+'</td><td><span class="badge '+(ok?'ok':'ng')+'">'+(ok?'的中':'見逃し')+'</span></td><td>'+(r.dyn.score==null?'-':r.dyn.score)+' '+levelCell(r.dyn.level)+'</td><td>'+(r.after.score==null?'-':r.after.score)+' '+levelCell(r.after.level)+'</td><td>上位'+pct(r.dyn.tau)+'</td><td>上位'+pct(r.st_comb.tau)+'</td><td class="l">'+g+'</td></tr>';
+    var d='<b>評価時点</b> '+esc(r.eval_jst)+'（基準日 '+esc(String(r.anchor_jst).slice(0,10))+'）／ 深さ '+(r.depth==null?'-':Math.round(r.depth)+'km')+' ／ 震源 '+r.lat+'N '+r.lon+'E ／ 周囲±1セルの最大 '+levelCell(r.dyn.nb_level)+'<br>';
+    d+='<b>震源セルの順位（長い棒ほど高リスク側・緑=上位'+tg+'%に入った）</b>';
+    d+=rankBar('動的（統合リスクマップ）', r.dyn.tau, r.dyn.tau<=thr+EPS);
+    var comp=r.comp||{};
+    ['etas','bvalue','fault','plate'].forEach(function(k){ if(comp[k]!=null) d+=rankBar('　成分: '+esc(srcLab(k)), comp[k], comp[k]<=thr+EPS); });
+    d+=rankBar(esc(srcLab('st_comb')), r.st_comb.tau, r.st_comb.tau<=thr+EPS);
+    d+=rankBar(esc(srcLab('st_seis')), r.st_seis.tau, r.st_seis.tau<=thr+EPS);
+    if(!ok){ var rs=(r.rescue&&r.rescue[tg])||[]; d+='<div style="margin-top:4px"><b>上位'+tg+'%に入れた情報：</b>'+(rs.length?rs.map(srcTag).join(''):'<span class="bad">なし（新しい情報が必要）</span>')+'</div>'; }
+    if(r.prev) d+='<div style="margin-top:4px"><b>直前の大地震：</b>'+esc(r.prev.t_jst.slice(0,16))+' M'+r.prev.mag+' '+esc(r.prev.place)+'（'+r.prev.dist_km+'km・'+r.prev.gap_days+'日前）</div>';
+    h+='<tr class="det" id="det'+i+'" style="display:none"><td colspan="9">'+d+'</td></tr>';
+  });
+  h+='</table></div><div class="note">直前/直後はリスク値(0〜100)とレベル。「順位」は震源セルが全セル中の上位何%か。震源名はカタログの英語表記です。直近400件まで表示。全件はCSVで取得できます（判定・救えた情報も含む）。</div></div>';
+  return h;
+}
+
+function render(){
+  var D=S.data, h='';
+  if(!D.n_events){ $('main').innerHTML='<div id="empty">この条件で保存済みの結果はまだありません。「実行」を押してください。</div>'; return; }
+  var G=D.groups[S.group], L=D.group_labels, M=D.model_labels;
+  h+=controlsCard(D);
+  if(G.n===0){ $('main').innerHTML=h+'<div class="card"><div class="note">この区分に該当する地震はありません。</div></div>'; return; }
+  h+=summaryCard(G)+missCard(G)+molchanCard(G,L,M)+metricsCard(G,M)+levelCard(G)+componentCard(G)+stabilityCard(G)+recordsCard(D);
   $('main').innerHTML=h;
 }
 init();
@@ -6922,7 +7194,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>Earthquake-risk-map v9.25</title>
+  <title>Earthquake-risk-map v9.30</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
@@ -7028,7 +7300,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震リスクマップ</div>
-      <div>v9.25 / 研究用</div>
+      <div>v9.30 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
