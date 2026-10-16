@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震リスクマップ v9.23
+地震リスクマップ v9.24
 
 ■ 目的と成功の定義
   統合リスクマップの目的は、地震の「発生時期の予測」ではなく、「M6以上の大きな地震が起きる場所を、
@@ -39,6 +39,8 @@
      共有URL/CSV出力、PWA化。通知は「時期の警報」と誤解されないよう、注目セルの変化として位置づける。
 
 ■ 更新履歴（要点のみ）
+  v9.24 一元化カタログ: 1年が複数ファイルに分かれている年(h199701+h199710 など)に対応／年別ファイルに欠けがあっても、
+        最新年から連続している範囲(例: 1983〜2024)だけを使う(従来は欠けがあるとバックテストが止まっていた)
   v9.23 一元化カタログの探索を強化: 置き場所を起動場所(cwd)だけでなくアプリの場所基準でも探す／環境変数JMA_CATALOG_DIRは絶対パス可／
         ファイル名の大文字小文字・拡張子(.txt/.dat/.zip/なし)・サブフォルダ・接尾辞を許容／見つからない時は探した場所と中身をエラーとバックテスト画面に表示
   v9.22 画面サイズへの追従とスマホUI修正: 画面の高さをJSで実測(100vhのままだとスマホのアドレスバー分だけ下が切れる)／
@@ -717,26 +719,38 @@ def _jma_listing(d):
 
 _JMA_EXT_PREF = {"": 0, ".txt": 1, ".dat": 2, ".zip": 3}
 
-def _jma_catalog_find(year):
-    """年別ファイルのパスを返す（展開済み優先、無ければzip）。無ければ None。
-    (v9.23) 大文字小文字・拡張子(.txt/.dat/.zip/なし)・サブフォルダ・多少の接尾辞(h2023_xxx.zip 等)を許容する。
-    ファイル名は h2023 / H2023.TXT / h2023.zip など。"""
+def _jma_catalog_find_all(year):
+    """(v9.24) その年のファイルのパスを時系列順のリストで返す。無ければ []。
+    1年が複数ファイルに分かれている年（1997年の h199701.zip=1〜9月 / h199710.zip=10〜12月 など）は、
+    年のあとに付く2桁の数字(開始月)ごとに1つずつ選んで並べる。年全体のファイル(h1997.zip)があればそれだけを使う。
+    大文字小文字・拡張子(.txt/.dat/.zip/なし)・サブフォルダ・多少の接尾辞(h1983 2.zip 等)は許容する。"""
     import re
-    pat = re.compile(r"^h?%d(?!\d)" % int(year), re.I)
-    best = None
+    y = int(year)
+    pat = re.compile(r"^h?%d(\d{2})?(?!\d)" % y, re.I)
+    groups = {}   # 開始月("" = 年全体) -> (key, path)
     for d in _jma_catalog_dirs():
         for path in _jma_listing(d):
             name = os.path.basename(path)
-            if not pat.match(name):
+            m = pat.match(name)
+            if not m:
                 continue
             ext = os.path.splitext(name)[1].lower()
             if ext not in _JMA_EXT_PREF:
                 continue
-            exact = 0 if re.fullmatch(r"h?%d(\.\w+)?" % int(year), name, re.I) else 1
+            part = m.group(1) or ""
+            exact = 0 if re.fullmatch(r"h?%d(\d{2})?(\.\w+)?" % y, name, re.I) else 1
             key = (exact, _JMA_EXT_PREF[ext], len(path))
-            if best is None or key < best[0]:
-                best = (key, path)
-    return best[1] if best else None
+            if part not in groups or key < groups[part][0]:
+                groups[part] = (key, path)
+    if "" in groups:
+        return [groups[""][1]]
+    return [groups[p][1] for p in sorted(groups)]
+
+def _jma_catalog_find(year):
+    """年別ファイルのパスを返す（展開済み優先、無ければzip）。無ければ None。
+    1年が複数ファイルの年は最初のファイル（全部は _jma_catalog_find_all）。"""
+    a = _jma_catalog_find_all(year)
+    return a[0] if a else None
 
 def _jma_catalog_diagnose():
     """(v9.23) 見つからないときの原因調査用: どこを探し、何が置かれているかを文字列で返す。"""
@@ -838,10 +852,10 @@ def fetch_quakes_jma_catalog_range(start_utc, end_utc, min_mag=None):
     e_jst = end_utc.astimezone(JST)
     paths = []
     for year in range(s_jst.year, e_jst.year + 1):
-        path = _jma_catalog_find(year)
-        if path is None:
+        ps = _jma_catalog_find_all(year)
+        if not ps:
             return None
-        paths.append(path)
+        paths.extend(ps)
     first = _jma_catalog_span(paths[0])[0]
     last = _jma_catalog_span(paths[-1])[1]
     if first is None or last is None:
@@ -5107,16 +5121,23 @@ def _bt_jst(dt):
 
 # ── 日本の一元化カタログの収録範囲 ────────────────────
 def _jma_catalog_coverage():
-    """年別ファイルがある年と、収録期間(最初・最後の記録時刻)を返す。無ければ None。"""
-    years = [y for y in range(1923, datetime.now(timezone.utc).year + 1) if _jma_catalog_find(y)]
-    if not years:
+    """年別ファイルがある年と、収録期間(最初・最後の記録時刻)を返す。無ければ None。
+    (v9.24) 年別ファイルに欠けがあっても、最新年から途切れず続いている範囲だけを使う
+    （例: 1951・1961・1967・1983〜2024 があれば 1983〜2024）。それより前の年は ignored_years に入れる。"""
+    all_years = [y for y in range(1923, datetime.now(timezone.utc).year + 1) if _jma_catalog_find_all(y)]
+    if not all_years:
         return None
-    first = _jma_catalog_span(_jma_catalog_find(years[0]))[0]
-    last = _jma_catalog_span(_jma_catalog_find(years[-1]))[1]
+    start = len(all_years) - 1
+    while start > 0 and all_years[start - 1] == all_years[start] - 1:
+        start -= 1
+    years = all_years[start:]
+    ignored = all_years[:start]
+    first = _jma_catalog_span(_jma_catalog_find_all(years[0])[0])[0]
+    last = _jma_catalog_span(_jma_catalog_find_all(years[-1])[-1])[1]
     if first is None or last is None:
         return None
     return {"first": first, "last": last, "years": years,
-            "contiguous": years == list(range(years[0], years[-1] + 1))}
+            "contiguous": True, "ignored_years": ignored}
 
 def _fetch_catalog_strict(start_utc, end_utc, min_mag=None):
     """一元化カタログから読む。期間を覆っていなければ例外（USGSへは逃げない。
@@ -6409,7 +6430,7 @@ function init(){
     ['Mag:min_mag','Depth:max_depth_km','Lead:lead_hours','After:after_hours','Rebuild:rebuild_days','Step:calib_step_hours','Prev:prev_mag'].forEach(function(s){
       var a=s.split(':'); if(p[a[1]]!=null) $('p'+a[0]).value=p[a[1]];
     });
-    $('covHint').innerHTML = d.coverage ? ('カタログ収録: '+d.coverage.first+' 〜 '+d.coverage.last+'（基準に約125日必要なため、先頭から約4か月ぶんは評価できません）') : ('<span style="color:#fca5a5">一元化カタログ(h2023 など年別ファイル)が見つかりません。</span><br>'+esc(d.catalog_diag||''));
+    $('covHint').innerHTML = d.coverage ? ('カタログ収録: '+d.coverage.first+' 〜 '+d.coverage.last+'（基準に約125日必要なため、先頭から約4か月ぶんは評価できません）'+(d.coverage.ignored ? '<br>※途切れているため使わない年: '+esc(d.coverage.ignored) : '')) : ('<span style="color:#fca5a5">一元化カタログ(h2023 など年別ファイル)が見つかりません。</span><br>'+esc(d.catalog_diag||''));
     if(d.job && d.job.running){ watch(); }
     else if(d.has_records){ loadResult(); }
   }).catch(function(e){ setStat('初期化に失敗: '+esc(e.message), true) });
@@ -6899,7 +6920,7 @@ SHELL_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>Earthquake-risk-map v9.23</title>
+  <title>Earthquake-risk-map v9.24</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
@@ -7005,7 +7026,7 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震リスクマップ</div>
-      <div>v9.23 / 研究用</div>
+      <div>v9.24 / 研究用</div>
     </div>
 
     <div class="group-title">地震データ</div>
@@ -7741,7 +7762,8 @@ def backtest_info():
         job = {"running": _bt_job["running"]}
     return {"coverage": None if not cov else {"first": cov["first"].astimezone(JST).strftime("%Y-%m-%d"),
                                               "last": cov["last"].astimezone(JST).strftime("%Y-%m-%d"),
-                                              "contiguous": cov["contiguous"]},
+                                              "contiguous": cov["contiguous"],
+                                              "ignored": ", ".join(str(y) for y in cov.get("ignored_years", []))},
             "defaults": BT_DEFAULT_PARAMS, "last_params": last, "job": job, "has_records": has,
             "catalog_diag": None if cov else _jma_catalog_diagnose()}
 
