@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-地震リスクマップ v9.40
+地震リスクマップ v9.50
 
 ■ 目的と成功の定義
   統合リスクマップの目的は、地震の「発生時期の予測」ではなく、「M6以上の大きな地震が起きる場所を、
@@ -39,6 +39,15 @@
      共有URL/CSV出力、PWA化。通知は「時期の警報」と誤解されないよう、注目セルの変化として位置づける。
 
 ■ 更新履歴（要点のみ）
+  v9.42 固定基準: 数年分(既定5年・7日おき)の基準を1回だけ作って calib_baselines/ に保存し、通常表示・過去日付(calib=date)・バックテストで
+        使い回す(作成: python app.py --build-baseline)。評価時点より前に終わる基準だけを使い(先読みなし)、無ければ従来の作り直しに戻る。
+        作成時の設定と食い違うファイルは使わない／東北沖2011・能登2024の余震期は既定で除外／状態は /calibration/status で確認
+  v9.41 「アーカイブ」タブを廃止し、サイドバーに「表示日時」(全体の日付。既定=現在)を追加。日時を入れて「適用」すると、
+        統合リスクマップと地震履歴がその時点の状態になる(統合リスクマップはアーカイブと同じ計算。「この日付で基準を作り直す」も同じ)。
+        統合リスクマップ・地震履歴・ETASマップ・b値マップが過去日付に対応(ETAS・b値は /archive/historical_tab が過去の地震から計算)。
+        TEC・GNSS・海面気圧は過去の値を持たないため、過去日付の間はグレー表示＋説明を出す。
+        過去日付のリスクマップには気圧・TEC・GNSSは含まれず、セル詳細の前日比・推移も出さない。
+        毎時スナップショットの保存(推移グラフ用)と /archive/historical_riskmap は従来どおり残す
   v9.40 新タブ「長期の地震分布」を追加(バックテストの静的ハザードと同じ作り方: 過去10年のM4.5以上を平滑化して順位づけ。
         「地震分布のみ」「＋活断層への近さ」の切替、M6以上の震央の重ね表示。一元化カタログ優先・足りない期間はUSGS)／
         サイドバーをバックテストの区分に合わせて整理: 動的(統合/地震活動/観測データ)・静的(長期)・検証ログ／
@@ -87,8 +96,8 @@
   8. 海面気圧     - アメダス海面気圧マップ
   10. 検証       - M6以上のバックテスト(Molchan図)。静的ハザードとの比較、余震は分けて評価。CSV出力あり
   11. 長期の地震分布 - 過去10年のM4.5以上の地震分布(静的ハザード。バックテストの比較対象と同じ作り方)。＋活断層への近さ、M6以上の震央
-  ※サイドバーの区分(v9.40): 動的=統合リスクマップ/地震履歴・ETAS・b値/TEC・GNSS・海面気圧、静的=長期の地震分布・活断層・プレート境界、検証・ログ=バックテスト・アーカイブ
-  9. アーカイブ   - 日時指定で、その時点から過去1か月分の地震データで統合リスクマップを再計算（GNSSは未実装）
+  ※サイドバーの区分(v9.40): 動的=統合リスクマップ/地震履歴・ETAS・b値/TEC・GNSS・海面気圧、静的=長期の地震分布・活断層・プレート境界、検証=バックテスト（過去日付はサイドバーの「表示日時」で指定）
+  9. (廃止) アーカイブ → サイドバーの「表示日時」に統合。日時指定で、その時点から過去1か月分の地震データで統合リスクマップを再計算（GNSSは未実装）
                   （直近60日以内はJMA/P2P統合データ、それより古い日時は気象庁一元化震源カタログ
                     (data/jma_catalog/ のファイル)、無ければUSGS過去カタログを都度取得）
 
@@ -111,14 +120,13 @@
   3999  統合リスクマップ（β）
   4526  アーカイブ: 過去時点の統合リスクマップ再計算
   5219  メインページ（タブシェル）
-  5222  TAB9 アーカイブUI
   5822  バックグラウンド更新
   5974  Flaskルーティング
   6457  手動再計算（各タブの「再計算」ボタン）
 """
 
 from flask import Flask, Response, send_file, request
-import requests, csv, os, math, re, json, threading, time, zipfile, io, bisect, tempfile, base64, gzip
+import requests, csv, os, sys, math, re, json, threading, time, zipfile, io, bisect, tempfile, base64, gzip, pickle
 from datetime import datetime, timezone, timedelta
 import numpy as np
 
@@ -396,12 +404,11 @@ _RECALC_SCOPE = {
     "pressure": "気象庁アメダスの海面気圧を取得し直します。",
     "longterm": "過去10年・M4.5以上の地震分布(と活断層への近さ)を作り直します。一元化カタログ(無ければUSGS)を読むため、数十秒かかります。",
 }
-_TAB_URLS = ["riskmap", "history", "etas", "bvalue", "faultmap", "tec", "gnss", "pressure", "snapshots", "backtest", "longterm"]
+_TAB_URLS = ["riskmap", "history", "etas", "bvalue", "faultmap", "tec", "gnss", "pressure", "backtest", "longterm"]
 
 def _tab_scopes_json():
     """サイドバーに出す「このボタンで何を再計算するか」(_TAB_URLS と同じ順)。"""
     d = dict(_RECALC_SCOPE)
-    d["snapshots"] = "このタブは、日時を入力して「この時点のリスクマップを取得」を押すとその時点で再計算します。"
     d["backtest"] = "このタブは、左側で期間を指定して「実行」を押すと計算します。このボタンでは動きません。"
     return json.dumps([d.get(u, "") for u in _TAB_URLS], ensure_ascii=False)
 
@@ -1838,7 +1845,18 @@ def _sample_ref_times(lookback_days=HIST_CALIB_LOOKBACK_DAYS, step_hours=HIST_CA
     # 直近(0時間前=現在)は「今まさに評価しようとしている値」と重なるため含めない
     return [now - timedelta(hours=step_hours * i) for i in range(1, n + 1)]
 
-def _compute_historical_calibration(end_utc=None, quakes=None, step_hours=HIST_CALIB_SAMPLE_HOURS):
+def _in_exclude_ranges(t, exclude_ranges, window_days=60.0):
+    """(v9.42) サンプル時刻tの直前window_days日の窓が、除外期間[(開始,終了),...]に触れていればTrue。
+    大地震の余震期など、基準に混ぜたくない期間の活動を含むサンプルを外すために使う。"""
+    if not exclude_ranges:
+        return False
+    for a, b in exclude_ranges:
+        if a <= t <= b + timedelta(days=window_days):
+            return True
+    return False
+
+def _compute_historical_calibration(end_utc=None, quakes=None, step_hours=HIST_CALIB_SAMPLE_HOURS,
+                                    lookback_days=HIST_CALIB_LOOKBACK_DAYS, exclude_ranges=None):
     """過去HIST_CALIB_LOOKBACK_DAYS日間を定期サンプリングし、ETAS/b値/断層・
     プレート応力それぞれの「生の値」の分布(プール)を作る。アーカイブタブの
     再計算ロジック(analyze_etas(ref_time=...) / _historical_fault_plate_raw)と同じ計算を、
@@ -1866,11 +1884,25 @@ def _compute_historical_calibration(end_utc=None, quakes=None, step_hours=HIST_C
         古い日付では一元化カタログ等から読んだ [end_utc-125日, end_utc] の地震を渡す。
         （評価の窓は各サンプル時刻より前だけなので、end_utc より後の地震が混ざっても使われない）
       ・step_hours でサンプル間隔を変えられる（既定は従来どおり24時間）。
-      省略時は従来と同じ動作（現在・quakes.csv・24時間）。"""
+      省略時は従来と同じ動作（現在・quakes.csv・24時間）。
+
+    (v9.42) lookback_days / exclude_ranges を追加。固定基準(数年分)の作成用。
+      ・処理を _calib_collect(サンプリング・集計) と _calib_finalize(確定・しきい値算出) に分けた
+        （期間を分割して集計し、最後に1回だけ確定できるように）。既定の動作・計算結果は従来と同じ。"""
+    ref_times = _sample_ref_times(lookback_days=lookback_days, step_hours=step_hours, end_utc=end_utc)
+    if exclude_ranges:
+        ref_times = [t for t in ref_times if not _in_exclude_ranges(t, exclude_ranges)]
+    return _calib_finalize(_calib_collect(ref_times, quakes))
+
+def _calib_collect(ref_times, quakes=None):
+    """(v9.42) ref_times の各時点について ETAS/b値/断層・プレート応力の生値を集め、セル別プールにして返す
+    （_compute_historical_calibration の前半。しきい値の算出は _calib_finalize）。"""
     from collections import defaultdict
-    ref_times = _sample_ref_times(step_hours=step_hours, end_utc=end_utc)
     etas_cell, bvalue_cell, fault_cell, plate_cell = (defaultdict(list), defaultdict(list),
                                                        defaultdict(list), defaultdict(list))
+    if not ref_times:
+        return {"etas_cell": etas_cell, "bvalue_cell": bvalue_cell, "fault_cell": fault_cell,
+                "plate_cell": plate_cell, "per_time_raw": [], "ok": 0, "n_ref": 0}
     per_time_raw = []   # (v8.21) しきい値キャリブレーション用: 各時点の成分別生値
 
     # ── 1) 地震データを1回だけ読み込み、時刻順の配列にする ──
@@ -1928,6 +1960,15 @@ def _compute_historical_calibration(end_utc=None, quakes=None, step_hours=HIST_C
     print(f"[絶対基準キャリブレーション] {ok}/{len(ref_times)}時点サンプリング完了 "
           f"(etas_cells={len(etas_cell)} bvalue_cells={len(bvalue_cell)} "
           f"fault_cells={len(fault_cell)} plate_cells={len(plate_cell)})")
+    return {"etas_cell": etas_cell, "bvalue_cell": bvalue_cell, "fault_cell": fault_cell,
+            "plate_cell": plate_cell, "per_time_raw": per_time_raw, "ok": ok, "n_ref": len(ref_times)}
+
+def _calib_finalize(col):
+    """(v9.42) _calib_collect の結果から、セル別プール・レベルしきい値を確定して返す
+    （_compute_historical_calibration の後半。中身は従来と同じ）。"""
+    etas_cell, bvalue_cell = col["etas_cell"], col["bvalue_cell"]
+    fault_cell, plate_cell = col["fault_cell"], col["plate_cell"]
+    per_time_raw, ok = col["per_time_raw"], col["ok"]
     # セル単位プールは、サンプル時点数(ok)が少なすぎる(=積み上げ途中)場合は
     # 誤ったセル基準値で誤判定するより「未キャリブレーション」扱いの方が安全なため、
     # 十分な時点数が確保できるまではNoneのままにする。
@@ -1968,6 +2009,9 @@ def _get_historical_calibration():
     バックグラウンドスレッドで再計算を開始しつつ、それまでは古い(または空の)
     結果をそのまま返す（Webリクエストの応答をブロックしないため）。"""
     global _hist_calib_cache
+    fixed = get_fixed_baseline_for(None) if CALIB_BASELINE_LIVE else None   # (v9.42) 固定基準があればそれを使う(再計算しない)
+    if fixed is not None:
+        return fixed
     if time.time() - _hist_calib_cache["ts"] > HIST_CALIB_TTL_SEC:
         if _hist_calib_lock.acquire(blocking=False):
             def _job():
@@ -1978,6 +2022,254 @@ def _get_historical_calibration():
                     _hist_calib_lock.release()
             threading.Thread(target=_job, daemon=True).start()
     return _hist_calib_cache
+
+# ══════════════════════════════════════════════════════
+# (v9.42) 固定基準（数年分の実績で1回だけ作り、ファイルに保存して使い回す）
+# ──────────────────────────────────────────────────────
+# 従来は「過去65日」の基準を、通常表示では6時間ごと、アーカイブ(calib=date)・バックテストでは
+# 日付ごとに作り直していたため、どれも遅かった。ここでは数年分(既定5年・7日おき)を1回だけ
+# オフラインで集計して .pkl.gz に保存し、起動時(初回アクセス時)に読み込むだけにする。
+#   ・作る:   python app.py --build-baseline [--end 2025-01-01] [--years 5] [--step-days 7]
+#             → calib_baselines/calib_baseline_YYYYMMDD.pkl.gz （YYYYMMDD=基準の終端。JSTのその日の0時より前だけで作る）
+#   ・使う:   通常表示 = いちばん新しい固定基準 / アーカイブ(calib=date)・バックテスト = 評価時点より前に終わる
+#             いちばん新しい固定基準（先読みなし）。該当が無ければ従来どおり作り直す(フォールバック)。
+#   ・安全:   作成時の設定(格子・ETAS/応力パラメータ・領域・下限Mなど)を一緒に保存し、読み込み時に現在の設定と
+#             食い違えばそのファイルは使わない(環境変数 CALIB_BASELINE_FORCE=1 で無視して使う)。
+#   ・注意:   pickle形式。自分で作ったファイルだけを置くこと（他人から受け取ったファイルは読み込まない）。
+# ══════════════════════════════════════════════════════
+CALIB_BASELINE_DIR   = os.environ.get("CALIB_BASELINE_DIR", "calib_baselines")
+CALIB_BASELINE_MODE  = os.environ.get("CALIB_BASELINE_MODE", "auto").strip().lower()   # auto=あれば使う / off=使わない
+CALIB_BASELINE_LIVE  = os.environ.get("CALIB_BASELINE_LIVE", "1").strip() != "0"       # 0=通常表示では使わない(アーカイブ・検証だけ)
+CALIB_BASELINE_FORCE = os.environ.get("CALIB_BASELINE_FORCE", "0").strip() == "1"      # 1=作成時と設定が違っても使う
+try:
+    CALIB_BASELINE_MAX_AGE_DAYS = float(os.environ.get("CALIB_BASELINE_MAX_AGE_DAYS", "1830"))   # 評価時点より何日前までの基準を許すか
+except ValueError:
+    CALIB_BASELINE_MAX_AGE_DAYS = 1830.0
+CALIB_BASELINE_FORMAT = 1
+CALIB_BASELINE_KEEP   = 2     # メモリに保持する固定基準の数
+# 基準に混ぜたくない大きな地震列(JSTの日付 開始〜終了)。この期間の活動を窓に含むサンプルは外す
+CALIB_BASELINE_DEFAULT_EXCLUDES = [("2011-03-11", "2012-03-11"),   # 東北地方太平洋沖地震とその余震
+                                   ("2024-01-01", "2024-07-01")]   # 令和6年能登半島地震とその余震
+_CALIB_WINDOW_DAYS = 60.0     # _calib_collect の窓(60日)。変えるなら両方合わせること
+
+def _calib_baseline_dirs():
+    d = CALIB_BASELINE_DIR
+    cands = [d] if os.path.isabs(d) else [os.path.join(_JMA_APP_DIR, d), os.path.join(os.getcwd(), d)]
+    out, seen = [], set()
+    for c in cands:
+        c = os.path.normpath(c)
+        if c not in seen and os.path.isdir(c):
+            seen.add(c); out.append(c)
+    return out
+
+_calib_index_cache = {"ts": 0.0, "val": []}
+def _calib_baseline_index():
+    """[(終端UTC, パス), ...] 古い順。ファイル名 calib_baseline_YYYYMMDD.pkl.gz の日付(JST 0時)が基準の終端。"""
+    if time.time() - _calib_index_cache["ts"] < 30:
+        return _calib_index_cache["val"]
+    found = {}
+    for d in _calib_baseline_dirs():
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            m = re.fullmatch(r"calib_baseline_(\d{8})\.pkl\.gz", n)
+            if not m:
+                continue
+            try:
+                end = datetime.strptime(m.group(1), "%Y%m%d").replace(tzinfo=JST).astimezone(timezone.utc)
+            except ValueError:
+                continue
+            found.setdefault(end, os.path.join(d, n))
+    val = sorted(found.items())
+    _calib_index_cache.update(ts=time.time(), val=val)
+    return val
+
+def _calib_baseline_signature():
+    """基準の中身を左右する設定。作成時と読み込み時で食い違えば、そのファイルは使えない。"""
+    return json.loads(json.dumps({
+        "format": CALIB_BASELINE_FORMAT, "grid": GRID_SIZE, "bvalue_grid": BVALUE_GRID_SIZE,
+        "jma_min_mag": JMA_CATALOG_MIN_MAG, "window_days": _CALIB_WINDOW_DAYS,
+        "etas": {k: getattr(EP, k) for k in dir(EP) if k.isupper()},          # インスタンス(EP/FSP)の現在値
+        "fsp": {k: getattr(FSP, k) for k in dir(FSP) if k.isupper()},
+        "hist_keys": list(_RISK_HIST_KEYS), "region": [list(b) for b in ETAS_REGION_BOXES],
+        "targets": {str(k): v for k, v in RISK_LEVEL_TARGETS.items()}, "calm_q": RISK_CALM_QUANTILE,
+        "lv5_prob": RISK_LV5_EXCEED_PROB, "min_gap": RISK_LEVEL_MIN_GAP,
+    }, sort_keys=True))
+
+def _jst_day(dt):
+    return dt.astimezone(JST).strftime("%Y-%m-%d")
+
+_fixed_cache = {}            # path -> 読み込み済みの較正dict(読めなければNone)
+_fixed_lock = threading.Lock()
+
+def _load_fixed_baseline(path, end_utc):
+    with _fixed_lock:
+        if path in _fixed_cache:
+            return _fixed_cache[path]
+    calib = None
+    try:
+        with gzip.open(path, "rb") as f:
+            blob = pickle.load(f)          # 自分で作ったファイルだけを置く前提
+        if not isinstance(blob, dict) or blob.get("format") != CALIB_BASELINE_FORMAT:
+            raise ValueError("形式が違います(作り直してください)")
+        meta, calib = blob["meta"], blob["calib"]
+        cur, old = _calib_baseline_signature(), meta.get("signature") or {}
+        diff = sorted(k for k in set(cur) | set(old) if cur.get(k) != old.get(k))
+        if diff and not CALIB_BASELINE_FORCE:
+            raise ValueError("作成時と設定が違います: " + ", ".join(diff) + "（作り直すか CALIB_BASELINE_FORCE=1）")
+        if not calib.get("risk_thresholds"):
+            raise ValueError("しきい値が入っていません")
+        start = datetime.fromisoformat(meta["start_utc"])
+        calib["fixed"] = True
+        calib["ts"] = time.time()
+        calib["baseline_name"] = os.path.basename(path)
+        calib["baseline_end_utc"] = end_utc
+        calib["baseline_start_utc"] = start
+        calib["baseline_start_jst"] = _jst_day(start)
+        calib["anchor_jst"] = _jst_day(end_utc)
+        calib["baseline_meta"] = {k: v for k, v in meta.items() if k != "signature"}
+        print(f"[固定基準] 読み込み: {os.path.basename(path)} "
+              f"({calib['baseline_start_jst']}〜{calib['anchor_jst']}・{calib.get('n_samples', 0)}時点)")
+    except Exception as e:
+        print(f"[固定基準] {os.path.basename(path)} は使えません: {e}")
+        calib = None
+    with _fixed_lock:
+        _fixed_cache[path] = calib
+        idx = _calib_baseline_index()
+        pin = idx[-1][1] if idx else None           # 通常表示で使う最新の固定基準は手放さない
+        loaded = [k for k, v in _fixed_cache.items() if v is not None]
+        for k in [k for k in loaded if k != pin]:
+            if len(loaded) <= CALIB_BASELINE_KEEP:
+                break
+            _fixed_cache.pop(k); loaded.remove(k)   # 古く読んだものから手放す(再度必要なら読み直す)
+    return calib
+
+def get_fixed_baseline_for(anchor_utc=None):
+    """anchor_utc 以前に終わるいちばん新しい固定基準を返す（先読みなし）。無ければ None。
+    anchor_utc=None は通常表示用で、いちばん新しい固定基準。"""
+    if CALIB_BASELINE_MODE == "off":
+        return None
+    cands = [c for c in _calib_baseline_index() if anchor_utc is None or c[0] <= anchor_utc]
+    for end, path in reversed(cands):
+        if anchor_utc is not None and (anchor_utc - end).total_seconds() > CALIB_BASELINE_MAX_AGE_DAYS * 86400:
+            return None                          # これより古い終端は許容範囲外
+        calib = _load_fixed_baseline(path, end)
+        if calib is not None:
+            return calib
+    return None
+
+def build_fixed_baseline(end_utc, years=5.0, step_days=7.0, exclude_ranges=None, chunk_days=180.0, out_dir=None):
+    """一元化カタログから固定基準を作って保存する。end_utc より前のデータだけを使う(先読みなし)。
+    大量の地震×時点の行列でメモリを使い切らないよう、サンプルを chunk_days ごとに分けて集計する。
+    戻り値: 保存したファイルのパス。"""
+    from collections import defaultdict
+    refs = _sample_ref_times(lookback_days=years * 365.25, step_hours=step_days * 24.0, end_utc=end_utc)
+    n_all = len(refs)
+    refs = sorted(t for t in refs if not _in_exclude_ranges(t, exclude_ranges, _CALIB_WINDOW_DAYS))
+    print(f"[固定基準] サンプル {n_all}時点のうち、除外期間にかかる{n_all - len(refs)}時点を外し、{len(refs)}時点で作ります")
+    if len(refs) < 40:
+        raise RuntimeError(f"サンプルが少なすぎます({len(refs)}時点)。--years を増やすか --step-days を短くしてください")
+    chunks, cur = [], []
+    for t in refs:
+        if cur and (t - cur[0]) > timedelta(days=chunk_days):
+            chunks.append(cur); cur = []
+        cur.append(t)
+    chunks.append(cur)
+    merged = {"etas_cell": defaultdict(list), "bvalue_cell": defaultdict(list), "fault_cell": defaultdict(list),
+              "plate_cell": defaultdict(list), "per_time_raw": [], "ok": 0, "n_ref": 0}
+    t0 = time.time()
+    for ci, ch in enumerate(chunks):
+        lo = min(ch) - timedelta(days=_CALIB_WINDOW_DAYS) - timedelta(hours=1)
+        print(f"[固定基準] ({ci + 1}/{len(chunks)}) {_jst_day(min(ch))}〜{_jst_day(max(ch))} の{len(ch)}時点を集計中…")
+        qs = _fetch_catalog_strict(lo, max(ch))
+        col = _calib_collect(ch, qs)
+        for k in ("etas_cell", "bvalue_cell", "fault_cell", "plate_cell"):
+            for cell, vals in col[k].items():
+                merged[k][cell].extend(vals)
+        merged["per_time_raw"].extend(col["per_time_raw"])
+        merged["ok"] += col["ok"]; merged["n_ref"] += col["n_ref"]
+        del qs, col
+    print(f"[固定基準] 集計完了({merged['ok']}/{merged['n_ref']}時点・{time.time() - t0:.0f}秒)。しきい値を計算します…")
+    calib = _calib_finalize(merged)
+    if not calib.get("risk_thresholds"):
+        raise RuntimeError(f"しきい値を作れませんでした(有効な時点 {calib.get('n_samples', 0)})")
+    for k in ("etas_cell", "bvalue_cell", "fault_cell", "plate_cell"):
+        calib[k] = {c: np.asarray(v, dtype=np.float32) for c, v in (calib.get(k) or {}).items()}
+    calib.pop("ts", None)
+    meta = {"created_utc": datetime.now(timezone.utc).isoformat(), "end_utc": end_utc.isoformat(),
+            "start_utc": min(refs).isoformat(), "years": years, "step_days": step_days,
+            "n_samples": calib.get("n_samples", 0), "source": "jma_catalog", "min_mag": JMA_CATALOG_MIN_MAG,
+            "exclude_ranges": [[_jst_day(a), _jst_day(b)] for a, b in (exclude_ranges or [])],
+            "signature": _calib_baseline_signature()}
+    out_dir = out_dir or (_calib_baseline_dirs() or [os.path.join(_JMA_APP_DIR, CALIB_BASELINE_DIR)])[0]
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"calib_baseline_{end_utc.astimezone(JST):%Y%m%d}.pkl.gz")
+    tmp = path + ".tmp"
+    with gzip.open(tmp, "wb", compresslevel=6) as f:
+        pickle.dump({"format": CALIB_BASELINE_FORMAT, "meta": meta, "calib": calib}, f, protocol=4)
+    os.replace(tmp, path)
+    _calib_index_cache["ts"] = 0.0
+    std = (calib["risk_thresholds"] or {}).get(_risk_subset_key(_RISK_STD_KEYS))
+    rep_ = calib.get("risk_calib_report") or {}
+    print(f"[固定基準] 保存しました: {path} ({os.path.getsize(path) / 1e6:.1f}MB)")
+    print(f"[固定基準] 標準構成のしきい値 Lv1〜Lv5 = {std}")
+    if rep_.get("counts_per_day"):
+        print("[固定基準] 日別セル数(中央値) = " + ", ".join(f"Lv{lv}:{v['median']}" for lv, v in rep_["counts_per_day"].items()))
+    print("[固定基準] セル数: " + ", ".join(f"{k.replace('_cell', '')}={len(calib[k])}" for k in
+          ("etas_cell", "bvalue_cell", "fault_cell", "plate_cell")))
+    return path
+
+def _cli_build_baseline(argv):
+    """python app.py --build-baseline [--end YYYY-MM-DD] [--years 5] [--step-days 7] [--exclude 開始:終了 ...]"""
+    import argparse
+    ap = argparse.ArgumentParser(prog="app.py --build-baseline",
+                                 description="固定基準(数年分の実績)を作ってファイルに保存します。")
+    ap.add_argument("--end", help="基準の終端(JSTの日付 YYYY-MM-DD)。この日の0時より前だけで作ります。省略時はカタログの最新日")
+    ap.add_argument("--years", type=float, default=5.0, help="遡る年数(既定5)")
+    ap.add_argument("--step-days", type=float, default=7.0, help="サンプル間隔(日。既定7)")
+    ap.add_argument("--exclude", action="append", default=[], metavar="開始:終了",
+                    help="基準に混ぜない大地震列の期間(JSTの日付 YYYY-MM-DD:YYYY-MM-DD)。複数指定可")
+    ap.add_argument("--no-default-exclude", action="store_true",
+                    help="既定の除外(東北沖2011-03-11〜2012-03-11・能登2024-01-01〜2024-07-01)を使わない")
+    ap.add_argument("--chunk-days", type=float, default=180.0, help="メモリ節約のための分割幅(日。既定180)")
+    ap.add_argument("--out-dir", default=None, help="保存先フォルダ(既定 calib_baselines/)")
+    a = ap.parse_args(argv)
+    cov = _jma_catalog_coverage()
+    if not cov:
+        print("一元化カタログ(年別ファイル)が見つかりません。JMA_CATALOG_DIR を確認してください。\n" + str(_jma_catalog_diagnose()))
+        return 2
+    try:
+        if a.end:
+            end_utc = datetime.strptime(a.end, "%Y-%m-%d").replace(tzinfo=JST).astimezone(timezone.utc)
+        else:
+            end_utc = cov["last"].astimezone(JST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+        excl = [] if a.no_default_exclude else list(CALIB_BASELINE_DEFAULT_EXCLUDES)
+        for e in a.exclude:
+            x, y = e.split(":")
+            excl.append((x.strip(), y.strip()))
+        ranges = []
+        for x, y in excl:
+            ranges.append((datetime.strptime(x, "%Y-%m-%d").replace(tzinfo=JST).astimezone(timezone.utc),
+                           datetime.strptime(y, "%Y-%m-%d").replace(tzinfo=JST).astimezone(timezone.utc)))
+    except ValueError as e:
+        print(f"日付の形式が正しくありません(YYYY-MM-DD): {e}")
+        return 2
+    first = end_utc - timedelta(days=a.years * 365.25 + _CALIB_WINDOW_DAYS)
+    print(f"[固定基準] カタログ収録: {_jst_day(cov['first'])}〜{_jst_day(cov['last'])} / 作る範囲: "
+          f"{_jst_day(first)}〜{_jst_day(end_utc)}（終端の日は含まない）")
+    if first < cov["first"] - _JMA_CATALOG_EDGE_TOL or end_utc > cov["last"] + _JMA_CATALOG_EDGE_TOL:
+        print("カタログがこの範囲を覆っていません。--end を早める／--years を減らしてください。")
+        return 2
+    try:
+        build_fixed_baseline(end_utc, a.years, a.step_days, ranges, a.chunk_days, a.out_dir)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f"作成に失敗しました: {e}")
+        return 1
+    return 0
+
 
 def _historical_abs_rank(raw_map, pool, invert=False, log_transform=False):
     """raw_mapの各セルの値を『そのセル自身の過去実績分布(pool[cell_key])の中での
@@ -2011,7 +2303,7 @@ def _cellwise_median_map(pool):
     そのセル自身の平常値に対する倍率を求めるために使う。"""
     if not pool:
         return {}
-    return {k: float(np.median(v)) for k, v in pool.items() if v}
+    return {k: float(np.median(v)) for k, v in pool.items() if len(v)}   # (v9.42) 固定基準はndarrayなので len で判定
 
 def _make_etas_domain_floor(median_map, lv3_ratio=1.5, lv4_ratio=3.0):
     """(v7.56) ETAS用ドメイン下限フィルタ。以前(_etas_domain_floor)は全国一律の
@@ -2268,14 +2560,89 @@ WIND_DIR_16 = ["北","北北東","北東","東北東","東","東南東","南東"
 # ══════════════════════════════════════════════════════
 # TAB 1: 統合地震履歴
 # ══════════════════════════════════════════════════════
-def render_quake_history(quakes, updated_str):
-    # 直近31日
-    cutoff = datetime.now(timezone.utc) - timedelta(days=31)
+# ── (v9.41) 全体の日付（サイドバーの「表示日時」）用ヘルパー ──────────────────
+def _global_dt_from_request():
+    """/tab/<name>?datetime=YYYY-MM-DDTHH:MM(JST)&calib=date を読む。
+    戻り値: (日時文字列 or None, calib=dateか, エラー文字列 or None)。datetime が無ければ「現在」。"""
+    s = (request.args.get("datetime") or "").strip()
+    if not s:
+        return None, False, None
+    try:
+        naive = datetime.strptime(s, "%Y-%m-%dT%H:%M")
+    except ValueError:
+        return None, False, "日時の形式が正しくありません（YYYY-MM-DDTHH:MM）"
+    if naive.replace(tzinfo=JST).astimezone(timezone.utc) > datetime.now(timezone.utc):
+        return None, False, "未来の日時は指定できません"
+    return s, request.args.get("calib") == "date", None
+
+def _tab_msg_html(msg):
+    from html import escape as _esc
+    return ("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head>"
+            "<body style=\"background:#05070d;color:#f3f4f6;font-family:sans-serif;padding:24px;line-height:1.7\">"
+            f"{_esc(str(msg))}</body></html>")
+
+def _quakes_for_range(start_utc, end_utc):
+    """[start_utc, end_utc] の地震と取得元を返す: (quakes, data_source)。
+    archive_historical_riskmap と同じ振り分け（直近60日=ローカルCSV、それより古い=一元化カタログ→USGS）。"""
+    now_utc = datetime.now(timezone.utc)
+    if start_utc >= now_utc - timedelta(days=ARCHIVE_LOCAL_SAFE_DAYS):
+        return load_quakes_between(start_utc, end_utc), "local"
+    qs = None
+    try:
+        qs = fetch_quakes_jma_catalog_range(start_utc, end_utc)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f"[履歴] JMAカタログの読み込みに失敗。USGSへフォールバックします: {e}")
+    if qs is not None:
+        return qs, "jma_catalog"
+    return fetch_quakes_usgs_range(start_utc, end_utc), "usgs_historical"
+
+def _hist_loader_html(name, dt_str, calib_date):
+    """/tab/etas|bvalue?datetime=… の入れ物ページ。重い計算は /archive/historical_tab で行い、
+    できたページ(HTML)で自分自身を置き換える（計算中のサーバー待ちやタイムアウトを避ける）。"""
+    q = f"name={name}&datetime={dt_str}" + ("&calib=date" if calib_date else "")
+    label = {"etas": "ETASマップ", "bvalue": "b値マップ"}.get(name, name)
+    return ("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"></head>"
+            "<body style=\"margin:0;background:#05070d;color:#f3f4f6;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;padding:24px;text-align:center;line-height:1.8\">"
+            "<div id=\"msg\" style=\"max-width:420px;font-size:13px\"></div>"
+            "<script>"
+            "var Q=" + json.dumps(q) + ";var LABEL=" + json.dumps(label, ensure_ascii=False) + ";"
+            "var m=document.getElementById('msg');"
+            "function say(t,err){m.style.color=err?'#fca5a5':'#f3f4f6';m.textContent=t;}"
+            "function go(){say('過去の時点の'+LABEL+'を計算しています…（数十秒かかる場合があります）');"
+            "fetch('/archive/historical_tab?'+Q).then(function(r){"
+            "if(r.status===202) return r.json().then(function(e){say(e.message);setTimeout(go,5000);return null;});"
+            "if(!r.ok) return r.json().then(function(e){throw new Error(e.error||('HTTPエラー '+r.status));});"
+            "return r.text();"
+            "}).then(function(h){if(h==null) return;document.open();document.write(h);document.close();})"
+            ".catch(function(e){say('取得に失敗しました: '+e.message,true);});}"
+            "go();"
+            "</script></body></html>")
+
+
+def _render_history_at(dt_str):
+    """過去の時点(JST)までの31日の地震履歴タブ。"""
+    ref_utc = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M").replace(tzinfo=JST).astimezone(timezone.utc)
+    try:
+        quakes, src = _quakes_for_range(ref_utc - timedelta(days=31), ref_utc)
+    except Exception as e:
+        return _tab_msg_html(f"過去の地震データを取得できませんでした: {e}")
+    label = {"local": "JMA/P2P統合データ（直近60日）",
+             "jma_catalog": f"気象庁一元化震源カタログ（M{JMA_CATALOG_MIN_MAG:.1f}以上のみ・震度は最大震度のみ）",
+             "usgs_historical": "USGS過去カタログ（震度情報なし・小規模地震が漏れる場合あり）"}.get(src, src)
+    return render_quake_history(quakes, "", ref_time_utc=ref_utc,
+                                note_html=f"過去の時点を表示中／データソース: {label}")
+
+
+def render_quake_history(quakes, updated_str, ref_time_utc=None, note_html=""):
+    # 直近31日（(v9.41) ref_time_utc を渡すと、その時点までの31日）
+    end_t = ref_time_utc or datetime.now(timezone.utc)
+    cutoff = end_t - timedelta(days=31)
     recent = []
     for q in quakes:
         try:
             t = datetime.fromisoformat(q["time"].replace("Z","+00:00"))
-            if t >= cutoff: recent.append(q)
+            if t >= cutoff and (ref_time_utc is None or t <= ref_time_utc): recent.append(q)
         except Exception: pass
     recent.sort(key=lambda q: q.get("time",""), reverse=True)
 
@@ -2319,6 +2686,12 @@ def render_quake_history(quakes, updated_str):
     markers_js = json.dumps(markers)
     total = len(recent)
     felt_n = sum(1 for q in recent if q.get("max_int","").strip() not in ("","−","-"))
+    if ref_time_utc is not None:
+        span_label = ref_time_utc.astimezone(JST).strftime("%Y-%m-%d %H:%M") + " JST までの31日"
+        sub_line = note_html
+    else:
+        span_label = "直近31日"
+        sub_line = f"更新: {updated_str} {_recalc_btn_html('history')}"
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -2378,10 +2751,10 @@ thead th{{padding:6px 5px;font-size:10px;color:rgba(235,238,245,.62);text-align:
 <div id="lp">
   <div id="lh">
     <div id="lhTop">
-      <h2>統合地震履歴（直近31日: {total}件 / 有感:{felt_n}件）</h2>
+      <h2>統合地震履歴（{span_label}: {total}件 / 有感:{felt_n}件）</h2>
       <button id="lpClose" onclick="toggleHistoryPanel()" title="地震一覧を閉じる">✕</button>
     </div>
-    <p>更新: {updated_str} {_recalc_btn_html('history')}</p>
+    <p>{sub_line}</p>
   </div>
   <div id="fbar">
     <button class="fb on" onclick="filter('all',this)">すべて</button>
@@ -2453,7 +2826,8 @@ function toggleHistoryPanel(){{
 # ══════════════════════════════════════════════════════
 # TAB 2: ETASマップ（研究用強化版）
 # ══════════════════════════════════════════════════════
-def render_etas(grid_scores, quakes, updated_str):
+def render_etas(grid_scores, quakes, updated_str, ref_time=None, calib=None, note_html=""):
+    # (v9.41) ref_time/calib/note_html: 過去日付モード用。省略時は従来どおり「現在」。
     src_count = {}
     for q in quakes: src_count[q.get("source","?")] = src_count.get(q.get("source","?"),0)+1
 
@@ -2473,7 +2847,7 @@ def render_etas(grid_scores, quakes, updated_str):
         # 活発かどうか」を絶対評価し、その結果を該当エリア内の細かい格子すべてに
         # 上限として適用する。相対評価(①)による細かい濃淡表現はそのまま活かしつつ、
         # 絶対評価(②)・ドメイン知識(③)の頭打ちだけをエリア単位の真の実績で行う。
-        calib = _get_historical_calibration()
+        calib = calib or _get_historical_calibration()
         etas_raw_coarse = _risk_etas_raw(grid_scores)
         etas_cell_pool = calib.get("etas_cell")
         abs_rank_coarse = _historical_abs_rank(etas_raw_coarse, etas_cell_pool, invert=False, log_transform=True)
@@ -2511,12 +2885,13 @@ def render_etas(grid_scores, quakes, updated_str):
                           "color":ETAS_COLOR[lv],"lv":lv,"score":round(score,4)})
 
     # 最近72時間の地震をマーカーとしてオーバーレイ
-    cutoff72 = datetime.now(timezone.utc) - timedelta(hours=72)
+    end_t = ref_time or datetime.now(timezone.utc)
+    cutoff72 = end_t - timedelta(hours=72)
     recent_markers = []
     for q in quakes:
         try:
             t = datetime.fromisoformat(q["time"].replace("Z","+00:00"))
-            if t < cutoff72: continue
+            if t < cutoff72 or (ref_time is not None and t > ref_time): continue
             mag = q.get("mag",0)
             recent_markers.append({
                 "lat":q["lat"],"lon":q["lon"],"mag":mag,
@@ -2528,6 +2903,7 @@ def render_etas(grid_scores, quakes, updated_str):
     cells_js = json.dumps(cells)
     recent_js = json.dumps(recent_markers)
     gs = GRID_SIZE
+    upd_html = note_html if note_html else f"更新: {updated_str}{_recalc_btn_html('etas')}"
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 {LEAFLET_CDN}
@@ -2551,7 +2927,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
   <span>表示レイヤー:</span>
   <button class="tog on" id="togEtas" onclick="toggleLayer('etas',this)">ETASグリッド</button>
   <button class="tog" id="togRecent" onclick="toggleLayer('recent',this)">直近72h地震</button>
-  <span style="margin-left:auto;display:inline-flex;align-items:center;gap:8px;color:rgba(235,238,245,.46);font-size:11px">更新: {updated_str}{_recalc_btn_html('etas')}</span>
+  <span style="margin-left:auto;display:inline-flex;align-items:center;gap:8px;color:rgba(235,238,245,.46);font-size:11px">{upd_html}</span>
 </div>
 <div id="map"></div>
 <div id="lg">
@@ -2605,7 +2981,7 @@ function toggleLayer(key,btn){{
 # ══════════════════════════════════════════════════════
 # TAB 3: b値マップ
 # ══════════════════════════════════════════════════════
-def render_bvalue(bvalue_grid, quakes, updated_str):
+def render_bvalue(bvalue_grid, quakes, updated_str, note_html=""):
     # b値カラースケール: 低b値(赤)→高b値(青)
     # 低b値は大地震の前兆として注目される
     #
@@ -2654,6 +3030,7 @@ def render_bvalue(bvalue_grid, quakes, updated_str):
         b_mean = b_min = b_max = b_std = "N/A"
 
     total_used = sum(v["n"] for v in bvalue_grid.values())
+    upd_html = note_html if note_html else f"更新: {updated_str}{_recalc_btn_html('bvalue')}"
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -2683,7 +3060,7 @@ body{{display:flex;flex-direction:column;height:100vh;background:radial-gradient
   <div class="stat">b平均: <span>{b_mean}</span></div>
   <div class="stat">b最小: <span style="color:#ef4444">{b_min}</span></div>
   <div class="stat">b最大: <span style="color:#60a5fa">{b_max}</span></div>
-  <div style="margin-left:auto;display:flex;align-items:center;gap:10px;color:rgba(235,238,245,.46)">更新: {updated_str}{_recalc_btn_html('bvalue')}</div>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:10px;color:rgba(235,238,245,.46)">{upd_html}</div>
 </div>
 <div id="map"></div>
 <div id="lg">
@@ -5236,6 +5613,9 @@ def get_calibration_at(ref_utc):
     """基準日(ref_utcのJST日付の0時)より前の65日だけで作った基準を返す。
     未作成なら背景スレッドで作り始め、(None, 状態) を返す。作成に失敗したら (None, {"error":...})。"""
     anchor = _date_calib_anchor(ref_utc)
+    fixed = get_fixed_baseline_for(anchor)      # (v9.42) その日より前に終わる固定基準があれば、作り直さずそれを使う
+    if fixed is not None:
+        return fixed, {"key": fixed.get("baseline_name"), "fixed": True}
     key = anchor.astimezone(JST).strftime("%Y%m%d")
     with _date_calib_lock:
         hit = _date_calib_cache.get(key)
@@ -5788,7 +6168,8 @@ def _bt_make_record(ev, group, prev, eval_t, anchor, score_vec, after_vec, th, s
 # ── 実行・保存 ────────────────────────────────────
 BT_DEFAULT_PARAMS = {"start": None, "end": None, "min_mag": 6.0, "lead_hours": 0.05, "after_hours": 0.05,
                      "rebuild_days": 30.0, "calib_step_hours": float(HIST_CALIB_SAMPLE_HOURS),
-                     "prev_mag": 6.0, "max_depth_km": 0.0, "defaults_ver": 2}
+                     "prev_mag": 6.0, "max_depth_km": 0.0, "defaults_ver": 2,
+                     "calib_mode": "fixed"}   # (v9.42) fixed=固定基準があれば使う(速い) / rebuild=毎回作り直す(従来)
 
 def _bt_parse_params(d):
     """画面/APIの入力を検証して実行パラメータにする。start/end は JST の 'YYYY-MM-DD'。"""
@@ -5799,6 +6180,7 @@ def _bt_parse_params(d):
                 p[k] = float(d[k])
         s = datetime.strptime(str(d.get("start")), "%Y-%m-%d").replace(tzinfo=JST)
         e = datetime.strptime(str(d.get("end")), "%Y-%m-%d").replace(tzinfo=JST) + timedelta(days=1)
+        p["calib_mode"] = "rebuild" if str(d.get("calib_mode") or "") == "rebuild" else "fixed"
     except (TypeError, ValueError):
         raise ValueError("開始日・終了日は YYYY-MM-DD で、数値の項目は数字で入力してください")
     if not (4.5 <= p["min_mag"] <= 9.5):
@@ -5829,8 +6211,17 @@ def _bt_cfg_hash(p):
                       "step": p["calib_step_hours"], "prev": p["prev_mag"], "near": BT_NEAR_RADIUS_CELLS,
                       "jma_min": JMA_CATALOG_MIN_MAG, "static": [BT_STATIC_MIN_MAG, BT_STATIC_LOOKBACK_YEARS,
                       BT_STATIC_SIGMA_CELLS, BT_STATIC_W_SEIS, BT_STATIC_W_FAULT],
-                      "w": {k: RISK_DEFAULT_WEIGHTS[k] for k in _RISK_HIST_KEYS}}, sort_keys=True)
+                      "w": {k: RISK_DEFAULT_WEIGHTS[k] for k in _RISK_HIST_KEYS},
+                      **_bt_calib_hash_part(p)}, sort_keys=True)
     return hashlib.sha1(key.encode()).hexdigest()[:10]
+
+def _bt_calib_hash_part(p):
+    """(v9.42) 固定基準を使うときだけ、使える基準ファイルの一覧をハッシュに入れる（基準が変わると結果も変わるため）。
+    従来方式(rebuild・固定基準なし)では何も足さないので、これまでの記録はそのまま使える。"""
+    if p.get("calib_mode") != "fixed" or CALIB_BASELINE_MODE == "off":
+        return {}
+    names = [os.path.basename(path) for _, path in _calib_baseline_index()]
+    return {"fixed_baselines": names} if names else {}
 
 def _bt_records_path(cfg):
     return os.path.join(BACKTEST_DIR, f"records_{cfg}.jsonl")
@@ -5879,6 +6270,7 @@ def _bt_run(p):
         end_utc = min(end_utc, cov["last"] - after)
         big = [e for e in events if e["mag"] >= p["prev_mag"]]
         targets, skipped = [], {"領域外": 0, "深さ超過": 0, "基準期間がカタログ外": 0}
+        use_fixed = p.get("calib_mode") == "fixed"
         for ev in events:
             if ev["mag"] < p["min_mag"] or not (start_utc <= ev["t"] < end_utc):
                 continue
@@ -5889,7 +6281,12 @@ def _bt_run(p):
                 skipped["深さ超過"] += 1; continue
             ev["eval_t"] = ev["t"] - lead
             ev["anchor"] = _bt_anchor(ev["eval_t"], p["rebuild_days"])
-            if ev["anchor"] - calib_span < cov["first"] - _JMA_CATALOG_EDGE_TOL:
+            # (v9.42) 評価時点より前に終わる固定基準があれば、基準は作り直さずそれを使う（先読みなし）
+            ev["fb"] = get_fixed_baseline_for(ev["eval_t"]) if use_fixed else None
+            if ev["fb"] is not None:
+                if ev["eval_t"] - timedelta(days=BT_WINDOW_DAYS) < cov["first"] - _JMA_CATALOG_EDGE_TOL:
+                    skipped["評価期間がカタログ外"] = skipped.get("評価期間がカタログ外", 0) + 1; continue
+            elif ev["anchor"] - calib_span < cov["first"] - _JMA_CATALOG_EDGE_TOL:
                 skipped["基準期間がカタログ外"] += 1; continue
             ev["group"], ev["prev"] = _bt_classify(ev, big, ev["eval_t"])
             targets.append(ev)
@@ -5910,19 +6307,29 @@ def _bt_run(p):
 
         groups = {}
         for ev in todo:
-            groups.setdefault(ev["anchor"], []).append(ev)
+            # 基準の作り直し間隔ごとにまとめる。固定基準を使う地震は、使う基準ごとにも分ける
+            groups.setdefault((ev["anchor"], ev["fb"]["baseline_name"] if ev["fb"] else ""), []).append(ev)
         out_path = _bt_records_path(cfg)
         n_done = len(targets) - len(todo)
-        for gi, anchor in enumerate(sorted(groups)):
+        for gi, gkey in enumerate(sorted(groups)):
+            anchor = gkey[0]
             if _bt_job["cancel"]:
                 _bt_set(phase="中止", message=f"中止しました（{n_done}/{len(targets)}件まで保存済み）")
                 return
-            evs = sorted(groups[anchor], key=lambda e: e["t"])
-            _bt_set(phase=f"基準の作成と評価 {gi + 1}/{len(groups)}（基準日 {_bt_jst(anchor)[:10]}・{len(evs)}件）")
-            q_lo = anchor - calib_span
+            evs = sorted(groups[gkey], key=lambda e: e["t"])
+            fixed_calib = evs[0]["fb"]
             q_hi = max([anchor] + [e["t"] + after for e in evs])
-            quakes = _fetch_catalog_strict(q_lo, min(q_hi, end_utc + after))
-            calib = _compute_historical_calibration(end_utc=anchor, quakes=quakes, step_hours=p["calib_step_hours"])
+            if fixed_calib is not None:
+                _bt_set(phase=f"固定基準で評価 {gi + 1}/{len(groups)}（{_bt_jst(anchor)[:10]}ごろ・{len(evs)}件・"
+                              f"基準 {fixed_calib['baseline_start_jst']}〜{fixed_calib['anchor_jst']}）")
+                q_lo = min(e["eval_t"] for e in evs) - timedelta(days=BT_WINDOW_DAYS) - timedelta(hours=1)
+                quakes = _fetch_catalog_strict(q_lo, min(q_hi, end_utc + after))
+                calib = fixed_calib
+            else:
+                _bt_set(phase=f"基準の作成と評価 {gi + 1}/{len(groups)}（基準日 {_bt_jst(anchor)[:10]}・{len(evs)}件）")
+                q_lo = anchor - calib_span
+                quakes = _fetch_catalog_strict(q_lo, min(q_hi, end_utc + after))
+                calib = _compute_historical_calibration(end_utc=anchor, quakes=quakes, step_hours=p["calib_step_hours"])
             th_all = calib.get("risk_thresholds") or {}
             th = th_all.get(BT_STD_KEY)
             if not th:
@@ -5946,6 +6353,8 @@ def _bt_run(p):
                     st_vecs = _bt_static_vectors(st, ev["eval_t"].timestamp())
                     rec = _bt_make_record(ev, ev["group"], ev["prev"], ev["eval_t"], anchor,
                                           score_vec, after_vec, th, st_vecs, p, comp_S=comp_S)
+                    if fixed_calib is not None:
+                        rec["baseline"] = fixed_calib["baseline_name"]   # (v9.42) どの固定基準で評価したか
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     f.flush()
                     n_done += 1
@@ -6233,7 +6642,7 @@ def _bt_csv(records, p):
     return "\ufeff" + buf.getvalue()
 
 
-def render_riskmap(risk_cells, updated_str):
+def render_riskmap(risk_cells, updated_str, hist=None):
     cells_js = json.dumps(risk_cells, ensure_ascii=False)
     weights_js = json.dumps(RISK_DEFAULT_WEIGHTS)
     labels_js = json.dumps(RISK_LABELS, ensure_ascii=False)
@@ -6241,6 +6650,13 @@ def render_riskmap(risk_cells, updated_str):
     gs = RISK_GRID_SIZE
     n_cells = len(risk_cells)
     w = RISK_DEFAULT_WEIGHTS
+    # (v9.41) 過去日付モード: hist={"datetime": "YYYY-MM-DDTHH:MM"(JST), "calib": bool}。
+    #   セルはページ側が /archive/historical_riskmap から取得して描画する（サーバーは重い計算を待たない）。
+    if hist:
+        n_cells = len(_RISK_CELLS)
+    hist_js = json.dumps(hist, ensure_ascii=False) if hist else "null"
+    hdr_html = (f"過去の時点を表示中（{hist['datetime'].replace('T', ' ')} JST）" if hist
+                else f"更新: {updated_str} {_recalc_btn_html('riskmap')}")
 
     # (v9.06) GNSS成分: 現在値だけを使う。現在のセルにGNSS値がある時だけ選択可能にする
     gnss_ready = any("gnss" in c["c"] for c in risk_cells)
@@ -6274,6 +6690,12 @@ def render_riskmap(risk_cells, updated_str):
         tec_row = ('<div class="chk-row disabled"><input type="checkbox" id="chk_tec" disabled>'
                    f'<span class="clabel">TEC（電離圏・局所偏差）</span><span class="cbadge">{_twhy}</span></div>')
     tec_ready_js = "true" if tec_ready else "false"
+    if hist:   # (v9.41) 過去の時点には、GNSS・TECの値がない
+        _na = '<span class="cbadge">過去非対応</span>'
+        gnss_row = ('<div class="chk-row disabled"><input type="checkbox" id="chk_gnss" disabled>'
+                    f'<span class="clabel">GNSS変位（地殻変動・現在値）</span>{_na}</div>')
+        tec_row = ('<div class="chk-row disabled"><input type="checkbox" id="chk_tec" disabled>'
+                   f'<span class="clabel">TEC（電離圏・局所偏差）</span>{_na}</div>')
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -6372,6 +6794,7 @@ canvas.dChart{{display:block;width:100%}}
   </div>
   <p class="sub">複数の地震関連データを統合した地震リスク指数です。各セルを「そのセル自身の過去65日の実績と比べてどれだけ普段と違うか」で絶対評価しています。地震の発生確率ではありません。</p>
 
+  <div id="histBanner" style="display:none;font-size:11px;color:#93c5fd;background:rgba(59,130,246,.14);border:1px solid rgba(59,130,246,.4);border-radius:10px;padding:8px 10px;margin-bottom:12px;line-height:1.6"></div>
   <div class="sec">
     <h3>プリセット</h3>
     <div class="preset-row">
@@ -6424,7 +6847,7 @@ canvas.dChart{{display:block;width:100%}}
 </div>
 <div id="mp">
   <div id="map"></div>
-  <div id="hdr">更新: {updated_str} {_recalc_btn_html('riskmap')}</div>
+  <div id="hdr">{hdr_html}</div>
   <div id="lg">
     <b>統合リスクレベル</b><br>
     <span style="color:{LEVEL_COLOR[5]};background:{LEVEL_COLOR[5]};opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特に稀な高リスク）<br>
@@ -6473,6 +6896,7 @@ var RISK_COLOR = {{5:'{LEVEL_COLOR[5]}',4:'{LEVEL_COLOR[4]}',3:'{LEVEL_COLOR[3]}
 var KEYS = ['etas','bvalue','fault','plate','pressure','tec','gnss'];
 var GNSS_READY = {gnss_ready_js};   // (v9.06) 現在のGNSS値が使えるか
 var TEC_READY = {tec_ready_js};     // (v9.21) 現在のTEC値が使えるか
+var HIST = {hist_js};   // (v9.41) 過去日付モード(nullなら現在)
 
 var PRESETS = {{
   standard: {{etas:true, bvalue:true, fault:true, plate:true, pressure:false, tec:true,  gnss:true}},   // (v9.07/9.21) GNSS・TECが使えない間は自動で外れる
@@ -6483,6 +6907,7 @@ var PRESETS = {{
 var selected = Object.assign({{}}, PRESETS.standard);
 if(!GNSS_READY) selected.gnss = false;   // (v9.07)
 if(!TEC_READY) selected.tec = false;     // (v9.21)
+if(HIST) selected.pressure = false;      // (v9.41) 過去の気圧は持たない
 
 if(window.innerWidth<=768){{
   document.getElementById('panel').classList.add('closed');
@@ -6509,6 +6934,7 @@ function applyPreset(name){{
     selected = Object.assign({{}}, PRESETS[name]);
     if(!GNSS_READY) selected.gnss = false;   // (v9.00) GNSSが使えない間は外す（「地殻変動」はプレートのみに戻る）
     if(!TEC_READY) selected.tec = false;     // (v9.21)
+    if(HIST) selected.pressure = false;      // (v9.41)
     applyCheckboxesFromSelected();
   }}
   setActivePreset(name);
@@ -6688,6 +7114,13 @@ function showDetail(cell, comp, lv){{
   }}
   drawBarChart(document.getElementById('dBarCanvas'), labels, contribInt, colors);
 
+  if(HIST){{   // (v9.41) 過去日付では前日比・推移（毎時スナップショット由来）は出さない
+    document.getElementById('dPrevDay').textContent = '過去日付では表示しません';
+    document.getElementById('dTrendState').textContent = '過去日付では表示しません';
+    var tc0 = document.getElementById('dTrendCanvas'); tc0.getContext('2d').clearRect(0, 0, tc0.width, tc0.height);
+    return;
+  }}
+
   // 前日比・推移は別セクションとして非同期取得（内訳の表示とはごちゃ混ぜにしない）
   document.getElementById('dPrevDay').textContent = '取得中…';
   document.getElementById('dTrendState').textContent = '取得中…';
@@ -6782,12 +7215,51 @@ function redraw(){{
   }});
   document.getElementById('cellN').textContent = shown;
   document.getElementById('lvCounts').textContent =
-    '現在: Lv1 '+lvN[1]+' / Lv2 '+lvN[2]+' / Lv3 '+lvN[3]+' / Lv4 '+lvN[4]+' / Lv5 '+lvN[5];
+    (HIST?'この時点: ':'現在: ')+'Lv1 '+lvN[1]+' / Lv2 '+lvN[2]+' / Lv3 '+lvN[3]+' / Lv4 '+lvN[4]+' / Lv5 '+lvN[5];
   renderRankTable(lastShownList);
 }}
 
-redraw();
-if(!THRESH.calibrated){{
+// (v9.41) 過去日付モード: アーカイブと同じ /archive/historical_riskmap で、その時点のセルを取得して描画する
+function histStatus(d){{
+  var src;
+  if(d.data_source==='jma_catalog') src='気象庁一元化震源カタログ（M'+(d.min_mag!=null?Number(d.min_mag).toFixed(1):'')+'以上のみ）';
+  else if(d.data_source==='usgs_historical') src='USGS過去カタログ（震度情報なし・小規模地震が漏れる場合あり）';
+  else src='JMA/P2P統合データ（直近60日）';
+  var calibLine=(d.calib_mode==='date')?(d.calib_fixed?('基準: <b>固定基準（'+d.calib_start_jst+' 〜 '+d.calib_anchor_jst+'・'+d.calib_n_samples+'時点）</b><br>'):('基準: <b>'+d.calib_anchor_jst+' より前の65日で作り直し</b><br>')):'基準: 現在の基準（過去65日）を使用<br>';
+  return '<b>過去の時点: '+d.ref_time_jst+'</b><br>'+calibLine+
+    '取得期間: '+d.period_start_jst+' 〜 '+d.ref_time_jst+'<br>'+
+    'データソース: <b>'+src+'</b>／地震 <b>'+d.quake_count+'</b>件<br>'+
+    '<span style="color:rgba(235,238,245,.62)">この時点のマップには、気圧・TEC・GNSSは含まれません。前日比・推移も表示しません。</span>';
+}}
+function loadHist(){{
+  var b=document.getElementById('histBanner'); b.style.display='block'; b.style.color='#93c5fd';
+  b.innerHTML='過去の時点（'+HIST.datetime.replace('T',' ')+' JST）のリスクマップを計算しています…（数十秒かかる場合があります）';
+  fetch('/archive/historical_riskmap?datetime='+encodeURIComponent(HIST.datetime)+(HIST.calib?'&calib=date':''))
+    .then(function(r){{
+      if(r.status===202) return r.json().then(function(e){{ return {{pending:true, message:e.message}}; }});
+      if(!r.ok) return r.json().then(function(e){{ throw new Error(e.error||('HTTPエラー '+r.status)); }});
+      return r.json();
+    }})
+    .then(function(d){{
+      if(d.pending){{ b.innerHTML=d.message; setTimeout(loadHist,5000); return; }}
+      CELLS=d.cells||[]; if(d.thresholds) THRESH=d.thresholds;
+      b.innerHTML=histStatus(d);
+      redraw();
+    }})
+    .catch(function(e){{ b.style.color='#fca5a5'; b.innerHTML='取得に失敗しました: '+e.message; }});
+}}
+if(HIST){{
+  var pcb=document.getElementById('chk_pressure');
+  if(pcb){{
+    pcb.checked=false; pcb.disabled=true; pcb.parentNode.classList.add('disabled');
+    var cw=pcb.parentNode.querySelector('.cweight'); if(cw) cw.style.display='none';
+    var bd=document.createElement('span'); bd.className='cbadge'; bd.textContent='過去非対応'; pcb.parentNode.appendChild(bd);
+  }}
+  loadHist();
+}} else {{
+  redraw();
+}}
+if(!HIST && !THRESH.calibrated){{
   var cb = document.getElementById('calibBanner');
   cb.style.display = 'block';
   cb.textContent = '絶対基準（過去65日の実績）を計算中、または過去データが不足しています。'
@@ -6822,6 +7294,8 @@ body{display:flex;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,
 .sec h3{font-size:11px;color:#93c5fd;margin-bottom:6px;letter-spacing:.5px}
 .field{display:flex;align-items:center;gap:6px;margin-bottom:6px;font-size:12px}
 .field label{flex:1;color:rgba(235,238,245,.75);line-height:1.35}
+.field select{width:150px;padding:5px 6px;border-radius:7px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:#f3f4f6;font-size:12px}
+.field select option{background:#1b2236;color:#f3f4f6}
 .field input{width:104px;padding:5px 6px;border-radius:7px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:#f3f4f6;font-size:12px}
 .hint{font-size:10px;color:rgba(235,238,245,.45);line-height:1.5;margin:-2px 0 6px}
 details{margin-bottom:10px}
@@ -6911,8 +7385,10 @@ tr.det td{white-space:normal;text-align:left;background:rgba(255,255,255,.035);p
       <div class="field"><label>直前(発生の何時間前)</label><input type="number" id="pLead" step="0.01" min="0.01" value="0.05"></div>
       <div class="field"><label>直後(何時間後・参考用)</label><input type="number" id="pAfter" step="0.01" min="0" value="0.05"></div>
       <div class="field"><label>基準の作り直し間隔(日, 0=1地震ごと)</label><input type="number" id="pRebuild" step="1" value="30"></div>
+      <div class="field"><label>基準の作り方</label><select id="pCalibMode"><option value="fixed">固定基準を使う(速い)</option><option value="rebuild">毎回作り直す(従来)</option></select></div>
+      <div class="hint" id="fbHint">固定基準: 確認中…</div>
       <div class="field"><label>基準のサンプル間隔(時間)</label><input type="number" id="pStep" step="6" value="24"></div>
-      <div class="hint">基準は「評価時点より前の65日」だけで作ります(先読みなし)。作り直し間隔が短いほど厳密ですが遅くなります。遅いときは間隔を90〜180日、サンプル間隔を48時間にすると軽くなります(基準が少し古く・粗くなります)。</div>
+      <div class="hint">固定基準を使うときは、評価時点より前に終わる固定基準を使います(先読みなし)。該当が無い時期は従来どおり作り直します。作り直す場合、基準は「評価時点より前の65日」だけで作ります(先読みなし)。作り直し間隔が短いほど厳密ですが遅くなります。遅いときは間隔を90〜180日、サンプル間隔を48時間にすると軽くなります(基準が少し古く・粗くなります)。</div>
       <div class="field"><label>余震判定:前の大地震のM以上</label><input type="number" id="pPrev" step="0.1" value="6.0"></div>
       <div class="hint">近く(50〜400km)・直前(30〜365日)の範囲は、前の大地震の規模から自動で決めます。</div>
     </div>
@@ -6946,7 +7422,7 @@ function srcTag(k){var c=(k==='nb')?'tag nb':(k.indexOf('st_')===0?'tag st':'tag
 function params(){
   return {start:$('pStart').value, end:$('pEnd').value, min_mag:$('pMag').value, max_depth_km:$('pDepth').value,
           lead_hours:$('pLead').value, after_hours:$('pAfter').value, rebuild_days:$('pRebuild').value,
-          calib_step_hours:$('pStep').value, prev_mag:$('pPrev').value};
+          calib_step_hours:$('pStep').value, prev_mag:$('pPrev').value, calib_mode:$('pCalibMode').value};
 }
 function qs(o){return Object.keys(o).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(o[k])}).join('&')}
 function setStat(msg, err){var s=$('stat'); s.className=err?'err':''; s.innerHTML=msg}
@@ -6954,10 +7430,12 @@ function init(){
   fetch('/backtest/info').then(function(r){return r.json()}).then(function(d){
     var p = (d.last_params && d.last_params.defaults_ver === DEF.defaults_ver) ? d.last_params : DEF;
     $('pStart').value=p.start; $('pEnd').value=p.end;
-    ['Mag:min_mag','Depth:max_depth_km','Lead:lead_hours','After:after_hours','Rebuild:rebuild_days','Step:calib_step_hours','Prev:prev_mag'].forEach(function(s){
+    ['Mag:min_mag','Depth:max_depth_km','Lead:lead_hours','After:after_hours','Rebuild:rebuild_days','Step:calib_step_hours','Prev:prev_mag','CalibMode:calib_mode'].forEach(function(s){
       var a=s.split(':'); if(p[a[1]]!=null) $('p'+a[0]).value=p[a[1]];
     });
     $('covHint').innerHTML = d.coverage ? ('カタログ収録: '+d.coverage.first+' 〜 '+d.coverage.last+'（基準に約125日必要なため、先頭から約4か月ぶんは評価できません）'+(d.coverage.ignored ? '<br>※途切れているため使わない年: '+esc(d.coverage.ignored) : '')) : ('<span style="color:#fca5a5">一元化カタログ(h2023 など年別ファイル)が見つかりません。</span><br>'+esc(d.catalog_diag||''));
+    var fb=d.fixed_baselines||[];
+    $('fbHint').innerHTML = fb.length ? ('固定基準(終端日): '+fb.map(esc).join(', ')+' ／ 評価時点より前に終わる最新のものを使います') : '固定基準は見つかりません(作ると速くなります: python app.py --build-baseline)。毎回作り直します。';
     if(d.job && d.job.running){ watch(); }
     else if(d.has_records){ loadResult(); }
   }).catch(function(e){ setStat('初期化に失敗: '+esc(e.message), true) });
@@ -7205,367 +7683,19 @@ init();
 
 
 # ══════════════════════════════════════════════════════
-# TAB 9: アーカイブ（過去の任意時点における統合リスクマップ検索）
+# (v9.41) 旧「アーカイブ」タブは廃止。過去日付は、サイドバーの「表示日時」(全体の日付)で指定する。
+#   ・統合リスクマップ: /tab/riskmap?datetime=…(&calib=date) → ページが /archive/historical_riskmap を呼ぶ
+#   ・地震履歴: /tab/history?datetime=… → _render_history_at()
+# 1時間ごとのスナップショット保存（data/snapshots/）は、統合リスクマップのセル詳細の
+# 「推移（直近7日）」グラフが使うため、バックエンドの保存・バックアップ処理は維持している。
 # ══════════════════════════════════════════════════════
-# ★ 旧仕様（1時間ごとのETAS/b値スナップショット一覧を左のリストから選んで
-# 見る形式）は撤去した。代わりに、日付と時刻を指定すると「その時刻」を基準に
-# 1か月前までの地震データを取得し直し、統合リスクマップ（ETAS/b値/活断層/
-# プレート境界）をその時点の状態として再計算・表示する形式にしている。
-# なお1時間ごとのスナップショット保存自体（data/snapshots/）は、統合リスク
-# マップタブのセル詳細に出る「推移（直近7日）」グラフが引き続き利用するため、
-# バックエンド側の保存処理は維持している。
-def render_snapshots(updated_str):
-    html = """<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-__LEAFLET_CDN__
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{display:flex;height:100vh;background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"SF Pro JP","Hiragino Sans",sans-serif;color:#f3f4f6}
-#panel{width:300px;flex-shrink:0;background:rgba(255,255,255,.055);backdrop-filter:blur(28px) saturate(180%);-webkit-backdrop-filter:blur(28px) saturate(180%);border-right:1px solid rgba(255,255,255,.14);overflow-y:auto;padding:14px}
-#panel h2{font-size:14px;color:#f3f4f6;margin-bottom:4px}
-#panel p.sub{font-size:11px;color:rgba(235,238,245,.46);margin-bottom:14px;line-height:1.6}
-.sec{margin-bottom:16px}
-.sec h3{font-size:12px;font-weight:700;color:#60a5fa;margin-bottom:8px;border-bottom:1px solid rgba(255,255,255,.14);padding-bottom:4px}
-.field{margin-bottom:10px}
-.field label{display:block;font-size:11px;color:rgba(235,238,245,.62);margin-bottom:4px}
-.field input{width:100%;padding:7px 8px;font-size:12px;background:rgba(255,255,255,.09);backdrop-filter:blur(14px) saturate(160%);-webkit-backdrop-filter:blur(14px) saturate(160%);border:1px solid rgba(255,255,255,.18);
-    border-radius:14px;color:#f3f4f6}
-.field input:focus{outline:none;border-color:#3b82f6}
-#fetchBtn{width:100%;padding:9px 0;font-size:12.5px;font-weight:700;color:#fff;cursor:pointer;
-    background:linear-gradient(135deg,#0a84ff,#7c5cff);border:none;border-radius:16px;margin-top:2px}
-#fetchBtn:hover{filter:brightness(1.1)}
-#fetchBtn:disabled{opacity:.5;cursor:default;filter:none}
-#statusBox{font-size:11px;color:rgba(235,238,245,.62);line-height:1.8;margin-top:12px;padding:10px 12px;
-    background:rgba(255,255,255,.07);border-radius:16px;border:1px solid rgba(255,255,255,.14);display:none}
-#statusBox b{color:#60a5fa}
-#statusBox.err{border-color:#7f1d1d;color:#fca5a5}
-.chk-row{display:flex;align-items:center;gap:8px;padding:5px 4px;border-radius:12px;font-size:12px}
-.chk-row:hover{background:rgba(255,255,255,.07)}
-.chk-row input{width:15px;height:15px;flex-shrink:0}
-.chk-row .clabel{flex:1;color:rgba(240,242,247,.85)}
-.chk-row .cweight{font-size:10px;color:rgba(235,238,245,.46)}
-#cellCount{font-size:11px;color:rgba(235,238,245,.62);margin-top:8px}
-#cellCount span{color:#60a5fa;font-weight:700}
-.note{font-size:10.5px;color:rgba(235,238,245,.46);line-height:1.7;margin-top:10px}
-#mp{flex:1;overflow:hidden;position:relative}
-#map{width:100%;height:100%}
-/* 地図タイル自体を少し明るく・彩度を落として、暗色オーバーレイとの同化を防ぐ(v7.44) */
-.leaflet-tile-pane{filter:brightness(1.18) saturate(0.8) contrast(0.95)}
-#lg{position:absolute;bottom:20px;left:20px;z-index:1000;background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
-    padding:10px 13px;border-radius:18px;border:1px solid rgba(255,255,255,.18);font-size:11px;line-height:1.9;color:#f3f4f6}
-#mapEmpty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-    color:rgba(235,238,245,.4);font-size:13px;text-align:center;padding:20px}
-#detailBox{display:none;position:absolute;top:14px;right:14px;z-index:1500;width:270px;
-    background:rgba(26,29,44,.5);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);border:1px solid rgba(255,255,255,.18);border-radius:20px;padding:12px 14px;
-    font-size:11px;color:rgba(240,242,247,.85)}
-#detailBox .dHead{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
-#dTitle{font-weight:700;font-size:14px;color:#f3f4f6}
-#dClose{flex-shrink:0;width:20px;height:20px;border:none;border-radius:12px;background:rgba(255,255,255,.18);backdrop-filter:blur(10px) saturate(160%);-webkit-backdrop-filter:blur(10px) saturate(160%);color:rgba(235,238,245,.72);
-    cursor:pointer;font-size:12px;line-height:1}
-#dClose:hover{background:rgba(255,255,255,.3);color:#fff}
-#dLoc{font-size:10px;color:rgba(235,238,245,.46);margin:2px 0 10px}
-.brk-row{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;color:rgba(235,238,245,.72)}
-.brk-val{font-weight:700;color:#f3f4f6}
-canvas.dChart{display:block;width:100%;margin-top:6px}
-
-@media (max-width:768px){
-  body{flex-direction:column;overflow-y:auto}
-  #panel{width:100%;border-right:none;border-bottom:1px solid rgba(255,255,255,.14);max-height:46vh}
-  #mp{flex:none;height:46vh;min-height:220px}
-  #detailBox{width:82vw;max-width:270px;right:8px;top:8px}
-}
-</style></head><body>
-<div id="panel">
-  <h2>過去時点マップ検索</h2>
-  <p class="sub">日付と時刻を指定すると、その時刻から1か月前までの地震データを取得し直し、その時点の統合リスクマップ（ETAS・b値・活断層・プレート境界）を再現します。GNSS変位は未実装です。</p>
-
-  <div class="sec">
-    <h3>基準日時（JST）</h3>
-    <div class="field"><label>日付</label><input type="date" id="inDate"></div>
-    <div class="field"><label>時刻</label><input type="time" id="inTime" value="00:00"></div>
-    <div style="margin-bottom:10px;font-size:11.5px;color:rgba(235,238,245,.75);line-height:1.5"><label><input type="checkbox" id="inCalib" style="width:auto;margin-right:6px">この日付で基準を作り直す（古い日付向け）</label>
-      <div style="font-size:10px;color:rgba(235,238,245,.42);margin-top:3px">基準日より前の65日だけで基準を作ります（一元化カタログの範囲のみ。初回は数十秒〜数分）。</div></div>
-    <button id="fetchBtn" onclick="runFetch()"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor"/></svg>この時点のリスクマップを取得</button>
-    <div id="statusBox"></div>
-  </div>
-
-  <div class="sec" id="chkSec" style="display:none">
-    <h3>使用データ（チェックで選択）</h3>
-    <div class="chk-row"><input type="checkbox" id="chk_etas" checked onchange="onToggle('etas')">
-      <span class="clabel">ETAS（地震活動度）</span><span class="cweight">w=__W_ETAS__</span></div>
-    <div class="chk-row"><input type="checkbox" id="chk_bvalue" checked onchange="onToggle('bvalue')">
-      <span class="clabel">b値（Gutenberg-Richter）</span><span class="cweight">w=__W_BVALUE__</span></div>
-    <div class="chk-row"><input type="checkbox" id="chk_fault" checked onchange="onToggle('fault')">
-      <span class="clabel">活断層 応力負荷</span><span class="cweight">w=__W_FAULT__</span></div>
-    <div class="chk-row"><input type="checkbox" id="chk_plate" checked onchange="onToggle('plate')">
-      <span class="clabel">プレート境界 応力負荷</span><span class="cweight">w=__W_PLATE__</span></div>
-    <div class="chk-row disabled"><input type="checkbox" disabled>
-      <span class="clabel">GNSS変位（地殻変動）</span><span class="cbadge">未実装</span></div>
-  </div>
-
-  <div id="cellCount" style="display:none">表示中のセル数: <span id="cellN">0</span></div>
-  <div class="note">
-    気圧偏差・TECは過去分のデータを保持していないため、この検索には含まれません。<br>
-    GNSS変位は、アーカイブでは未実装です（統合リスクマップタブでは現在値のみで使えます）。<br>
-    直近60日以内は気象庁(JMA)・P2P地震情報を統合した高精度データを使用します。<br>
-    それより古い日時は、サーバーに気象庁一元化震源カタログの年別ファイルがある期間ならそれを使います。
-    無い期間はUSGSの過去カタログから都度取得します（数年前まで指定可能）。
-    ただしUSGSは国内のごく小規模な地震が漏れる場合があり、震度情報も含まれません。
-  </div>
-</div>
-<div id="mp">
-  <div id="map"></div>
-  <div id="mapEmpty">日付と時刻を指定して取得してください</div>
-  <div id="lg" style="display:none">
-    <b>統合リスクレベル</b><br>
-    <span style="color:#0c000c;background:#0c000c;opacity:0.9;padding:0 6px;border:1px solid #fff">■</span> Lv5（特に稀な高リスク）<br>
-    <span style="color:#8000ff;opacity:0.55">■</span> Lv4（警戒）<br>
-    <span style="color:#ff0000;opacity:0.55">■</span> Lv3（注意）<br>
-    <span style="color:#ffe600;opacity:0.55">■</span> Lv2（やや注意）<br>
-    <span style="color:#66ccff;opacity:0.55">■</span> Lv1（平常）<br>
-    <hr style="border-color:rgba(255,255,255,.18);margin:5px 0">
-    <small style="color:rgba(235,238,245,.46)">Lv0（しきい値未満）のセルは地図上に表示されません</small><br>
-    <small>指定時点における相対リスク指数<br>（発生確率を意味するものではありません）</small>
-  </div>
-  <div id="detailBox">
-    <div class="dHead">
-      <div><div id="dTitle">-</div><div id="dLoc"></div></div>
-      <button id="dClose" onclick="closeDetail()" title="閉じる">✕</button>
-    </div>
-    <div id="dBreakdown"></div>
-    <canvas id="dBarCanvas" class="dChart" width="230" height="100"></canvas>
-  </div>
-</div>
-<script>
-var RISK_COLOR = {5:'#0c000c',4:'#8000ff',3:'#ff0000',2:'#ffe600',1:'#66ccff'};
-var COMP_COLOR = {etas:'#ef4444', bvalue:'#f97316', fault:'#facc15', plate:'#38bdf8'};
-var WEIGHTS = __WEIGHTS_JSON__;
-var LABELS  = {etas:'ETAS', bvalue:'b値', fault:'活断層', plate:'プレート境界'};
-var KEYS = ['etas','bvalue','fault','plate'];
-var GS = __RISK_GRID_SIZE__;
-var selected = {etas:true, bvalue:true, fault:true, plate:true};
-var CELLS = [];
-var lastShownList = [];
-var map = null, rectLayer = null;
-
-function onToggle(key){
-  selected[key] = document.getElementById('chk_'+key).checked;
-  redraw();
-}
-
-// (v8.21) 通常版と同じ: 履歴のある成分がそのセルに無い場合は中立0.5で補う
-function computeComposite(cell){
-  var wsum=0, ssum=0, used=[], wmiss=0;
-  KEYS.forEach(function(k){
-    if(!selected[k]) return;
-    var wk = WEIGHTS[k];
-    if(cell.c[k]){ wsum += wk; ssum += wk*cell.c[k].s; used.push(k); }
-    else { wmiss += wk; }
-  });
-  if(wsum<=0) return null;
-  var wall = wsum + wmiss;
-  return {score: (ssum + 0.5*wmiss)/wall, used: used, wsum: wall, wmiss: wmiss};
-}
-// (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。
-// (v7.56) アーカイブ版も通常版(riskmapタブ)と同じ絶対基準に統一。Lv0(色無し)も同様。
-// (v8.21) 通常版と同じ、過去実績からの自動キャリブレーション済みしきい値を使う
-// （サーバーが /archive/historical_riskmap の応答に同梱してTHRESHへ設定する）。
-var THRESH = {by_subset:{}, default:[0.2,0.4,0.6,0.85,0.97]};
-function currentThresholds(){
-  var ks = KEYS.filter(function(k){ return selected[k]; });
-  return (THRESH.by_subset && THRESH.by_subset[ks.join(',')]) || THRESH.default;
-}
-function levelOf(score){
-  var t = currentThresholds();
-  if(score>=t[4]) return 5;
-  if(score>=t[3]) return 4;
-  if(score>=t[2]) return 3;
-  if(score>=t[1]) return 2;
-  if(score>=t[0]) return 1;
-  return 0;
-}
-
-function roundPartsToTotal(parts, total){
-  var floors = parts.map(Math.floor);
-  var used = floors.reduce(function(a,b){return a+b;}, 0);
-  var remainder = Math.round(total - used);
-  var order = parts.map(function(p,i){return {i:i, frac:p-Math.floor(p)};})
-                   .sort(function(a,b){return b.frac-a.frac;});
-  var result = floors.slice();
-  for(var k=0; k<remainder && k<order.length; k++){ result[order[k].i] += 1; }
-  return result;
-}
-
-function drawBarChart(canvas, labels, values, colors){
-  var ctx = canvas.getContext('2d');
-  var W = canvas.width, H = canvas.height;
-  ctx.clearRect(0,0,W,H);
-  var n = labels.length;
-  if(n===0) return;
-  var maxV = Math.max(1, Math.max.apply(null, values.map(function(v){return Math.abs(v);})));
-  var labelW = 60, valW = 28;
-  var trackW = W - labelW - valW;
-  var rowH = H / n;
-  var barH = Math.min(14, rowH - 6);
-  ctx.font = '10px sans-serif';
-  ctx.textBaseline = 'middle';
-  for(var i=0; i<n; i++){
-    var cy = rowH*i + rowH/2;
-    ctx.fillStyle = '#9ca3af';
-    ctx.fillText(labels[i], 0, cy);
-    ctx.fillStyle = 'rgba(255,255,255,.12)';
-    ctx.fillRect(labelW, cy-barH/2, trackW, barH);
-    var w = Math.max(1, trackW * (Math.abs(values[i]) / maxV));
-    ctx.fillStyle = colors[i] || '#60a5fa';
-    ctx.fillRect(labelW, cy-barH/2, w, barH);
-    ctx.fillStyle = '#f3f4f6';
-    ctx.fillText((values[i]>=0?'+':'')+values[i], labelW+trackW+4, cy);
-  }
-}
-
-function closeDetail(){ document.getElementById('detailBox').style.display = 'none'; }
-
-function showDetail(cell, comp, lv){
-  document.getElementById('detailBox').style.display = 'block';
-  var total = Math.round(comp.score*100);
-  document.getElementById('dTitle').textContent = '総合リスク ' + total + ' (Lv' + lv + ')';
-  document.getElementById('dLoc').textContent = '緯度' + cell.lat.toFixed(2) + ' / 経度' + cell.lon.toFixed(2);
-  var labels=[], contribFloat=[], colors=[];
-  comp.used.forEach(function(k){
-    var d = cell.c[k];
-    var nw = WEIGHTS[k] / comp.wsum;
-    labels.push(LABELS[k]); contribFloat.push(nw * d.s * 100); colors.push(COMP_COLOR[k] || '#60a5fa');
-  });
-  var names = comp.used.map(function(k){ return LABELS[k]; });
-  if(comp.wmiss > 0){
-    names.push('データ無し(中立)'); labels.push('データ無し'); colors.push('#6b7280');
-    contribFloat.push(0.5 * comp.wmiss / comp.wsum * 100);
-  }
-  var contribInt = roundPartsToTotal(contribFloat, total);
-  document.getElementById('dBreakdown').innerHTML = names.map(function(nm, i){
-    return '<div class="brk-row"><span>' + nm + '</span>' +
-      '<span class="brk-val">' + (contribInt[i]>=0?'+':'') + contribInt[i] + '</span></div>';
-  }).join('');
-  drawBarChart(document.getElementById('dBarCanvas'), labels, contribInt, colors);
-}
-
-function ensureMap(){
-  if(map) return;
-  map = L.map('map',{center:[36,138],zoom:5,preferCanvas:true});
-  __DARK_TILE__
-  __GEOJSON_JS__
-}
-
-function redraw(){
-  if(!map) return;
-  if(rectLayer) map.removeLayer(rectLayer);
-  rectLayer = L.layerGroup().addTo(map);
-  var shown = 0;
-  lastShownList = [];
-  CELLS.forEach(function(cell){
-    var comp = computeComposite(cell);
-    if(!comp) return;
-    var lv = levelOf(comp.score);
-    if(lv===0) return;  // (v7.56) Lv0(色無し)は地図・件数・ランキングいずれにも出さない
-    shown++;
-    lastShownList.push({cell:cell, comp:comp, lv:lv});
-    var rect = L.rectangle(
-      [[cell.lat-GS/2, cell.lon-GS/2],[cell.lat+GS/2, cell.lon+GS/2]],
-      {color: lv===5 ? '#ffffff' : null, weight: lv===5 ? 2 : 0, fill:true, fillColor:RISK_COLOR[lv], fillOpacity: lv===5 ? 0.9 : 0.55}
-    );
-    rect.on('click', function(){ showDetail(cell, comp, lv); });
-    rect.addTo(rectLayer);
-  });
-  document.getElementById('cellN').textContent = shown;
-}
-
-function fmtStatus(d){
-  var srcLabel;
-  if(d.data_source === 'jma_catalog'){
-    srcLabel = '気象庁一元化震源カタログ（60日超のため。M' +
-               (d.min_mag != null ? Number(d.min_mag).toFixed(1) : '') + '以上のみ使用）';
-  } else if(d.data_source === 'usgs_historical'){
-    srcLabel = 'USGS過去カタログ（60日超のため。震度情報なし・小規模地震が漏れる場合あり）';
-  } else {
-    srcLabel = 'JMA/P2P統合データ（直近60日）';
-  }
-  var calibLine = (d.calib_mode === 'date') ? ('基準: <b>' + d.calib_anchor_jst + ' より前の65日で作り直し</b><br>') : '';
-  return '基準時刻: <b>' + d.ref_time_jst + '</b><br>' + calibLine +
-         '取得期間: ' + d.period_start_jst + ' 〜 ' + d.ref_time_jst + '<br>' +
-         'データソース: <b>' + srcLabel + '</b><br>' +
-         '使用した地震データ: <b>' + d.quake_count + '</b>件 ／ セル数: <b>' + d.cells.length + '</b>';
-}
-
-var RC_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor"/></svg>';
-function runFetch(){
-  var dateVal = document.getElementById('inDate').value;
-  var timeVal = document.getElementById('inTime').value || '00:00';
-  var statusBox = document.getElementById('statusBox');
-  var btn = document.getElementById('fetchBtn');
-  if(!dateVal){
-    statusBox.className = 'err'; statusBox.style.display = 'block';
-    statusBox.innerHTML = '日付を入力してください。';
-    return;
-  }
-  btn.disabled = true; btn.textContent = '取得中...';
-  statusBox.className = ''; statusBox.style.display = 'block';
-  statusBox.innerHTML = '地震データを取得し、統合リスクマップを再計算しています…（数十秒かかる場合があります）';
-  closeDetail();
-
-  var pendingRetry = false;
-  var calibQ = document.getElementById('inCalib').checked ? '&calib=date' : '';
-  fetch('/archive/historical_riskmap?datetime=' + encodeURIComponent(dateVal + 'T' + timeVal) + calibQ)
-    .then(function(r){
-      if(r.status === 202) return r.json().then(function(e){ return {pending: true, message: e.message}; });
-      if(!r.ok) return r.json().then(function(e){ throw new Error(e.error || ('HTTPエラー ' + r.status)); });
-      return r.json();
-    })
-    .then(function(d){
-      if(d.pending){
-        pendingRetry = true;
-        statusBox.className = ''; statusBox.innerHTML = d.message;
-        setTimeout(runFetch, 5000);
-        return;
-      }
-      CELLS = d.cells || [];
-      if(d.thresholds) THRESH = d.thresholds;
-      statusBox.className = ''; statusBox.innerHTML = fmtStatus(d);
-      document.getElementById('chkSec').style.display = CELLS.length ? 'block' : 'none';
-      document.getElementById('cellCount').style.display = CELLS.length ? 'block' : 'none';
-      document.getElementById('lg').style.display = CELLS.length ? 'block' : 'none';
-      document.getElementById('mapEmpty').style.display = CELLS.length ? 'none' : 'flex';
-      if(CELLS.length){
-        ensureMap();
-        setTimeout(function(){ map.invalidateSize(); redraw(); }, 50);
-      }
-    })
-    .catch(function(e){
-      statusBox.className = 'err';
-      statusBox.innerHTML = '取得に失敗しました: ' + e.message;
-    })
-    .finally(function(){
-      if(pendingRetry) return;
-      btn.disabled = false; btn.innerHTML = RC_ICON + 'この時点のリスクマップを取得';
-    });
-}
-</script></body></html>"""
-    html = html.replace("__RISK_GRID_SIZE__", str(RISK_GRID_SIZE))
-    # (v9.07) 重みはサーバー側(しきい値の較正に使うもの)と必ず一致させる
-    html = html.replace("__WEIGHTS_JSON__", json.dumps({k: RISK_DEFAULT_WEIGHTS[k] for k in _RISK_HIST_KEYS}))
-    for _k in _RISK_HIST_KEYS:
-        html = html.replace(f"__W_{_k.upper()}__", f"{RISK_DEFAULT_WEIGHTS[_k]:.2f}")
-    html = html.replace("__LEAFLET_CDN__", LEAFLET_CDN)
-    html = html.replace("__DARK_TILE__", DARK_TILE)
-    html = html.replace("__GEOJSON_JS__", GEOJSON_JS)
-    return html
-
 
 SHELL_HTML = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
-  <title>Earthquake-risk-map v9.40</title>
+  <title>Earthquake-risk-map v9.41</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
   <link rel="shortcut icon" href="/favicon.ico">
@@ -7629,6 +7759,29 @@ SHELL_HTML = """<!DOCTYPE html>
     .gt-sta{background:rgba(245,158,11,.25);color:#fcd34d}
     .gt-ver{background:rgba(255,255,255,.12);color:rgba(235,238,245,.62)}
     .group-note{padding:0 14px 4px;font-size:10px;line-height:1.5;color:rgba(235,238,245,.38)}
+    /* (v9.41) 全体の日付 */
+    .gdate{padding:10px 12px 12px;border-bottom:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.03)}
+    .gd-h{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:11px;font-weight:700;color:rgba(235,238,245,.72);margin-bottom:6px}
+    .gd-state{font-size:9.5px;font-weight:700;padding:1px 7px;border-radius:7px;background:rgba(52,211,153,.22);color:#6ee7b7;white-space:nowrap}
+    .gd-state.past{background:rgba(251,191,36,.22);color:#fcd34d}
+    #gdInput{width:100%;padding:6px 7px;font-size:12px;color:#f3f4f6;background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.18);border-radius:10px;color-scheme:dark;font-family:inherit}
+    .gd-opt{display:flex;align-items:flex-start;gap:6px;margin-top:7px;font-size:10.5px;line-height:1.45;color:rgba(235,238,245,.62)}
+    .gd-opt input{margin-top:2px;flex-shrink:0}
+    .gd-btns{display:flex;gap:6px;margin-top:8px}
+    .gd-btns button{flex:1;padding:7px 4px;font-size:11.5px;font-weight:600;color:#fff;cursor:pointer;border:1px solid rgba(255,255,255,.2);border-radius:10px;background:rgba(255,255,255,.1)}
+    .gd-btns button:hover{filter:brightness(1.2)}
+    #gdApply{background:linear-gradient(135deg,rgba(10,132,255,.55),rgba(124,92,255,.4))}
+    .gd-note{margin-top:7px;font-size:10px;line-height:1.5;color:rgba(235,238,245,.42)}
+    .tab-btn .natag{display:none;font-size:9px;padding:1px 5px;border-radius:7px;background:rgba(255,255,255,.12);color:rgba(235,238,245,.6);flex-shrink:0}
+    .tab-btn.na{opacity:.42}
+    .tab-btn.na .badge{display:none}
+    .tab-btn.na .natag{display:inline-block}
+    #main{position:relative}
+    #unsup{display:none;position:absolute;inset:0;align-items:center;justify-content:center;flex-direction:column;gap:10px;padding:24px;text-align:center;z-index:5}
+    #unsup.show{display:flex}
+    #unsup .u-t{font-size:15px;font-weight:700;color:#f3f4f6}
+    #unsup .u-d{max-width:420px;font-size:12.5px;line-height:1.7;color:rgba(235,238,245,.62)}
+    #unsup button{margin-top:4px;padding:9px 18px;font-size:12.5px;font-weight:600;color:#fff;cursor:pointer;border:1px solid rgba(255,255,255,.2);border-radius:12px;background:linear-gradient(135deg,rgba(10,132,255,.55),rgba(124,92,255,.4))}
     #toast{
       display:none;position:fixed;left:50%;transform:translateX(-50%);
       bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:400;
@@ -7680,7 +7833,14 @@ SHELL_HTML = """<!DOCTYPE html>
   <div id="sidebar">
     <div class="app-title">
       <div>地震リスクマップ</div>
-      <div>v9.40 / 研究用</div>
+      <div>v9.50 / 研究用</div> 
+    </div>
+    <div class="gdate">
+      <div class="gd-h"><span>表示日時（JST）</span><span id="gdState" class="gd-state">現在</span></div>
+      <input type="datetime-local" id="gdInput" aria-label="表示する日時（日本時間）">
+      <label class="gd-opt"><input type="checkbox" id="gdCalib"><span>この日付で基準を作り直す（時間がかかる・過去の評価向け）</span></label>
+      <div class="gd-btns"><button id="gdApply" onclick="applyGDate()">適用</button><button id="gdNow" onclick="resetGDate()">現在に戻す</button></div>
+      <div class="gd-note" id="gdNote"></div>
     </div>
 
     <div class="group-title"><span class="gt gt-dyn">動的</span>統合</div>
@@ -7723,7 +7883,7 @@ SHELL_HTML = """<!DOCTYPE html>
     <div class="sep"></div>
     <div class="group-title"><span class="gt gt-sta">静的</span>長期</div>
     <div class="group-note">過去の実績・地質データで作る。日々は変わらない</div>
-    <button class="tab-btn" data-idx="10" onclick="sw(10)">
+    <button class="tab-btn" data-idx="9" onclick="sw(9)">
       <span class="label">長期の地震分布</span>
       <span class="badge">10年・M4.5+</span>
     </button>
@@ -7733,14 +7893,10 @@ SHELL_HTML = """<!DOCTYPE html>
     </button>
 
     <div class="sep"></div>
-    <div class="group-title"><span class="gt gt-ver">検証</span>ログ</div>
-    <button class="tab-btn" data-idx="9" onclick="sw(9)">
+    <div class="group-title"><span class="gt gt-ver">検証</span></div>
+    <button class="tab-btn" data-idx="8" onclick="sw(8)">
       <span class="label">バックテスト</span>
       <span class="badge">Molchan</span>
-    </button>
-    <button class="tab-btn" data-idx="8" onclick="sw(8)">
-      <span class="label">アーカイブ</span>
-      <span class="badge">JMA/USGS</span>
     </button>
 
     <div class="version">ETAS残差研究プロジェクト</div>
@@ -7756,7 +7912,7 @@ SHELL_HTML = """<!DOCTYPE html>
     <iframe id="f7" src=""></iframe>
     <iframe id="f8" src=""></iframe>
     <iframe id="f9" src=""></iframe>
-    <iframe id="f10" src=""></iframe>
+    <div id="unsup"><div class="u-t" id="unT"></div><div class="u-d" id="unD"></div><button onclick="resetGDate()">現在に戻す</button></div>
   </div>
   <script>
     // 画面の高さを実測して反映（スマホはアドレスバーの出入りで100vhが実際の表示領域とずれ、下が切れるため）
@@ -7769,17 +7925,87 @@ SHELL_HTML = """<!DOCTYPE html>
     window.addEventListener('orientationchange', function(){ setTimeout(fitH, 250); });
     if(window.visualViewport) window.visualViewport.addEventListener('resize', fitH);
 
-    var URLS=['riskmap','history','etas','bvalue','faultmap','tec','gnss','pressure','snapshots','backtest','longterm'];
-    var loaded=[true,false,false,false,false,false,false,false,false,false,false];
+    var URLS=['riskmap','history','etas','bvalue','faultmap','tec','gnss','pressure','backtest','longterm'];
+    var loaded=[true,false,false,false,false,false,false,false,false,false];
+
+    // ── (v9.41) 全体の日付（表示日時） ──
+    // 既定は「現在」(gDate='')。日時を適用すると、対応タブ(DATE_OK)は ?datetime= 付きで開き直す。
+    // 対応タブ: 統合リスクマップ・地震履歴・ETASマップ・b値マップ。
+    // 未対応タブ(NA_INFO)は、過去日付の間は中身を出さず、グレー表示＋説明にする（現在値を過去として見せない）。
+    var gDate='', gCalib=false;
+    var DATE_OK=[0,1,2,3];
+    var NA_INFO={
+      5:{tag:'現在のみ',d:'TECは現在の値だけで、過去の値を保持していないため、過去の日付では表示できません。'},
+      6:{tag:'現在のみ',d:'GNSS変位は現在の値だけで、過去の値を保持していないため、過去の日付では表示できません。'},
+      7:{tag:'現在のみ',d:'海面気圧は現在の値だけで、過去の値を保持していないため、過去の日付では表示できません。'}
+    };
+    function nowJstStr(){ return new Date(Date.now()+9*3600*1000).toISOString().slice(0,16); }
+    function tabUrl(idx,bust){
+      var q=[];
+      if(gDate && DATE_OK.indexOf(idx)>=0){ q.push('datetime='+encodeURIComponent(gDate)); if(gCalib) q.push('calib=date'); }
+      if(bust) q.push('_='+Date.now());
+      return '/tab/'+URLS[idx]+(q.length?'?'+q.join('&'):'');
+    }
+    function isBlocked(idx){ return !!gDate && !!NA_INFO[idx]; }
+    function refreshTop(){
+      var tt=document.getElementById('topTitle');
+      if(tt && typeof TAB_LABELS!=='undefined') tt.textContent=TAB_LABELS[curTab]+(gDate?'［'+gDate.slice(5).replace('T',' ')+'］':'');
+    }
+    function setGState(){
+      var st=document.getElementById('gdState');
+      if(gDate){ st.textContent=gDate.replace('T',' '); st.classList.add('past'); } else { st.textContent='現在'; st.classList.remove('past'); }
+      Object.keys(NA_INFO).forEach(function(k){
+        var b=document.querySelector('.tab-btn[data-idx="'+k+'"]'); if(b) b.classList.toggle('na',!!gDate);
+      });
+      document.getElementById('gdNote').textContent = gDate
+        ? '過去の日時では、統合リスクマップ・地震履歴・ETAS・b値を表示します（グレーのタブは現在値のみです）。'
+        : '「現在」は最新のデータです。日時を入れて「適用」を押すと、その時点の状態を表示します。';
+    }
+    function reloadDated(){
+      DATE_OK.forEach(function(i){ if(loaded[i]) document.getElementById('f'+i).src=tabUrl(i,true); });
+    }
+    function applyGDate(){
+      var v=document.getElementById('gdInput').value;
+      if(!v){ showToast('日時を入力してください',3000); return; }
+      if(v>nowJstStr()){ showToast('未来の日時は指定できません',3500); return; }
+      gDate=v; gCalib=document.getElementById('gdCalib').checked;
+      setGState(); reloadDated(); sw(curTab);
+      showToast('表示日時を '+v.replace('T',' ')+'（JST）にしました',3500);
+    }
+    function resetGDate(){
+      gDate=''; gCalib=false;
+      document.getElementById('gdInput').value=''; document.getElementById('gdCalib').checked=false;
+      setGState(); reloadDated(); sw(curTab);
+    }
+    (function initGDate(){
+      var inp=document.getElementById('gdInput');
+      inp.max=nowJstStr();
+      inp.addEventListener('focus',function(){ inp.max=nowJstStr(); });
+      Object.keys(NA_INFO).forEach(function(k){
+        var b=document.querySelector('.tab-btn[data-idx="'+k+'"]'); if(!b) return;
+        var s=document.createElement('span'); s.className='natag'; s.textContent=NA_INFO[k].tag; b.appendChild(s);
+      });
+      setGState();
+    })();
+
     function sw(idx){
       curTab=idx; if(typeof updateScope==='function') updateScope(idx);
-      var tt=document.getElementById('topTitle'); if(tt && typeof TAB_LABELS!=='undefined') tt.textContent=TAB_LABELS[idx];
       document.querySelectorAll('.tab-btn').forEach(function(b){b.classList.toggle('active',Number(b.dataset.idx)===idx)});
-      document.querySelectorAll('iframe').forEach(function(f,i){f.classList.toggle('active',i===idx)});
-      if(!loaded[idx]){
-        document.getElementById('f'+idx).src='/tab/'+URLS[idx];
-        loaded[idx]=true;
+      var blocked=isBlocked(idx);
+      document.querySelectorAll('iframe').forEach(function(f,i){f.classList.toggle('active',i===idx && !blocked)});
+      var un=document.getElementById('unsup');
+      if(blocked){
+        document.getElementById('unT').textContent=TAB_LABELS[idx]+'は、過去の日時では表示できません';
+        document.getElementById('unD').textContent=NA_INFO[idx].d;
+        un.classList.add('show');
+      } else {
+        un.classList.remove('show');
+        if(!loaded[idx]){
+          document.getElementById('f'+idx).src=tabUrl(idx);
+          loaded[idx]=true;
+        }
       }
+      refreshTop();
       if(window.innerWidth<=768){closeSb()}
     }
     function toggleSb(){
@@ -7793,7 +8019,7 @@ SHELL_HTML = """<!DOCTYPE html>
 
     // ── 各タブの「再計算」 ──
     // サイドバーのボタンは「いま開いているタブ」を、各タブ内のアイコンは「そのタブ」を再計算する(recalcByName)。
-    var TAB_LABELS=['統合リスクマップ','地震履歴','ETASマップ','b値マップ','活断層・プレート境界','TEC','GNSS変位','海面気圧','アーカイブ','バックテスト','長期の地震分布'];
+    var TAB_LABELS=['統合リスクマップ','地震履歴','ETASマップ','b値マップ','活断層・プレート境界','TEC','GNSS変位','海面気圧','バックテスト','長期の地震分布'];
     var TAB_SCOPES=__TAB_SCOPES__;
     var curTab=0, recalcBusy=false, toastTimer=null;
     function showToast(msg,ms){
@@ -7803,7 +8029,7 @@ SHELL_HTML = """<!DOCTYPE html>
       if(ms){toastTimer=setTimeout(function(){t.style.display='none'},ms)}
     }
     function reloadTab(idx){
-      document.getElementById('f'+idx).src='/tab/'+URLS[idx]+'?_='+Date.now();
+      document.getElementById('f'+idx).src=tabUrl(idx,true);
       loaded[idx]=true;
     }
     function updateScope(idx){
@@ -7823,15 +8049,17 @@ SHELL_HTML = """<!DOCTYPE html>
       if(recalcBusy) return;
       var idx=(typeof i==='number')?i:curTab, name=URLS[idx], label=TAB_LABELS[idx];
       if(window.innerWidth<=768){closeSb()}
-      if(idx===9){
+      if(idx===8){
         showToast('バックテストは、タブ左側の「実行」ボタンで計算します',4000);
         return;
       }
-      if(idx===8){
-        // アーカイブは指定日時ごとの再計算UI。タブ内の取得ボタンを同じ入力で再実行する
-        var w=document.getElementById('f8').contentWindow;
-        if(w && typeof w.runFetch==='function'){ w.runFetch(); showToast('入力中の日時で再計算します',3000); }
-        else { showToast('日時を入力して「この時点のリスクマップを取得」を押してください',4000); }
+      if(isBlocked(idx)){
+        showToast('過去の日時では再計算できません。「現在に戻す」を押してください',4000);
+        return;
+      }
+      if(gDate && DATE_OK.indexOf(idx)>=0){
+        // 過去の日時を表示中は、「再計算」＝指定した日時で開き直す（アーカイブと同じ計算）
+        reloadTab(idx); showToast('指定した日時（'+gDate.replace('T',' ')+' JST）で再計算します',3500);
         return;
       }
       var t0=Date.now();
@@ -8047,6 +8275,16 @@ def tab(name):
     if data is None:
         return Response("<html><body style='background:radial-gradient(at 18% 15%,#233560 0%,transparent 55%),radial-gradient(at 85% 12%,#3a2560 0%,transparent 50%),radial-gradient(at 60% 92%,#0f3a4a 0%,transparent 55%),#05070d;background-attachment:fixed;color:white;padding:20px'>ロード中...</body></html>", mimetype="text/html")
     upd = data["updated"]
+    # (v9.41) 全体の日付: ?datetime=YYYY-MM-DDTHH:MM(JST)[&calib=date]。統合リスクマップと地震履歴だけが対応する
+    g_dt, g_calib, g_err = _global_dt_from_request()
+    if g_err:
+        return Response(_tab_msg_html(g_err), mimetype="text/html", status=400)
+    if g_dt and name == "history":
+        return Response(_render_history_at(g_dt), mimetype="text/html")
+    if g_dt and name in ("etas", "bvalue"):
+        return Response(_hist_loader_html(name, g_dt, g_calib), mimetype="text/html")
+    if g_dt and name == "riskmap":
+        return Response(render_riskmap([], upd, hist={"datetime": g_dt, "calib": g_calib}), mimetype="text/html")
     if   name == "history":  html = render_quake_history(data["all"], upd)
     elif name == "etas":     html = render_etas(data["etas"], data["all"], upd)
     elif name == "bvalue":   html = render_bvalue(data["bvalue"], data["all"], upd)
@@ -8057,7 +8295,6 @@ def tab(name):
     elif name == "tec":      html = render_tec(upd)
     elif name == "gnss":     html = render_gnss(upd)
     elif name == "pressure": html = render_pressure(upd)
-    elif name == "snapshots": html = render_snapshots(upd)
     elif name == "backtest":  html = render_backtest(upd)
     elif name == "longterm":  html = render_longterm(upd)
     else: return Response("Not found", status=404)
@@ -8329,6 +8566,8 @@ def _archive_with_date_calibration(ref_time_jst, ref_time_utc):
         "period_start_jst": start_utc.astimezone(JST).strftime("%Y-%m-%d %H:%M JST"),
         "quake_count": len(quakes), "data_source": "jma_catalog", "min_mag": JMA_CATALOG_MIN_MAG,
         "calib_mode": "date", "calib_anchor_jst": calib.get("anchor_jst"),
+        "calib_fixed": bool(calib.get("fixed")), "calib_start_jst": calib.get("baseline_start_jst"),
+        "calib_n_samples": calib.get("n_samples", 0),
         "thresholds": {"by_subset": calib["risk_thresholds"], "default": RISK_THRESH_DEFAULT,
                        "calibrated": True, "n_samples": calib.get("n_samples", 0)},
         "cells": cells,
@@ -8337,7 +8576,7 @@ def _archive_with_date_calibration(ref_time_jst, ref_time_utc):
 @app.route("/archive/historical_riskmap")
 def archive_historical_riskmap():
     """
-    アーカイブタブ用: 指定された日時(JST)を基準に、その1か月前までの
+    表示日時(全体の日付。旧アーカイブタブ)用: 指定された日時(JST)を基準に、その1か月前までの
     地震データを取得し直して、その時点の統合リスクマップ（ETAS/b値/活断層/
     プレート境界）を再計算して返す。
     クエリパラメータ: datetime = "YYYY-MM-DDTHH:MM" (JST基準、入力欄のvalueをそのまま渡す想定)
@@ -8412,6 +8651,73 @@ def archive_historical_riskmap():
         "cells": cells,
     }
 
+@app.route("/archive/historical_tab")
+def archive_historical_tab():
+    """(v9.41) 過去の時点のETASマップ/b値マップのページ(HTML)を返す。
+    name=etas|bvalue, datetime=YYYY-MM-DDTHH:MM(JST), calib=date(省略可)。
+    データの振り分け・基準の作り直しは /archive/historical_riskmap と同じ。"""
+    name = request.args.get("name", "")
+    if name not in ("etas", "bvalue"):
+        return {"error": "対応していないタブです"}, 404
+    try:
+        naive = datetime.strptime(request.args.get("datetime", ""), "%Y-%m-%dT%H:%M")
+    except ValueError:
+        return {"error": "日時の形式が正しくありません（YYYY-MM-DDTHH:MM）"}, 400
+    ref_time_jst = naive.replace(tzinfo=JST)
+    ref_utc = ref_time_jst.astimezone(timezone.utc)
+    if ref_utc > datetime.now(timezone.utc):
+        return {"error": "未来の日時は指定できません"}, 400
+
+    calib = None
+    if request.args.get("calib") == "date":
+        calib, info = get_calibration_at(ref_utc)
+        if calib is None:
+            if info.get("error"):
+                return {"error": f"この日付の基準を作れませんでした: {info['error']}"}, 503
+            who = "この日付の基準（その日より前の65日）" if info.get("same") else "別の日付の基準"
+            return {"pending": True, "message": f"{who}を作成中です。完了すると自動で表示します（初回は数十秒〜数分）"}, 202
+        start_utc = ref_utc - timedelta(days=BT_WINDOW_DAYS)
+        try:
+            quakes = _fetch_catalog_strict(start_utc, ref_utc)
+        except Exception as e:
+            return {"error": str(e)}, 503
+        data_source = "jma_catalog"
+    else:
+        if not get_risk_level_thresholds()["calibrated"]:
+            return {"error": "絶対基準(過去65日の実績)を計算中です。数分後にもう一度お試しください。"}, 503
+        start_utc = ref_utc - timedelta(days=30)
+        try:
+            quakes, data_source = _quakes_for_range(start_utc, ref_utc)
+        except Exception as e:
+            return {"error": f"過去データの取得に失敗しました: {e}"}, 500
+
+    src_label = {"local": "JMA/P2P統合データ（直近60日）",
+                 "jma_catalog": f"気象庁一元化震源カタログ（M{JMA_CATALOG_MIN_MAG:.1f}以上のみ）",
+                 "usgs_historical": "USGS過去カタログ（震度情報なし・小規模地震が漏れる場合あり）"}[data_source]
+    if calib is not None and calib.get("fixed"):
+        basis = (f"基準: 固定基準（{calib.get('baseline_start_jst')}〜{calib.get('anchor_jst')}・"
+                 f"{calib.get('n_samples', 0)}時点）")
+    elif calib is not None:
+        basis = f"基準: {calib.get('anchor_jst')} より前の65日で作り直し"
+    else:
+        basis = "基準: 現在の基準（過去65日）を使用"
+    caveat = ""
+    if name == "bvalue" and data_source != "local":
+        caveat = "<br>※ 小さい地震が少ないデータ元のため、b値の絶対値は現在の表示と単純に比べられません。"
+    note = (f"<span style=\"color:#93c5fd\"><b>過去の時点: {ref_time_jst.strftime('%Y-%m-%d %H:%M')} JST</b>／"
+            f"{start_utc.astimezone(JST).strftime('%Y-%m-%d %H:%M')} 〜／{src_label}／地震 {len(quakes)}件"
+            + (f"／{basis}" if name == "etas" else "") + f"{caveat}</span>")
+    try:
+        if name == "etas":
+            html_out = render_etas(analyze_etas(quakes, ref_time=ref_utc), quakes, "",
+                                   ref_time=ref_utc, calib=calib, note_html=note)
+        else:
+            html_out = render_bvalue(compute_bvalue_grid(quakes), quakes, "", note_html=note)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return {"error": f"再計算に失敗しました: {e}"}, 500
+    return Response(html_out, mimetype="text/html")
+
 @app.route("/data/risk_level_thresholds")
 def risk_level_thresholds():
     """(v8.21) 統合リスクマップのレベル境界と、その境界を過去実績に当てはめた場合の
@@ -8444,7 +8750,22 @@ def backtest_info():
                                               "contiguous": cov["contiguous"],
                                               "ignored": ", ".join(str(y) for y in cov.get("ignored_years", []))},
             "defaults": BT_DEFAULT_PARAMS, "last_params": last, "job": job, "has_records": has,
+            "fixed_baselines": ([] if CALIB_BASELINE_MODE == "off" else [_jst_day(e) for e, _ in _calib_baseline_index()]),
             "catalog_diag": None if cov else _jma_catalog_diagnose()}
+
+@app.route("/calibration/status")
+def calibration_status():
+    """(v9.42) いま通常表示で使っている基準（固定基準か65日方式か）と、置いてある固定基準の一覧。"""
+    live = _get_historical_calibration()
+    fixed = bool(live.get("fixed"))
+    return {"mode": CALIB_BASELINE_MODE, "live_uses_fixed": fixed,
+            "live_baseline": ({"name": live.get("baseline_name"), "start_jst": live.get("baseline_start_jst"),
+                               "end_jst": live.get("anchor_jst"), "n_samples": live.get("n_samples", 0),
+                               "meta": live.get("baseline_meta")} if fixed else None),
+            "live_65day_n_samples": None if fixed else live.get("n_samples", 0),
+            "dirs": _calib_baseline_dirs(),
+            "files": [{"end_jst": _jst_day(e), "file": os.path.basename(p_)} for e, p_ in _calib_baseline_index()],
+            "max_age_days": CALIB_BASELINE_MAX_AGE_DAYS}
 
 @app.route("/backtest/start", methods=["POST"])
 def backtest_start():
@@ -8894,6 +9215,9 @@ def recalc_status(name):
 
 
 if __name__ == "__main__":
+    # (v9.42) python app.py --build-baseline ... : 固定基準を作って終了する（サーバーは起動しない）
+    if "--build-baseline" in sys.argv:
+        sys.exit(_cli_build_baseline([a for a in sys.argv[1:] if a != "--build-baseline"]))
     # ★ Bug fix (2026-08): quakes.csv の復元は、バックグラウンド更新ループが
     # 1回目に load_quakes() でキャッシュを温める前に完了している必要があるため、
     # スナップショット復元（非同期）とは別に、ここで同期的に実行する。
