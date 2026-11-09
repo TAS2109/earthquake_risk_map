@@ -6154,7 +6154,9 @@ def _bt_make_record(ev, group, prev, eval_t, anchor, score_vec, after_vec, th, s
                 "nb_level": nb_level, "n_scored": int(valid.sum()),
                 "area_ge": area_ge, "area_dil_ge": area_dil, **_bt_model_stats(score_vec, idx, r)},
         "after": {"score": None if s_after is None else round(s_after * 100, 1),
-                  "level": int(sum(1 for t in th if a_valid and after_vec[idx] >= t))},
+                  "level": int(sum(1 for t in th if a_valid and after_vec[idx] >= t)),
+                  # (v9.43) 直前と直後でリスク値が完全に同じ(丸め前で比較)。不具合の疑いとして既定で結果から除く
+                  "same": bool(s_before is not None and s_after is not None and s_before == s_after)},
         "st_seis": _bt_model_stats(st_vecs["st_seis"], idx, r),
         "st_comb": _bt_model_stats(st_vecs["st_comb"], idx, r),
         "thresholds": [round(float(t), 4) for t in th],
@@ -6169,6 +6171,7 @@ def _bt_make_record(ev, group, prev, eval_t, anchor, score_vec, after_vec, th, s
 BT_DEFAULT_PARAMS = {"start": None, "end": None, "min_mag": 6.0, "lead_hours": 0.05, "after_hours": 0.05,
                      "rebuild_days": 30.0, "calib_step_hours": float(HIST_CALIB_SAMPLE_HOURS),
                      "prev_mag": 6.0, "max_depth_km": 0.0, "defaults_ver": 2,
+                     "show_unchanged": False, "show_outside": False,
                      "calib_mode": "fixed"}   # (v9.42) fixed=固定基準があれば使う(速い) / rebuild=毎回作り直す(従来)
 
 def _bt_parse_params(d):
@@ -6181,6 +6184,10 @@ def _bt_parse_params(d):
         s = datetime.strptime(str(d.get("start")), "%Y-%m-%d").replace(tzinfo=JST)
         e = datetime.strptime(str(d.get("end")), "%Y-%m-%d").replace(tzinfo=JST) + timedelta(days=1)
         p["calib_mode"] = "rebuild" if str(d.get("calib_mode") or "") == "rebuild" else "fixed"
+        # (v9.43) 直前・直後でリスク値が変わらない地震を表示するか(既定: 表示しない)。記録のハッシュには影響しない
+        p["show_unchanged"] = str(d.get("show_unchanged") or "").lower() in ("1", "true", "on", "yes")
+        # (v9.44) 震源セルに動的スコアが無い(計算範囲外の)地震を表示するか(既定: 表示しない)
+        p["show_outside"] = str(d.get("show_outside") or "").lower() in ("1", "true", "on", "yes")
     except (TypeError, ValueError):
         raise ValueError("開始日・終了日は YYYY-MM-DD で、数値の項目は数字で入力してください")
     if not (4.5 <= p["min_mag"] <= 9.5):
@@ -6569,16 +6576,38 @@ def _bt_level_table(recs):
                      "lift_nb": None if area_nb <= 0 else round(hit_nb / area_nb, 2)})
     return rows
 
+def _bt_is_unchanged(r):
+    """(v9.43) 直前と直後でリスク値が一切変わっていない記録 = 不具合の疑い。
+    直前・直後の両方にスコアがある場合だけ判定する(どちらかが無いものは別扱い)。
+    after.same(丸め前の比較)があればそれを、古い記録は保存値(小数1桁)の一致で判定する。"""
+    a = r.get("after") or {}
+    d = r.get("dyn") or {}
+    if "same" in a:
+        return bool(a["same"])
+    return d.get("score") is not None and a.get("score") is not None and d["score"] == a["score"]
+
+def _bt_is_outside(r):
+    """(v9.44) 震源セルに動的スコアが無い = 計算範囲外(リスク値を計算できていない)の記録。"""
+    return not (r.get("dyn") or {}).get("valid", True)
+
 def _bt_summarize(records, p):
     """records: {id: 記録} から、期間・規模・深さで絞って、グループ別・モデル別に集計する。"""
     start = datetime.strptime(p["start"], "%Y-%m-%d").replace(tzinfo=JST).astimezone(timezone.utc)
     end = (datetime.strptime(p["end"], "%Y-%m-%d").replace(tzinfo=JST) + timedelta(days=1)).astimezone(timezone.utc)
     recs = []
+    n_unchanged = 0
+    n_outside = 0
     for r in records.values():
         t = datetime.fromisoformat(r["t_utc"])
         if not (start <= t < end) or r["mag"] < p["min_mag"]:
             continue
         if p["max_depth_km"] > 0 and r["depth"] > p["max_depth_km"]:
+            continue
+        if not p.get("show_unchanged") and _bt_is_unchanged(r):
+            n_unchanged += 1   # (v9.43) 直前直後でリスク値が同じ = 不具合の疑い。既定では除外
+            continue
+        if not p.get("show_outside") and _bt_is_outside(r):
+            n_outside += 1     # (v9.44) 計算範囲外(震源セルにスコア無し)。既定では除外
             continue
         recs.append(r)
     recs.sort(key=lambda r: r["t_utc"])
@@ -6592,7 +6621,8 @@ def _bt_summarize(records, p):
                          best=[bk, bt]))
     out = {"params": p, "n_events": len(recs), "group_labels": BT_GROUP_LABELS, "model_labels": BT_MODEL_LABELS,
            "tau_grid": BT_TAU_GRID, "groups": {}, "rows": rows, "src_labels": BT_SRC_LABELS,
-           "miss_thrs": list(BT_MISS_THRS)}
+           "miss_thrs": list(BT_MISS_THRS), "n_unchanged_hidden": n_unchanged,
+           "n_outside_hidden": n_outside}
     for g, rs in groups.items():
         gg = {"n": len(rs), "models": {}, "levels": _bt_level_table(rs), "sig05": _bt_sig_curve(len(rs)), "paired": {},
               "components": _bt_component_table(rs), "breakdown": _bt_breakdown(rs) if rs else {"by_year": [], "by_mag": []},
@@ -6626,6 +6656,10 @@ def _bt_csv(records, p):
             continue
         if p["max_depth_km"] > 0 and r["depth"] > p["max_depth_km"]:
             continue
+        if not p.get("show_unchanged") and _bt_is_unchanged(r):
+            continue   # (v9.43) 直前直後でリスク値が同じ = 不具合の疑い
+        if not p.get("show_outside") and _bt_is_outside(r):
+            continue   # (v9.44) 計算範囲外
         d = r["dyn"]; pv = r.get("prev")
         w.writerow([r["t_jst"], r["place"], r["mag"],
                     "" if d["score"] is None else d["score"], "" if r["after"]["score"] is None else r["after"]["score"],
@@ -7377,6 +7411,8 @@ tr.det td{white-space:normal;text-align:left;background:rgba(255,255,255,.035);p
     <div class="field"><label>終了日</label><input type="date" id="pEnd"></div>
     <div class="hint" id="covHint"></div>
     <div class="field"><label>対象のM以上</label><input type="number" id="pMag" step="0.1" value="6.0"></div>
+    <div class="field"><label>直前・直後でリスク値が変わらない地震も表示する(不具合の疑い)</label><input type="checkbox" id="pUnch" style="width:auto"></div>
+    <div class="field"><label>計算範囲外(震源セルにリスク値が無い)の地震も表示する</label><input type="checkbox" id="pOut" style="width:auto"></div>
   </div>
   <details>
     <summary>詳細設定(通常は変えなくてよい)</summary>
@@ -7422,7 +7458,8 @@ function srcTag(k){var c=(k==='nb')?'tag nb':(k.indexOf('st_')===0?'tag st':'tag
 function params(){
   return {start:$('pStart').value, end:$('pEnd').value, min_mag:$('pMag').value, max_depth_km:$('pDepth').value,
           lead_hours:$('pLead').value, after_hours:$('pAfter').value, rebuild_days:$('pRebuild').value,
-          calib_step_hours:$('pStep').value, prev_mag:$('pPrev').value, calib_mode:$('pCalibMode').value};
+          calib_step_hours:$('pStep').value, prev_mag:$('pPrev').value, calib_mode:$('pCalibMode').value,
+          show_unchanged:($('pUnch').checked?1:0), show_outside:($('pOut').checked?1:0)};
 }
 function qs(o){return Object.keys(o).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(o[k])}).join('&')}
 function setStat(msg, err){var s=$('stat'); s.className=err?'err':''; s.innerHTML=msg}
@@ -7433,6 +7470,10 @@ function init(){
     ['Mag:min_mag','Depth:max_depth_km','Lead:lead_hours','After:after_hours','Rebuild:rebuild_days','Step:calib_step_hours','Prev:prev_mag','CalibMode:calib_mode'].forEach(function(s){
       var a=s.split(':'); if(p[a[1]]!=null) $('p'+a[0]).value=p[a[1]];
     });
+    $('pUnch').checked = !!p.show_unchanged;
+    $('pUnch').onchange = function(){ loadResult(); };
+    $('pOut').checked = !!p.show_outside;
+    $('pOut').onchange = function(){ loadResult(); };
     $('covHint').innerHTML = d.coverage ? ('カタログ収録: '+d.coverage.first+' 〜 '+d.coverage.last+'（基準に約125日必要なため、先頭から約4か月ぶんは評価できません）'+(d.coverage.ignored ? '<br>※途切れているため使わない年: '+esc(d.coverage.ignored) : '')) : ('<span style="color:#fca5a5">一元化カタログ(h2023 など年別ファイル)が見つかりません。</span><br>'+esc(d.catalog_diag||''));
     var fb=d.fixed_baselines||[];
     $('fbHint').innerHTML = fb.length ? ('固定基準(終端日): '+fb.map(esc).join(', ')+' ／ 評価時点より前に終わる最新のものを使います') : '固定基準は見つかりません(作ると速くなります: python app.py --build-baseline)。毎回作り直します。';
@@ -7665,9 +7706,13 @@ function recordsCard(D){
 
 function render(){
   var D=S.data, h='';
-  if(!D.n_events){ $('main').innerHTML='<div id="empty">この条件で保存済みの結果はまだありません。「実行」を押してください。</div>'; return; }
+  var nU=D.n_unchanged_hidden||0, nO=D.n_outside_hidden||0, nH=nU+nO;
+  var uNote = nH ? '<div class="note warn" style="margin:0 0 10px">非表示にしている地震: '+
+      (nU?'直前・直後でリスク値が変わらない '+nU+'件（不具合の疑い）':'')+(nU&&nO?'、':'')+(nO?'計算範囲外（震源セルにリスク値なし） '+nO+'件':'')+
+      '。左の「表示する」チェックで表示できます。</div>' : '';
+  if(!D.n_events){ $('main').innerHTML=uNote+'<div id="empty">'+(nH?'表示できる地震がありません（すべて非表示の条件に該当しました）。':'この条件で保存済みの結果はまだありません。「実行」を押してください。')+'</div>'; return; }
   var G=D.groups[S.group], L=D.group_labels, M=D.model_labels;
-  h+=controlsCard(D);
+  h+=uNote+controlsCard(D);
   if(G.n===0){ $('main').innerHTML=h+'<div class="card"><div class="note">この区分に該当する地震はありません。</div></div>'; return; }
   h+=summaryCard(G)+missCard(G)+molchanCard(G,L,M)+metricsCard(G,M)+levelCard(G)+componentCard(G)+stabilityCard(G)+recordsCard(D);
   $('main').innerHTML=h;
