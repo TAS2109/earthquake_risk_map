@@ -5455,6 +5455,7 @@ def compute_risk_trend_for_cell(gi, gj, selected_keys):
 #   切り下げたもの(0なら1地震ごとに作り直す)。基準の作成は重いので、同じanchorの地震で共有する。
 # ══════════════════════════════════════════════════════
 BACKTEST_DIR = "data/backtest"
+BT_WORKERS = max(1, min(8, (os.cpu_count() or 1)))   # (v9.45) バックテストの並列スレッド数
 BT_WINDOW_DAYS = 60.0          # 較正(_compute_historical_calibration)の窓と同じ。変えるなら較正側も合わせること
 BT_STD_KEY = _risk_subset_key(_RISK_STD_KEYS)
 BT_NEAR_RADIUS_CELLS = 1       # 「周囲」= 震源セルから±1セル(約±55km)
@@ -6102,24 +6103,39 @@ class _BtRankCtx:
         comp[(w * valid).sum(axis=1) <= 0] = np.nan
         return comp
 
+def _bt_raw_one(qa, e, win):
+    """(v9.45) 1時点ぶんの ETAS・b値の生の値。時点どうしは独立なので並列に実行できる。"""
+    qt = qa["t"]
+    lo = int(np.searchsorted(qt, e - win, side="left"))
+    hi = int(np.searchsorted(qt, e, side="right"))
+    if hi > lo:
+        etas_raw = _risk_etas_raw(_analyze_etas_window(qa, lo, hi, e))
+        bvalue_raw = _risk_bvalue_raw(compute_bvalue_grid(qa["q"][lo:hi]))
+    else:
+        etas_raw, bvalue_raw = {}, {}
+    return (e, lo, hi, etas_raw, bvalue_raw)
+
 def _bt_raw_series(qa, epochs, fpts, ppts):
     """各時刻(epoch秒)について、その時点までの直近 BT_WINDOW_DAYS 日の地震から ETAS・b値・活断層・
-    プレート境界の『生の値』を作る（較正と同じ計算。断層・プレートは全時刻まとめて）。"""
-    qt = qa["t"]
+    プレート境界の『生の値』を作る（較正と同じ計算。断層・プレートは全時刻まとめて）。
+    (v9.45) ETAS・b値は時点ごとに並列実行し、各処理の所要時間をログに出す。"""
     win = BT_WINDOW_DAYS * 86400.0
-    rows = []
-    for e in epochs:
-        lo = int(np.searchsorted(qt, e - win, side="left"))
-        hi = int(np.searchsorted(qt, e, side="right"))
-        if hi > lo:
-            etas_raw = _risk_etas_raw(_analyze_etas_window(qa, lo, hi, e))
-            bvalue_raw = _risk_bvalue_raw(compute_bvalue_grid(qa["q"][lo:hi]))
-        else:
-            etas_raw, bvalue_raw = {}, {}
-        rows.append((e, lo, hi, etas_raw, bvalue_raw))
+    t0 = time.time()
+    workers = max(1, min(BT_WORKERS, len(epochs)))
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            rows = list(ex.map(lambda e: _bt_raw_one(qa, e, win), epochs))
+    else:
+        rows = [_bt_raw_one(qa, e, win) for e in epochs]
+    t1 = time.time()
     sp = [(e, lo, hi) for e, lo, hi, _, _ in rows]
     fl = _load_to_grid_max_multi(fpts, _fault_plate_loads_multi(fpts, qa, sp, window_days=BT_WINDOW_DAYS))
+    t2 = time.time()
     pl = _load_to_grid_max_multi(ppts, _fault_plate_loads_multi(ppts, qa, sp, window_days=BT_WINDOW_DAYS))
+    t3 = time.time()
+    print(f"[バックテスト] 時点{len(epochs)}個 / スレッド{workers}: ETAS+b値 {t1 - t0:.1f}秒"
+          f"（1時点あたり{(t1 - t0) / max(len(epochs), 1):.1f}秒）, 活断層 {t2 - t1:.1f}秒, プレート {t3 - t2:.1f}秒")
     return [{"etas": r[3], "bvalue": r[4], "fault": fl[i], "plate": pl[i]} for i, r in enumerate(rows)]
 
 
@@ -6318,7 +6334,9 @@ def _bt_run(p):
             groups.setdefault((ev["anchor"], ev["fb"]["baseline_name"] if ev["fb"] else ""), []).append(ev)
         out_path = _bt_records_path(cfg)
         n_done = len(targets) - len(todo)
+        ctx_cache = {}   # (v9.45) 固定基準ごとの順位計算の下準備（並べ替え済み履歴）を、基準の期間をまたいで使い回す
         for gi, gkey in enumerate(sorted(groups)):
+            t_grp = time.time()
             anchor = gkey[0]
             if _bt_job["cancel"]:
                 _bt_set(phase="中止", message=f"中止しました（{n_done}/{len(targets)}件まで保存済み）")
@@ -6345,18 +6363,27 @@ def _bt_run(p):
                 print(f"[バックテスト] 基準日{_bt_jst(anchor)}: 基準を作れずスキップ（{calib.get('n_samples', 0)}時点）")
                 n_done += len(evs); _bt_set(done=n_done)
                 continue
-            ctx = _BtRankCtx(calib)
+            if fixed_calib is not None:
+                ctx = ctx_cache.get(fixed_calib["baseline_name"])
+                if ctx is None:
+                    ctx = ctx_cache[fixed_calib["baseline_name"]] = _BtRankCtx(calib)
+            else:
+                ctx = _BtRankCtx(calib)
+            t_load = time.time() - t_grp
             qa = _build_quake_arrays(quakes)
             epochs = []
+            with_after = p["after_hours"] > 0   # (v9.45) 直後を0時間にすると直後の計算を省く（時間が約半分）
+            stride = 2 if with_after else 1
             for ev in evs:
                 epochs.append(ev["eval_t"].timestamp())
-                epochs.append((ev["t"] + after).timestamp())
+                if with_after:
+                    epochs.append((ev["t"] + after).timestamp())
             raws = _bt_raw_series(qa, epochs, fpts, ppts)
             with open(out_path, "a", encoding="utf-8") as f:
                 for n, ev in enumerate(evs):
-                    score_vec = ctx.composite(raws[2 * n])
+                    score_vec = ctx.composite(raws[stride * n])
                     comp_S = ctx.last_S.copy()   # (v9.21) 直前時点の成分別スコア
-                    after_vec = ctx.composite(raws[2 * n + 1])
+                    after_vec = ctx.composite(raws[stride * n + 1]) if with_after else np.full_like(score_vec, np.nan)
                     st_vecs = _bt_static_vectors(st, ev["eval_t"].timestamp())
                     rec = _bt_make_record(ev, ev["group"], ev["prev"], ev["eval_t"], anchor,
                                           score_vec, after_vec, th, st_vecs, p, comp_S=comp_S)
@@ -6366,6 +6393,8 @@ def _bt_run(p):
                     f.flush()
                     n_done += 1
                     _bt_set(done=n_done)
+            print(f"[バックテスト] グループ{gi + 1}/{len(groups)}（{len(evs)}件）: 合計{time.time() - t_grp:.1f}秒"
+                  f"（基準・カタログ読み込み{t_load:.1f}秒）")
             del quakes, qa, raws
         _bt_set(phase="完了", message=f"{n_done}/{len(targets)}件を評価しました")
     except Exception as e:
@@ -7419,7 +7448,7 @@ tr.det td{white-space:normal;text-align:left;background:rgba(255,255,255,.035);p
     <div class="body">
       <div class="field"><label>震源の深さ上限(km, 0=なし)</label><input type="number" id="pDepth" step="10" value="0"></div>
       <div class="field"><label>直前(発生の何時間前)</label><input type="number" id="pLead" step="0.01" min="0.01" value="0.05"></div>
-      <div class="field"><label>直後(何時間後・参考用)</label><input type="number" id="pAfter" step="0.01" min="0" value="0.05"></div>
+      <div class="field"><label>直後(何時間後・参考用 / 0=計算しない=約2倍速)</label><input type="number" id="pAfter" step="0.01" min="0" value="0.05"></div>
       <div class="field"><label>基準の作り直し間隔(日, 0=1地震ごと)</label><input type="number" id="pRebuild" step="1" value="30"></div>
       <div class="field"><label>基準の作り方</label><select id="pCalibMode"><option value="fixed">固定基準を使う(速い)</option><option value="rebuild">毎回作り直す(従来)</option></select></div>
       <div class="hint" id="fbHint">固定基準: 確認中…</div>
